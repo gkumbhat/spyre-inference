@@ -17,7 +17,7 @@ the reminder would stop being actionable.
 reviews and label changes.
 
 Driven by [pr_reminder_slack.yaml](../../.github/workflows/pr_reminder_slack.yaml)
-(daily at 13:23 UTC, plus manual dispatch).
+(daily at 15:03 UTC — 10:03 EST, 11:03 EDT — plus manual dispatch).
 
 ## Setup
 
