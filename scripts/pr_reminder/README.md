@@ -52,9 +52,14 @@ file or from **Settings → Secrets and variables → Actions** without a commit
 | `STALE_HOURS` | `PR_REMINDER_STALE_HOURS` | `24` | Inactivity threshold, in hours |
 | `MAX_IDLE_DAYS` | `PR_REMINDER_MAX_IDLE_DAYS` | `30` | Skip PRs idle longer than this; `0` disables |
 | `EXEMPT_LABELS` | `PR_REMINDER_EXEMPT_LABELS` | `keep-open,stale,do-not-merge` | Labels that exclude a PR |
-| `SLACK_HEADER_TEMPLATE` | `PR_REMINDER_HEADER_TEMPLATE` | see script | Message header |
-| `SLACK_PR_LINE_TEMPLATE` | `PR_REMINDER_PR_LINE_TEMPLATE` | see script | Per-PR line |
-| `SLACK_FOOTER_TEMPLATE` | `PR_REMINDER_FOOTER_TEMPLATE` | see script | Message footer |
+
+## Message templates
+
+`HEADER_TEMPLATE`, `PR_LINE_TEMPLATE` and `FOOTER_TEMPLATE` live at the top of
+[pr_reminder.py](pr_reminder.py). Edit them there — the workflow deliberately does not
+plumb them through repo variables, so wording changes go through review like any other
+code. Each still honours a `SLACK_HEADER_TEMPLATE` / `SLACK_PR_LINE_TEMPLATE` /
+`SLACK_FOOTER_TEMPLATE` env override, which is handy for trying wording locally.
 
 Templates are Slack `mrkdwn` and use `str.format` placeholders. The header takes
 `count`, `stale_hours`, `repo`, `repo_url`; each PR line takes `rank`, `number`, `url`,

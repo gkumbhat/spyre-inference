@@ -42,9 +42,6 @@ jobs:
       STALE_HOURS: ${{ vars.PR_REMINDER_STALE_HOURS || '24' }}
       MAX_IDLE_DAYS: ${{ vars.PR_REMINDER_MAX_IDLE_DAYS || '30' }}
       EXEMPT_LABELS: ${{ vars.PR_REMINDER_EXEMPT_LABELS || 'keep-open,stale,do-not-merge' }}
-      SLACK_HEADER_TEMPLATE: ${{ vars.PR_REMINDER_HEADER_TEMPLATE }}
-      SLACK_PR_LINE_TEMPLATE: ${{ vars.PR_REMINDER_PR_LINE_TEMPLATE }}
-      SLACK_FOOTER_TEMPLATE: ${{ vars.PR_REMINDER_FOOTER_TEMPLATE }}
 
     steps:
       - name: Checkout reminder script
