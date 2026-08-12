@@ -48,6 +48,7 @@ file or from **Settings → Secrets and variables → Actions** without a commit
 | `SLACK_WEBHOOK_URL` | secret of the same name | — | Incoming-webhook URL; takes precedence |
 | `SLACK_BOT_TOKEN` | secret of the same name | — | Slack bot token (`chat:write`) |
 | `SLACK_CHANNEL_ID` | `SLACK_CHANNEL_ID` | — | Channel to post into (bot-token path only) |
+| `SLACK_MENTION_GROUP_ID` | `PR_REMINDER_SLACK_GROUP_ID` | see workflow | Who to ping: a user group ID, or `here`/`channel`/`everyone`; empty pings nobody |
 | `MAX_PRS` | `PR_REMINDER_MAX_PRS` | `10` | How many PRs to list |
 | `STALE_HOURS` | `PR_REMINDER_STALE_HOURS` | `24` | Inactivity threshold, in hours |
 | `MAX_IDLE_DAYS` | `PR_REMINDER_MAX_IDLE_DAYS` | `30` | Skip PRs idle longer than this; `0` disables |
@@ -62,8 +63,25 @@ code. Each still honours a `SLACK_HEADER_TEMPLATE` / `SLACK_PR_LINE_TEMPLATE` /
 `SLACK_FOOTER_TEMPLATE` env override, which is handy for trying wording locally.
 
 Templates are Slack `mrkdwn` and use `str.format` placeholders. The header takes
-`count`, `stale_hours`, `repo`, `repo_url`; each PR line takes `rank`, `number`, `url`,
-`title`, `author`, `idle_days`, `labels`; the footer takes `shown`, `total`.
+`mention`, `count`, `stale_hours`, `repo`, `repo_url`; each PR line takes `rank`,
+`number`, `url`, `title`, `author`, `idle_days`, `labels`; the footer takes `shown`,
+`total`.
+
+`{mention}` is built from `SLACK_MENTION_GROUP_ID`:
+
+| Value | Renders as | Effect |
+|---|---|---|
+| `S0BKBNPFP0W` | `<!subteam^S0BKBNPFP0W>` | Notifies every member of that user group |
+| `here` | `<!here>` | Notifies active members of the channel |
+| `channel` | `<!channel>` | Notifies every member of the channel |
+| `everyone` | `<!everyone>` | Notifies the whole workspace via `#general` |
+| empty | nothing | No ping; the header starts at the emoji |
+
+These entity forms are the only ones Slack notifies on — plain `@handle` text renders as
+literal characters and pings no one
+([Slack docs](https://docs.slack.dev/messaging/formatting-message-text)). For a user
+group, use the *ID* rather than the handle: handles get renamed, IDs don't. A leading `@`
+is tolerated, so `@here` and `here` behave the same.
 
 ## On failure
 

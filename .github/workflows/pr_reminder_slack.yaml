@@ -38,6 +38,7 @@ jobs:
       SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
       SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
       SLACK_CHANNEL_ID: ${{ vars.SLACK_CHANNEL_ID }}
+      SLACK_MENTION_GROUP_ID: ${{ vars.PR_REMINDER_SLACK_GROUP_ID || 'S0BKBNPFP0W' }}
       MAX_PRS: ${{ vars.PR_REMINDER_MAX_PRS || '10' }}
       STALE_HOURS: ${{ vars.PR_REMINDER_STALE_HOURS || '24' }}
       MAX_IDLE_DAYS: ${{ vars.PR_REMINDER_MAX_IDLE_DAYS || '30' }}

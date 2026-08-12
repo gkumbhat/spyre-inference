@@ -27,6 +27,8 @@ Environment variables:
   SLACK_WEBHOOK_URL       Slack incoming-webhook URL, channel is fixed by the hook (secret)
   SLACK_BOT_TOKEN         Slack bot token, needs chat:write (secret)
   SLACK_CHANNEL_ID        channel to post into on the bot-token path, e.g. C0123456789
+  SLACK_MENTION_GROUP_ID  who to ping in the header: a user group ID, or one of
+                          here/channel/everyone; empty pings nobody
   MAX_PRS                 how many PRs to list (default 10)
   STALE_HOURS             inactivity threshold in hours (default 24)
   MAX_IDLE_DAYS           skip PRs idle longer than this; 0 disables (default 30)
@@ -64,6 +66,12 @@ SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "")
 SLACK_CHANNEL_ID = os.environ.get("SLACK_CHANNEL_ID", "")
 
+SLACK_MENTION_GROUP_ID = os.environ.get("SLACK_MENTION_GROUP_ID", "")
+
+# Slack only notifies on mention *entities*; plain "@handle" text renders as
+# literal characters and pings nobody.
+BROADCAST_MENTIONS = ("here", "channel", "everyone")
+
 MAX_PRS = int(os.environ.get("MAX_PRS") or "10")
 STALE_HOURS = float(os.environ.get("STALE_HOURS") or "24")
 # Upper bound on idleness: a PR nobody has touched in a month is not a review
@@ -84,7 +92,7 @@ MAX_PAGES = 10
 FAILURE_ISSUE_TITLE = "[pr-reminder] daily PR reminder job failed"
 
 HEADER_TEMPLATE = os.environ.get("SLACK_HEADER_TEMPLATE") or (
-    ":eyes: *{count} open PRs with no activity in the last {stale_hours:g}h* "
+    "{mention} :eyes: *{count} open PRs with no activity in the last {stale_hours:g}h* "
     "in <{repo_url}|{repo}> — oldest first:"
 )
 PR_LINE_TEMPLATE = os.environ.get("SLACK_PR_LINE_TEMPLATE") or (
@@ -182,13 +190,28 @@ def escape_mrkdwn(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def build_mention(value: str) -> str:
+    """Render SLACK_MENTION_GROUP_ID as a Slack mention entity, or "" for none.
+
+    "here"/"channel"/"everyone" become the broadcast forms; anything else is
+    taken as a user group ID (handles get renamed, IDs don't).
+    """
+    value = value.strip().lstrip("@")
+    if not value:
+        return ""
+    if value.lower() in BROADCAST_MENTIONS:
+        return f"<!{value.lower()}>"
+    return f"<!subteam^{value}>"
+
+
 def render_message(top: list[dict], total: int, now: datetime) -> str:
     header = HEADER_TEMPLATE.format(
+        mention=build_mention(SLACK_MENTION_GROUP_ID),
         count=len(top),
         stale_hours=STALE_HOURS,
         repo=GITHUB_REPO,
         repo_url=f"https://github.com/{GITHUB_REPO}",
-    )
+    ).lstrip()  # no leading gap when the mention is disabled
     lines = [header]
     for rank, pr in enumerate(top, start=1):
         title = pr["title"].strip()
