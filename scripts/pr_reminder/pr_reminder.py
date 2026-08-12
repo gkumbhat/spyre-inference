@@ -313,15 +313,44 @@ def find_failure_issue(session: requests.Session) -> int | None:
     return None
 
 
-def format_error(error: BaseException) -> str:
-    text = "".join(traceback.format_exception(type(error), error, error.__traceback__)).strip()
-    # Failure text is published to Slack and to a public GitHub issue, and a
-    # requests/urllib error embeds the URL it failed to reach — which for the
-    # webhook path is itself the credential.
+def redact(text: str) -> str:
+    """Strip credentials from anything bound for a log, Slack, or a GitHub issue.
+
+    Error text from requests/slack_sdk embeds the URL it failed to reach, and on
+    the webhook path that URL *is* the credential. Everything that reports a
+    failure must go through here.
+    """
     for secret in (SLACK_WEBHOOK_URL, SLACK_BOT_TOKEN, GITHUB_TOKEN):
         if secret:
             text = text.replace(secret, "***")
     return text
+
+
+class RedactingFilter(logging.Filter):
+    """Redact secrets from every record reaching a handler, ours or a library's.
+
+    Redacting only our own messages is not enough: on a connection failure
+    slack_sdk logs the full request URL at INFO ("Going to retry the same
+    request: POST <url>"), and on the webhook path that URL is the credential.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.msg, str):
+            record.msg = redact(record.msg)
+        # Only strings are rewritten; coercing numeric args would break %d/%g.
+        if isinstance(record.args, tuple):
+            record.args = tuple(redact(a) if isinstance(a, str) else a for a in record.args)
+        return True
+
+
+for _handler in logging.getLogger().handlers:
+    _handler.addFilter(RedactingFilter())
+
+
+def format_error(error: BaseException) -> str:
+    return redact(
+        "".join(traceback.format_exception(type(error), error, error.__traceback__)).strip()
+    )
 
 
 def write_step_summary(text: str) -> None:
@@ -342,11 +371,11 @@ def report_failure(error: BaseException) -> int:
         post_to_slack(failure_text)
         return 1
     except (SlackClientError, RuntimeError, OSError) as slack_error:
-        log.error("Could not report the failure to Slack: %s", slack_error)
+        log.error("Could not report the failure to Slack: %s", redact(str(slack_error)))
     try:
         open_failure_issue(github_session(), error)
     except Exception as issue_error:  # last rung of the ladder
-        log.error("Could not open a failure issue either: %s", issue_error)
+        log.error("Could not open a failure issue either: %s", redact(str(issue_error)))
     return 1
 
 
@@ -378,7 +407,7 @@ def main() -> int:
         try:
             open_failure_issue(session, error)
         except Exception as issue_error:  # last rung of the ladder
-            log.error("Could not open a failure issue either: %s", issue_error)
+            log.error("Could not open a failure issue either: %s", redact(str(issue_error)))
         return 1
     return 0
 
