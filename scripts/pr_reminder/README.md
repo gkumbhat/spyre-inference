@@ -21,8 +21,8 @@ twice a day, plus manual dispatch:
 
 | Cron (UTC) | Zurich | US East | Audience |
 |---|---|---|---|
-| `3 9 * * *` | 10:03 CET / 11:03 CEST | 04:03 / 05:03 | European morning |
-| `3 15 * * *` | 16:03 / 17:03 | 10:03 EST / 11:03 EDT | US morning |
+| `3 8 * * *` | 10:03 CEST / 09:03 CET | 04:03 EDT / 03:03 EST | European morning |
+| `3 15 * * *` | 17:03 CEST / 16:03 CET | 11:03 EDT / 10:03 EST | US morning |
 
 Both fire off the hour on purpose — GitHub delays scheduled runs under load and the top
 of the hour is its documented peak. Cron has no DST handling, so each slides an hour
