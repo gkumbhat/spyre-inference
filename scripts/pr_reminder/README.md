@@ -17,7 +17,16 @@ the reminder would stop being actionable.
 reviews and label changes.
 
 Driven by [pr_reminder_slack.yaml](../../.github/workflows/pr_reminder_slack.yaml)
-(daily at 15:03 UTC — 10:03 EST, 11:03 EDT — plus manual dispatch).
+twice a day, plus manual dispatch:
+
+| Cron (UTC) | Zurich | US East | Audience |
+|---|---|---|---|
+| `3 9 * * *` | 10:03 CET / 11:03 CEST | 04:03 / 05:03 | European morning |
+| `3 15 * * *` | 16:03 / 17:03 | 10:03 EST / 11:03 EDT | US morning |
+
+Both fire off the hour on purpose — GitHub delays scheduled runs under load and the top
+of the hour is its documented peak. Cron has no DST handling, so each slides an hour
+later in local terms during summer time.
 
 ## Setup
 
