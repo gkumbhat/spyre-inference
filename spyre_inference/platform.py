@@ -330,6 +330,34 @@ class TorchSpyrePlatform(CpuPlatform):
         )
 
     @classmethod
+    def _force_fp16_head_for_token_classification(cls, vllm_config: VllmConfig) -> None:
+        """Keep the head dtype at float16 for ``*ForTokenClassification`` models.
+
+        vLLM defaults ``head_dtype`` to float32 for pooling runners whenever the
+        platform advertises float32 support, which ``CpuPlatform`` does. Unlike a
+        reranker -- whose classifier belongs to the pooler and can fall back to
+        CPU -- these models apply ``self.classifier`` inside ``forward`` on the
+        Spyre activations, and Spyre has no float32 batchmatmul, so a float32 head
+        cannot run at all. ``head_dtype="model"`` is vLLM's own opt-out and
+        resolves to the enforced float16 model dtype.
+        """
+        model_config = vllm_config.model_config
+        if model_config is None or model_config.runner_type != "pooling":
+            return
+        if not any("ForTokenClassification" in arch for arch in model_config.architectures):
+            return
+        if getattr(model_config.hf_config, "head_dtype", None) is not None:
+            return  # an explicit user override wins
+
+        model_config.hf_config.head_dtype = "model"
+        logger.info(
+            "Pooling: forcing head_dtype=model (%s) for %s; its classifier runs "
+            "inside the model forward on Spyre, which has no FP32 batchmatmul",
+            model_config.dtype,
+            model_config.architecture,
+        )
+
+    @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
         cls.log_server_boot(vllm_config)
 
@@ -340,6 +368,8 @@ class TorchSpyrePlatform(CpuPlatform):
                 f"The model dtype needs to be torch.float16 for spyre, "
                 f"but was specified to be {vllm_config.model_config.dtype}"
             )
+
+        cls._force_fp16_head_for_token_classification(vllm_config)
 
         # Pad attention head_dim up to a stick-aligned size on the native path.
         cls._maybe_pad_head_dim(vllm_config)

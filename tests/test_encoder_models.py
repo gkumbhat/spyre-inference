@@ -50,6 +50,25 @@ RERANKER_MODELS = [
     "BAAI/bge-reranker-v2-m3",
 ]
 
+# Token classification (token_classify / AllPool path). One vector per *token*
+# rather than per request, so the pooler runs on the host: upstream ``AllPool``
+# hands out ``torch.split`` views whose host storage_offset is a multiple of
+# num_labels, and torch-spyre#3798 rejects a device copy of an offset view unless
+# that offset is a multiple of the 64-element stick. Both architectures apply
+# ``self.classifier`` inside ``forward``, so it stays on Spyre in float16 (see
+# TorchSpyrePlatform._force_fp16_head_for_token_classification).
+TOKEN_CLASSIFY_MODELS = [
+    "dslim/bert-base-NER",
+    "Jean-Baptiste/roberta-large-ner-english",
+]
+TOKEN_CLASSIFY_PROMPTS = [
+    "My name is Wolfgang and I live in Berlin",
+    "George Washington went to Washington",
+]
+# Per-token argmax must match HF on this fraction of tokens. Not 1.0: the head
+# runs in float16 here against HF float32, so a near-tied token can flip.
+LABEL_AGREEMENT_MIN = 0.95
+
 # Match upstream check_embeddings_close(tol=1e-2).
 COSINE_MIN = 0.99
 
@@ -85,6 +104,23 @@ def _hf_last_token_embeddings(model: str, prompts: list[str]) -> list[list[float
         emb = hs[torch.arange(hs.size(0)), idx]
         emb = F.normalize(emb.float(), p=2, dim=-1)
     return emb.tolist()
+
+
+def _hf_token_labels(model: str, prompts: list[str]) -> list[list[int]]:
+    """CPU HF per-token argmax labels (matches vLLM AllPool + classifier + softmax)."""
+    from transformers import AutoModelForTokenClassification, AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(model)
+    hf = AutoModelForTokenClassification.from_pretrained(model)
+    hf.eval()
+
+    labels = []
+    with torch.inference_mode():
+        for prompt in prompts:
+            enc = tok(prompt, return_tensors="pt", truncation=True, max_length=64)
+            logits = hf(**enc).logits[0]
+            labels.append(logits.float().argmax(dim=-1).tolist())
+    return labels
 
 
 @pytest.mark.uses_subprocess
@@ -167,3 +203,46 @@ def test_encoder_rerank_models(model: str) -> None:
     scores = llm.score("What is Spyre?", "An IBM AI accelerator.")
     assert len(scores) == 1
     assert math.isfinite(scores[0].outputs.score)
+
+
+@pytest.mark.uses_subprocess
+@pytest.mark.parametrize("model", TOKEN_CLASSIFY_MODELS)
+def test_encoder_token_classify_models(model: str) -> None:
+    """Per-token labels match HF, with the pooler on the host.
+
+    Covers the whole token_classify path end to end: the encoder and the float16
+    classifier run on Spyre, the ``[num_tokens, num_labels]`` logits come back in
+    one D2H, and upstream ``AllPool`` partitions them per request on the host.
+
+    Asserts shape as well as labels — one row per prompt token — because a partition
+    that silently drops or duplicates rows is the failure mode this path is exposed
+    to, and argmax agreement alone would not catch a shifted split.
+    """
+    ref_labels = _hf_token_labels(model, TOKEN_CLASSIFY_PROMPTS)
+
+    llm = LLM(
+        model=model,
+        runner="pooling",
+        max_model_len=64,
+        max_num_seqs=len(TOKEN_CLASSIFY_PROMPTS),
+        enforce_eager=True,
+        pooler_config=PoolerConfig(task="token_classify"),
+    )
+    outputs = llm.encode(TOKEN_CLASSIFY_PROMPTS, pooling_task="token_classify")
+    assert len(outputs) == len(TOKEN_CLASSIFY_PROMPTS)
+
+    for prompt, out, ref in zip(TOKEN_CLASSIFY_PROMPTS, outputs, ref_labels):
+        data = torch.as_tensor(out.outputs.data).float()
+        assert data.ndim == 2, f"{model}: expected [num_tokens, num_labels], got {data.shape}"
+        assert data.shape[0] == len(ref), (
+            f"{model}: {data.shape[0]} token rows vs HF {len(ref)} for prompt {prompt!r} — "
+            "the per-request partition dropped or duplicated rows"
+        )
+        assert torch.isfinite(data).all(), f"{model}: non-finite logits for prompt {prompt!r}"
+
+        got = data.argmax(dim=-1).tolist()
+        agreement = sum(g == r for g, r in zip(got, ref)) / len(ref)
+        assert agreement >= LABEL_AGREEMENT_MIN, (
+            f"{model}: per-token label agreement {agreement:.3f} < {LABEL_AGREEMENT_MIN} "
+            f"vs HF for prompt {prompt!r}\n  spyre {got}\n  hf    {ref}"
+        )

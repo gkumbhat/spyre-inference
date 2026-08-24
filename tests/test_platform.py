@@ -507,3 +507,61 @@ def test_worker_reasserts_recompile_limits_after_autoload():
 
     src = inspect.getsource(spyre_worker.TorchSpyreWorker.init_device)
     assert src.index("torch_spyre._autoload()") < src.index("_raise_dynamo_recompile_limits()")
+
+
+def _fake_head_dtype_config(architectures, runner_type="pooling", head_dtype=None):
+    """Minimal stand-in for the fields ``_force_fp16_head_for_token_classification`` reads."""
+    hf = SimpleNamespace()
+    if head_dtype is not None:
+        hf.head_dtype = head_dtype
+    model_config = SimpleNamespace(
+        runner_type=runner_type,
+        architectures=architectures,
+        architecture=architectures[0],
+        hf_config=hf,
+        dtype=torch.float16,
+    )
+    return SimpleNamespace(model_config=model_config), hf
+
+
+def test_force_fp16_head_for_token_classification():
+    """``*ForTokenClassification`` gets head_dtype=model, so the head stays float16.
+
+    Its classifier runs inside ``forward`` on Spyre activations and Spyre has no
+    FP32 batchmatmul, so vLLM's float32 pooling default cannot run at all — and
+    unlike a reranker's, this classifier cannot fall back to CPU because the
+    activations feeding it are on device.
+    """
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config, hf = _fake_head_dtype_config(["BertForTokenClassification"])
+    TorchSpyrePlatform._force_fp16_head_for_token_classification(vllm_config)
+    assert hf.head_dtype == "model"
+
+
+def test_force_fp16_head_skips_sequence_classification():
+    """A reranker keeps vLLM's float32 default; its classifier can go to CPU."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config, hf = _fake_head_dtype_config(["XLMRobertaForSequenceClassification"])
+    TorchSpyrePlatform._force_fp16_head_for_token_classification(vllm_config)
+    assert not hasattr(hf, "head_dtype")
+
+
+def test_force_fp16_head_respects_explicit_override():
+    """An explicit hf_overrides head_dtype wins over the platform default."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config, hf = _fake_head_dtype_config(["BertForTokenClassification"], head_dtype="float32")
+    TorchSpyrePlatform._force_fp16_head_for_token_classification(vllm_config)
+    assert hf.head_dtype == "float32"
+
+
+def test_force_fp16_head_skips_generative_runner():
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config, hf = _fake_head_dtype_config(
+        ["BertForTokenClassification"], runner_type="generate"
+    )
+    TorchSpyrePlatform._force_fp16_head_for_token_classification(vllm_config)
+    assert not hasattr(hf, "head_dtype")

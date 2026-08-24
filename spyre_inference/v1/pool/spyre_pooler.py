@@ -153,6 +153,34 @@ def _module_has_float32_params(module: nn.Module) -> bool:
     return any(p.dtype == torch.float32 for p in module.parameters())
 
 
+def pooler_owned_classifier(model: nn.Module, pooler: nn.Module) -> nn.Module | None:
+    """``model.classifier`` only when the pooler is the thing that calls it.
+
+    Sequence-classification models hand their classifier to the pooler head, so a
+    CPU pooler needs it on CPU too. ``*ForTokenClassification`` models instead
+    apply ``self.classifier`` inside ``forward``, on activations that are still on
+    Spyre -- moving it there would leave a CPU weight fed a Spyre input. Identity,
+    not architecture name, decides: the seq-cls case passes the same module object
+    into the head, so it is reachable from the pooler.
+    """
+    classifier = getattr(model, "classifier", None)
+    if classifier is None:
+        return None
+
+    def _holds_classifier(node: nn.Module) -> bool:
+        # DispatchPooler.poolers_by_task is a plain dict, not an nn.ModuleDict, so
+        # nn.Module.__setattr__ never registers its values into _modules and
+        # node.modules() does not descend into it -- the same gap
+        # patch_normalize_for_spyre and friends already route around below.
+        # Missing this let a reranker's pooler-owned FP32 classifier look
+        # unowned, skip the CPU fallback, and run an FP32 batchmatmul on Spyre.
+        if isinstance(node, DispatchPooler):
+            return any(_holds_classifier(sub) for sub in node.poolers_by_task.values())
+        return any(m is classifier for m in node.modules())
+
+    return classifier if _holds_classifier(pooler) else None
+
+
 def patch_normalize_for_spyre(pooler: nn.Module) -> int:
     """Replace ``PoolerNormalize`` with ``SpyreNormalize``. Recurses ``DispatchPooler``."""
     if isinstance(pooler, DispatchPooler):
@@ -232,13 +260,16 @@ def configure_pooling_for_spyre(model: nn.Module, spyre_device: torch.device) ->
             reason,
         )
         pooler.to("cpu")
-        if hasattr(model, "classifier"):
-            model.classifier.to("cpu")
+        owned = pooler_owned_classifier(model, pooler)
+        if owned is not None:
+            owned.to("cpu")
         return False
 
-    classifier = getattr(model, "classifier", None)
+    classifier = pooler_owned_classifier(model, pooler)
     # Spyre has no FP32 batch matmul (reranker RobertaClassificationHead is
-    # float32 via head_dtype). Run pooler + classifier on CPU like MEAN.
+    # float32 via head_dtype). Run pooler + classifier on CPU like MEAN. A
+    # forward-owned classifier is not a candidate: it cannot leave the device, so
+    # TorchSpyrePlatform forces its head dtype to float16 instead.
     fp32_head = _module_has_float32_params(pooler) or (
         classifier is not None and _module_has_float32_params(classifier)
     )
