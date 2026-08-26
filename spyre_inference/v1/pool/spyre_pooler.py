@@ -29,14 +29,18 @@ from vllm.model_executor.layers.pooler.seqwise.methods import (
 )
 from vllm.model_executor.layers.pooler.seqwise.poolers import SequencePooler
 from vllm.model_executor.layers.pooler.special import DispatchPooler
+from vllm.model_executor.layers.pooler.tokwise.poolers import TokenPooler
 from vllm.v1.outputs import PoolerOutput
 
 from spyre_inference.custom_ops.utils import convert
 
 logger = init_logger(__name__)
 
-# AllPool uses slice views; unsafe on Spyre.
-TOKEN_POOLING_TASKS = frozenset({"token_embed", "token_classify"})
+# REPRO BRANCH ONLY: token_embed's TokenEmbeddingPoolerHead still has its own
+# unaddressed fp32 head_dtype cast (see patch_embedding_heads_for_spyre), so it
+# stays restricted. token_classify is the one this branch deliberately
+# re-enables, naively, to reproduce torch-spyre#3798 through a real server.
+TOKEN_POOLING_TASKS = frozenset({"token_embed"})
 
 
 class SpyreEmbeddingPoolerHead(EmbeddingPoolerHead):
@@ -236,6 +240,13 @@ def patch_pooler_for_spyre(pooler: nn.Module) -> tuple[int, list[str]]:
             num_patched += 1
         elif isinstance(pooling, SequencePoolingMethod):
             unsupported.append(type(pooling).__name__)
+    elif isinstance(pooler, TokenPooler):
+        # REPRO BRANCH ONLY: nothing swapped -- AllPool.forward()'s torch.split
+        # is a standard PyTorch op, assumed here to work like it does on every
+        # other device. It doesn't: torch-spyre#3798 rejects the per-request
+        # views it produces. See scripts/repro_3798_via_vllm.py, which does the
+        # same thing at runtime via monkeypatch instead of committing to it here.
+        num_patched += 1
     elif isinstance(pooler, DispatchPooler):
         for sub in pooler.poolers_by_task.values():
             sub_patched, sub_unsupported = patch_pooler_for_spyre(sub)
