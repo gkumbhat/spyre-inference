@@ -20,7 +20,7 @@ xfail: when a primitive starts working in torch-spyre, the corresponding
 probe flips to XPASS and we can remove the associated workaround here.
 
 All tests run against the real Spyre device when available; otherwise they
-skip silently (the same pattern used by test_spyre_attn.py).
+skip silently (the same pattern used by attention/test_spyre_attn.py).
 """
 
 import pytest
@@ -96,7 +96,8 @@ def test_spyre_lm_head_unpadded_matmul_and_slice(spyre_device):
         "layout of x to carry x_var=d1' (out=1 case; out>=2 works, so this is "
         "distinct from the 64*(k*32) work-division limit in torch-spyre#1918). "
         "Fails in both eager and compile. "
-        "When supported, please adapt tests/test_mlp.py::test_replicated_matches_reference"
+        "When supported, please adapt "
+        "tests/custom_ops/test_mlp.py::test_replicated_matches_reference"
     ),
 )
 def test_spyre_matmul_output_dim_1(spyre_device, mode):
@@ -196,7 +197,7 @@ def test_spyre_single_row_index_select(spyre_device):
 
 
 # Note: the embedding single-row probe lives in
-# tests/test_vocab_parallel_embedding.py::test_single_token_embedding_on_device.
+# tests/custom_ops/test_vocab_parallel_embedding.py::test_single_token_embedding_on_device.
 # It is intentionally not duplicated here.
 
 
@@ -503,14 +504,6 @@ def test_spyre_narrow_copy_row_write(spyre_device, mode):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "In-place multiplication on a non-contiguous Spyre tensor triggers "
-        "a torch-spyre compile issue. This forces SpyreLogitsProcessor to "
-        "call .contiguous() on the logits before downstream scaling."
-    ),
-)
 def test_spyre_inplace_mul_noncontiguous(spyre_device):
     """In-place mul on a transposed/logit-shaped non-contiguous Spyre tensor."""
     logits = torch.randn(32, 32000, dtype=torch.float16, device=spyre_device).t()[:32]
@@ -591,31 +584,7 @@ def test_spyre_ondevice_scatter_into_output_at_offset(spyre_device):
     torch.testing.assert_close(output.cpu(), expected, atol=0, rtol=0)
 
 
-@pytest.mark.parametrize(
-    "source",
-    [
-        "clone",
-        pytest.param(
-            "view",
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason=(
-                    "A device-to-device slice write copies the source's whole "
-                    "underlying extent instead of the view's size, so a prefix view "
-                    "overwrites rows past the destination slice — corrupting the next "
-                    "sequence in the batch (torch-spyre#3826). .contiguous() does not "
-                    "help: a prefix slice is already contiguous and keeps the same "
-                    "storage. This is why the write-back in "
-                    "SpyreAttentionImpl._online_softmax_attention clones the unpadded "
-                    "result. Once this probe XPASSes, drop that .clone(). NB: the "
-                    "overrun only appears once another prefix-view slice write at a "
-                    "different view length has already run in the process, so this "
-                    "test arms it itself — see the warm-up in the body."
-                ),
-            ),
-        ),
-    ],
-)
+@pytest.mark.parametrize("source", ["clone", "view"])
 def test_spyre_scatter_from_prefix_view_source(spyre_device, source):
     """Slice-assign whose source is a prefix view of a longer tensor.
 
@@ -630,6 +599,9 @@ def test_spyre_scatter_from_prefix_view_source(spyre_device, source):
     overrun only shows up once one at a *different* view length has already
     run. The warm-up below arms it, so the verdict does not depend on which
     other tests happened to run first in this process.
+
+    Both sources land correctly as of torch-spyre#3826; before that the ``view``
+    case overran, which forced a ``.clone()`` in the write-back.
     """
     num_heads, head_size = 32, 128
     aligned_q, query_len, q_start = 64, 32, 32
@@ -693,39 +665,17 @@ def test_spyre_compile_input_honors_storage_offset(spyre_device, dtype):
 # ---------------------------------------------------------------------------
 
 
-def _slot_major_cache(num_slots, num_kv_heads, head_size, spyre_device, pinned):
-    """A zeroed slot-major KV cache, with or without the slot-outermost pin."""
-    from spyre_inference.v1.attention.backends.spyre_attn import slot_major_kv_layout
-
-    base = torch.zeros(num_slots, num_kv_heads, head_size, dtype=torch.float16)
-    if not pinned:
-        return base.to(spyre_device)
-    # .to(device_layout=) needs a live RuntimeContext; prime it.
-    torch.empty(1, device=spyre_device)
-    layout = slot_major_kv_layout(num_slots, num_kv_heads, head_size, torch.float16)
-    return base.to(spyre_device, device_layout=layout)
+def _slot_major_cache(num_slots, num_kv_heads, head_size, spyre_device):
+    return torch.zeros(num_slots, num_kv_heads, head_size, dtype=torch.float16, device=spyre_device)
 
 
-@pytest.mark.parametrize(
-    "pinned",
-    [
-        True,
-        pytest.param(
-            False,
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason=(
-                    "On the default device layout index_copy_ writes to the wrong "
-                    "rows and raises nothing (torch-spyre#3705); if this XPASSes, "
-                    "slot_major_kv_layout and the host allocate-then-transfer can go."
-                ),
-            ),
-        ),
-    ],
-)
-def test_spyre_slot_major_scatter_needs_pinned_layout(spyre_device, pinned):
-    """The reshape_and_cache scatter hits exactly slot_mapping, and only when
-    the cache is slot-outermost."""
+def test_spyre_slot_major_scatter_hits_exact_slots(spyre_device):
+    """The reshape_and_cache scatter hits exactly slot_mapping.
+
+    Was strict-xfail on torch-spyre#3705: index_copy_ on the default device
+    layout silently wrote the wrong rows, which forced a host-allocated cache
+    under a pinned slot-outermost layout.
+    """
     num_blocks, block_size, num_kv_heads, head_size = 8, 64, 8, 128
     num_slots = num_blocks * block_size
 
@@ -736,7 +686,7 @@ def test_spyre_slot_major_scatter_needs_pinned_layout(spyre_device, pinned):
     def scatter(pages, index, src):
         pages.index_copy_(0, index, src)
 
-    pages = _slot_major_cache(num_slots, num_kv_heads, head_size, spyre_device, pinned)
+    pages = _slot_major_cache(num_slots, num_kv_heads, head_size, spyre_device)
     torch.compile(scatter, dynamic=False)(pages, slots.to(spyre_device), kv_cpu.to(spyre_device))
 
     expected = torch.zeros(num_slots, num_kv_heads, head_size, dtype=torch.float16)
@@ -777,7 +727,7 @@ def test_spyre_slot_major_scatter_needs_compile(spyre_device, mode):
     if mode == "compile":
         scatter = torch.compile(scatter, dynamic=False)
 
-    pages = _slot_major_cache(num_slots, num_kv_heads, head_size, spyre_device, pinned=True)
+    pages = _slot_major_cache(num_slots, num_kv_heads, head_size, spyre_device)
     scatter(pages, slots.to(spyre_device), kv_cpu.to(spyre_device))
 
     assert pages.device.type == "spyre", "scatter left the device"
@@ -803,7 +753,7 @@ def test_spyre_slot_major_scatter_strided_source(spyre_device):
             v.view(num_tokens, num_kv_heads, head_size),
         )
 
-    pages = _slot_major_cache(num_slots, num_kv_heads, head_size, spyre_device, pinned=True)
+    pages = _slot_major_cache(num_slots, num_kv_heads, head_size, spyre_device)
     k_dev, _ = kv_views(qkv_cpu.to(spyre_device))
     assert not k_dev.is_contiguous() and k_dev.storage_offset() > 0
 
@@ -819,3 +769,29 @@ def test_spyre_slot_major_scatter_strided_source(spyre_device):
     written = got.ne(0).any(-1).any(-1).nonzero().flatten().tolist()
     assert written == sorted(slots.tolist()), f"scatter hit the wrong rows: {written}"
     torch.testing.assert_close(got, expected, atol=1e-2, rtol=1e-2)
+
+
+# ---------------------------------------------------------------------------
+# 9. Scalar pow
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "torch.pow(x, 3) returns |x| ** 4 on Spyre, so gelu_new degenerates to "
+        "the identity for negative inputs. Exponents 2 and 4 are correct. When "
+        "this passes, drop custom_ops/activation.py::SpyreNewGELU. Tracked by "
+        "torch-spyre#4009."
+    ),
+)
+def test_spyre_scalar_pow_cube(spyre_device):
+    """torch.pow with exponent 3 on a device-produced tensor."""
+    # x has to come from an on-device op: a host-copied tensor of unaligned width
+    # is re-tiled and the comparison stops being meaningful.
+    a = torch.randn(8, 256, dtype=torch.float16, device=spyre_device)
+    b = torch.randn(256, 3072, dtype=torch.float16, device=spyre_device) / 32
+    x = a @ b
+
+    expected = x.cpu().float() ** 3
+    torch.testing.assert_close(torch.pow(x, 3).cpu().float(), expected, atol=1e-1, rtol=5e-2)

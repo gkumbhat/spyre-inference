@@ -201,15 +201,70 @@ jobs:
               - linux
             image_label: image_torch_spyre
             test_target: test-compile
-          - cfg: Spyre attention tests
-            # Decoder attention only; the encoder split runs below.
+          # Decoder attention, sharded across parallel jobs. The compiled
+          # (STOCK on device) cases dominate runtime and grow HBM within a
+          # process, so each shard is its own job on its own card: wall-clock
+          # drops to the slowest shard and per-process HBM growth stays bounded
+          # (each shard holds only ~1/N of the compiled cases). The plugin owns
+          # the weighted partition; ATTN_SHARDS (Makefile default) is the count.
+          # Adding/removing a shard = add/remove an entry here and bump that
+          # default. The encoder split runs below.
+          - cfg: Spyre attention tests (shard 1/7)
             test_types: unit regression trunk
             runs_on:
               - x86_64
               - spyre_pf_x1
               - linux
             image_label: image_torch_spyre
-            test_target: test-attention
+            test_target: test-attention-shard-0
+          - cfg: Spyre attention tests (shard 2/7)
+            test_types: unit regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x1
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-attention-shard-1
+          - cfg: Spyre attention tests (shard 3/7)
+            test_types: unit regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x1
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-attention-shard-2
+          - cfg: Spyre attention tests (shard 4/7)
+            test_types: unit regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x1
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-attention-shard-3
+          - cfg: Spyre attention tests (shard 5/7)
+            test_types: unit regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x1
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-attention-shard-4
+          - cfg: Spyre attention tests (shard 6/7)
+            test_types: unit regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x1
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-attention-shard-5
+          - cfg: Spyre attention tests (shard 7/7)
+            test_types: unit regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x1
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-attention-shard-6
           - cfg: Encoder attention tests
             test_types: unit regression trunk
             runs_on:
@@ -268,6 +323,10 @@ jobs:
       # Force cache-only: fork PRs have no HF_TOKEN, so Hub revalidation
       # against a gated repo 401s even when the model is on the PVC.
       HF_HUB_OFFLINE: '1'
+      # torch-spyre#3707's HBM pool planner corrupts compiled output and leaks
+      # HBM across fallback boundaries; spyre_inference sets this too, but only if
+      # nothing has imported torch_spyre before it, so pin it for the whole job.
+      HBM_POOL_PLANNING: '0'
 
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -581,6 +640,10 @@ jobs:
       STORAGE_1_DIR: /storage-1/spyre-inference
       HF_HOME: /storage-1/spyre-inference/.cache/huggingface
       HF_HUB_OFFLINE: '1'
+      # torch-spyre#3707's HBM pool planner corrupts compiled output and leaks
+      # HBM across fallback boundaries; spyre_inference sets this too, but only if
+      # nothing has imported torch_spyre before it, so pin it for the whole job.
+      HBM_POOL_PLANNING: '0'
       RESULTS_DIR: benchmark-results
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
