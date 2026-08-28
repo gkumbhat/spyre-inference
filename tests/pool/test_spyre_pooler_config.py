@@ -32,10 +32,12 @@ from vllm.model_executor.layers.pooler.special import DispatchPooler
 
 from spyre_inference.v1.pool.spyre_pooler import (
     SpyreCLSPool,
+    SpyreCpuClassifier,
     SpyreEmbeddingPoolerHead,
     SpyreLastPool,
     SpyreNormalize,
     configure_pooling_for_spyre,
+    run_pooling_tail_on_cpu,
 )
 
 _SPYRE = torch.device("cpu")  # configure only needs a device label for logging
@@ -104,3 +106,30 @@ def test_configure_pooling_fp32_classifier_falls_back_to_cpu():
 
 def test_configure_pooling_no_pooler_returns_false():
     assert configure_pooling_for_spyre(nn.Module(), _SPYRE) is False
+
+
+def test_model_applied_classifier_is_wrapped_for_cpu() -> None:
+    """A classifier the pooler does not own is applied by the model: wrap it."""
+    model = nn.Module()
+    model.classifier = nn.Linear(4, 2, dtype=torch.float32)
+    model.head_dtype = torch.float32
+    pooler = SequencePooler(pooling=MeanPool(), head=None)
+
+    run_pooling_tail_on_cpu(model, pooler)
+
+    assert isinstance(model.classifier, SpyreCpuClassifier)
+    assert model.head_dtype == torch.float16
+
+
+def test_pooler_owned_classifier_is_not_wrapped() -> None:
+    """A reranker head owns the classifier, so moving it to CPU is enough."""
+    classifier = nn.Linear(4, 2, dtype=torch.float32)
+    model = nn.Module()
+    model.classifier = classifier
+    pooler = SequencePooler(pooling=MeanPool(), head=None)
+    pooler.head = nn.Module()
+    pooler.head.classifier = classifier
+
+    run_pooling_tail_on_cpu(model, pooler)
+
+    assert model.classifier is classifier

@@ -149,6 +149,41 @@ class SpyreNormalize(PoolerNormalize):
         return pooled_data * sumsq.add(eps).rsqrt()
 
 
+class SpyreCpuClassifier(nn.Module):
+    """D2H wrapper for a classifier the model applies in its own forward.
+
+    Token-classification models call ``self.classifier`` themselves, so moving it
+    to CPU with the pooler leaves it receiving Spyre activations.
+    """
+
+    def __init__(self, classifier: nn.Module) -> None:
+        super().__init__()
+        self.classifier = classifier
+        self.param_dtype = next(classifier.parameters()).dtype
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.classifier(convert(hidden_states, "cpu").to(self.param_dtype))
+
+
+def run_pooling_tail_on_cpu(model: nn.Module, pooler: nn.Module) -> None:
+    """Move pooler and classifier to CPU, wrapping a model-applied classifier."""
+    pooler.to("cpu")
+    classifier = getattr(model, "classifier", None)
+    if classifier is None or isinstance(classifier, SpyreCpuClassifier):
+        return
+    # A reranker head owns the classifier and applies it after the pooler moves;
+    # anything else is applied by the model itself and needs the D2H wrapper.
+    owned = any(getattr(m, "classifier", None) is classifier for m in pooler.modules())
+    classifier.to("cpu")
+    if owned:
+        return
+    # An on-device fp16->fp32 cast returns wrong data, so neutralize the model's
+    # head_dtype cast and upcast on the host instead.
+    if getattr(model, "head_dtype", None) is not None:
+        model.head_dtype = torch.float16
+    model.classifier = SpyreCpuClassifier(classifier)
+
+
 def _module_has_float32_params(module: nn.Module) -> bool:
     return any(p.dtype == torch.float32 for p in module.parameters())
 
@@ -231,9 +266,7 @@ def configure_pooling_for_spyre(model: nn.Module, spyre_device: torch.device) ->
             "Pooling: %s has no Spyre path; running the pooler on CPU",
             reason,
         )
-        pooler.to("cpu")
-        if hasattr(model, "classifier"):
-            model.classifier.to("cpu")
+        run_pooling_tail_on_cpu(model, pooler)
         return False
 
     classifier = getattr(model, "classifier", None)
@@ -243,9 +276,7 @@ def configure_pooling_for_spyre(model: nn.Module, spyre_device: torch.device) ->
         classifier is not None and _module_has_float32_params(classifier)
     )
     if fp32_head:
-        pooler.to("cpu")
-        if classifier is not None:
-            classifier.to("cpu")
+        run_pooling_tail_on_cpu(model, pooler)
         logger.info(
             "Pooling: FP32 classifier/head unsupported on Spyre "
             "(no FP32 batchmatmul); running pooler on CPU"
