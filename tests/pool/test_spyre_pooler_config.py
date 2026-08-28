@@ -28,15 +28,19 @@ from vllm.model_executor.layers.pooler.activations import PoolerNormalize
 from vllm.model_executor.layers.pooler.seqwise.heads import EmbeddingPoolerHead
 from vllm.model_executor.layers.pooler.seqwise.methods import CLSPool, LastPool, MeanPool
 from vllm.model_executor.layers.pooler.seqwise.poolers import SequencePooler
+from vllm.model_executor.layers.pooler.tokwise.methods import AllPool, StepPool
+from vllm.model_executor.layers.pooler.tokwise.poolers import TokenPooler
 from vllm.model_executor.layers.pooler.special import DispatchPooler
 
 from spyre_inference.v1.pool.spyre_pooler import (
+    SpyreAllPool,
     SpyreCLSPool,
     SpyreCpuClassifier,
     SpyreEmbeddingPoolerHead,
     SpyreLastPool,
     SpyreNormalize,
     configure_pooling_for_spyre,
+    patch_pooler_for_spyre,
     run_pooling_tail_on_cpu,
 )
 
@@ -133,3 +137,41 @@ def test_pooler_owned_classifier_is_not_wrapped() -> None:
     run_pooling_tail_on_cpu(model, pooler)
 
     assert model.classifier is classifier
+
+
+def _token_pooler(cls) -> TokenPooler:
+    """``AllPool.__init__`` reads the vLLM config; bypass it for a unit test."""
+    pooling = cls.__new__(cls)
+    nn.Module.__init__(pooling)
+    pooling.enable_chunked_prefill = False
+    return TokenPooler(pooling=pooling, head=None)
+
+
+def test_token_pooler_all_pool_is_patched():
+    pooler = _token_pooler(AllPool)
+    num_patched, unsupported = patch_pooler_for_spyre(pooler)
+    assert (num_patched, unsupported) == (1, [])
+    assert isinstance(pooler.pooling, SpyreAllPool)
+
+
+def test_token_pooler_step_pool_is_unsupported():
+    """StepPool subclasses AllPool but indexes by step tag; keep it on CPU."""
+    pooler = _token_pooler(StepPool)
+    num_patched, unsupported = patch_pooler_for_spyre(pooler)
+    assert (num_patched, unsupported) == (0, ["StepPool"])
+
+
+def test_spyre_all_pool_matches_torch_split():
+    counts = [3, 1, 4]
+    hidden_states = torch.arange(sum(counts) * 9, dtype=torch.float16).reshape(-1, 9)
+
+    class _Cursor:
+        num_scheduled_tokens_cpu = torch.tensor(counts)
+
+    class _Meta:
+        def get_pooling_cursor(self):
+            return _Cursor()
+
+    got = SpyreAllPool(enable_chunked_prefill=False)(hidden_states, _Meta())
+    for chunk, expected in zip(got, torch.split(hidden_states, counts)):
+        assert torch.equal(chunk, expected)

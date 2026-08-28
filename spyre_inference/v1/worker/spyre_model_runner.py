@@ -57,7 +57,6 @@ from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.layers.attention.attention import Attention
 from vllm.model_executor.models.interfaces_base import VllmModelForPooling
 from vllm.model_executor.models.utils import PPMissingLayer
-from vllm.tasks import PoolingTask
 from vllm.v1.outputs import (
     AsyncModelRunnerOutput,
     KVConnectorOutput,
@@ -79,7 +78,6 @@ from spyre_inference.custom_ops.head_pad import (
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.attention import attn_layer
 from spyre_inference.v1.pool import (
-    TOKEN_POOLING_TASKS,
     configure_pooling_for_spyre,
     copy_pooler_output_to_cpu,
     select_rows,
@@ -708,20 +706,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Sampler warmup only needs last_hidden_states on CPU.
         return hidden_states, last_hidden_states
 
-    def get_supported_pooling_tasks(self) -> list[PoolingTask]:
-        """Drop token-level tasks on Spyre pooler (slice views are unsafe)."""
-        tasks = super().get_supported_pooling_tasks()
-        if not self._pooling_on_spyre:
-            return tasks
-
-        supported = [t for t in tasks if t not in TOKEN_POOLING_TASKS]
-        if tasks and not supported:
-            raise RuntimeError(
-                f"Model {self.model_config.model} supports only token-level "
-                "pooling, which is unsupported while the pooler runs on Spyre."
-            )
-        return supported
-
     def _pool(
         self,
         hidden_states: torch.Tensor,
@@ -753,14 +737,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
         assert num_reqs == len(self.input_batch.pooling_params), (
             "Either all or none of the requests in a batch must be pooling request"
         )
-
-        for params in self.input_batch.pooling_params.values():
-            if params.task in TOKEN_POOLING_TASKS:
-                raise NotImplementedError(
-                    f"Pooling task {params.task!r} returns per-sequence views "
-                    "of hidden_states, which is unsupported while the pooler "
-                    "runs on Spyre."
-                )
 
         # Crop via index_select — Spyre dim-0 slice views are unsafe.
         hidden_states = convert(hidden_states, self._spyre_device)
