@@ -347,6 +347,25 @@ class _SpyreModelWrapper:
         hidden_states = convert(hidden_states, device=self._spyre_device)
         return self._model.compute_logits(hidden_states, *args, **kwargs)
 
+    def embed_multimodal(self, **kwargs):
+        """Move multimodal encoder inputs (e.g. pixel_values) onto Spyre.
+
+        _execute_mm_encoder calls this directly on `self.model`, bypassing
+        __call__, so it needs its own CPU <-> Spyre boundary conversion.
+        `group_and_batch_mm_kwargs` batches multimodal kwargs onto
+        self.device=CPU, but the vision tower's weights live on Spyre.
+        """
+
+        def _to_spyre(t):
+            return convert(t, device=self._spyre_device) if isinstance(t, torch.Tensor) else t
+
+        def _to_cpu(t):
+            return convert(t, device="cpu") if isinstance(t, torch.Tensor) else t
+
+        kwargs_converted = {key: _to_spyre(val) for key, val in kwargs.items()}
+        result = self._model.embed_multimodal(**kwargs_converted)
+        return tree_map(_to_cpu, result)
+
     def __getattr__(self, name):
         return getattr(self._model, name)
 
