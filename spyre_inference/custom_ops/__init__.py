@@ -25,6 +25,7 @@ from . import (
     layer_norm,
     linear,
     logits_processor,  # noqa: F401
+    multimodal_merge,
     parallel_lm_head,
     rms_norm,
     rotary_embedding,
@@ -43,3 +44,4 @@ def register_all():
     utils.register()
     vocab_parallel_embedding.register()
     layer_norm.register()
+    multimodal_merge.register()
