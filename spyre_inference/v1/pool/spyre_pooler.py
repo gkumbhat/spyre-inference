@@ -37,6 +37,9 @@ from spyre_inference.custom_ops.utils import convert
 
 logger = init_logger(__name__)
 
+# fp16 elements per 128-byte stick; the modulus torch-spyre#3798's offset guard checks.
+ELEMS_PER_STICK = 64
+
 
 class SpyreEmbeddingPoolerHead(EmbeddingPoolerHead):
     """D2H before ``.to(head_dtype)`` when dtype changes; rest is upstream.
@@ -169,6 +172,46 @@ class SpyreAllPool(AllPool):
         return out
 
 
+class SpyrePaddedAllPool(AllPool):
+    """Per-request rows via a plain slice on a label width padded to a stick
+    multiple, instead of ``SpyreAllPool``'s ``select_rows`` gather.
+
+    ``AllPool``'s ``torch.split`` on the model's real ``[T, num_labels]`` output
+    trips torch-spyre#3798: chunk k's host storage_offset is ``start *
+    num_labels``, a multiple of 64 (the fp16 stick) only by coincidence.
+    ``pad_classifier_for_spyre`` widens the classifier's output to a multiple of
+    64 so every offset becomes ``start * 64`` -- always aligned -- and a plain
+    slice clears the guard with no gather at all.
+
+    ``real_width`` is set by ``pad_classifier_for_spyre`` once the model's
+    classifier is known: ``patch_pooler_for_spyre`` only sees the pooler, not the
+    model, so it cannot be supplied at construction time.
+    """
+
+    def __init__(self, enable_chunked_prefill: bool) -> None:
+        nn.Module.__init__(self)
+        self.enable_chunked_prefill = enable_chunked_prefill
+        self.real_width: int | None = None
+
+    def forward(self, hidden_states, pooling_metadata):
+        if self.enable_chunked_prefill:
+            raise NotImplementedError(
+                "chunked prefill is unsupported with token-level pooling on Spyre"
+            )
+        if self.real_width is None:
+            raise RuntimeError(
+                "SpyrePaddedAllPool.real_width was never set -- "
+                "pad_classifier_for_spyre must run before the first forward"
+            )
+        counts = pooling_metadata.get_pooling_cursor().num_scheduled_tokens_cpu.tolist()
+        out = []
+        start = 0
+        for n in counts:
+            out.append(hidden_states[start : start + n, : self.real_width])
+            start += n
+        return out
+
+
 def prepare_token_head_for_spyre(
     model: nn.Module, pooler: nn.Module, spyre_device: torch.device
 ) -> None:
@@ -193,6 +236,72 @@ def prepare_token_head_for_spyre(
         for param in target.parameters(recurse=True):
             if param.dtype == torch.float32:
                 param.data = convert(param.data, spyre_device, torch.float16)
+
+
+def _padded_parameter(
+    param: torch.Tensor, padded_width: int, real_width: int, spyre_device: torch.device
+) -> nn.Parameter:
+    """A fresh, already-fp16-on-Spyre Parameter, zero-padded to ``padded_width``
+    rows with ``param``'s real values copied into the first ``real_width``.
+
+    Built and padded entirely on CPU, then converted once. The result is wrapped
+    in a brand-new ``nn.Parameter`` and must be assigned by attribute
+    (``module.weight = ...``), never via ``.data =`` onto an existing Parameter:
+    a plain ``nn.Linear``'s auto-created Parameter and whatever tensor type
+    ``convert()`` returns are not "compatible tensor types" for that swap
+    (``RuntimeError: variable.set_data(tensor)``), even though both are
+    nominally CPU/float32 in Python.
+    """
+    cpu_value = convert(param.detach(), "cpu")
+    padded_cpu = torch.zeros(padded_width, *cpu_value.shape[1:], dtype=cpu_value.dtype)
+    padded_cpu[:real_width] = cpu_value
+    return nn.Parameter(convert(padded_cpu, spyre_device, torch.float16), requires_grad=False)
+
+
+def pad_classifier_for_spyre(
+    model: nn.Module, pooler: nn.Module, spyre_device: torch.device
+) -> None:
+    """Widen a forward-owned classifier's output to a stick multiple (64), so
+    ``SpyrePaddedAllPool``'s per-request row slice always starts at an offset
+    torch-spyre#3798's guard accepts.
+
+    Does its own fp16 + device conversion (via ``_padded_parameter``) rather than
+    leaving it to ``prepare_token_head_for_spyre``'s later ``param.data =
+    convert(...)`` loop: that loop only fires ``if param.dtype == torch.float32``,
+    which the widened classifier's already-fp16 parameters correctly skip, so the
+    two never touch the same parameter.
+
+    Extra output columns are zero-weighted and never read back --
+    ``SpyrePaddedAllPool`` trims every chunk to the real width before returning
+    it -- so they cannot change the classifier's real output.
+    """
+    targets = [m for m in pooler.modules() if isinstance(m, SpyrePaddedAllPool)]
+    if not targets:
+        return
+
+    classifier = getattr(model, "classifier", None)
+    if not isinstance(classifier, nn.Linear):
+        raise RuntimeError(
+            "pad_classifier_for_spyre only knows how to widen a plain nn.Linear "
+            f"classifier; got {type(classifier).__name__}"
+        )
+
+    real_width = classifier.out_features
+    padded_width = ((real_width + ELEMS_PER_STICK - 1) // ELEMS_PER_STICK) * ELEMS_PER_STICK
+    if padded_width != real_width:
+        wide = nn.Linear(
+            classifier.in_features,
+            padded_width,
+            bias=classifier.bias is not None,
+            device="cpu",
+        )
+        wide.weight = _padded_parameter(classifier.weight, padded_width, real_width, spyre_device)
+        if classifier.bias is not None:
+            wide.bias = _padded_parameter(classifier.bias, padded_width, real_width, spyre_device)
+        model.classifier = wide
+
+    for pool in targets:
+        pool.real_width = real_width
 
 
 class SpyreCpuClassifier(nn.Module):
@@ -291,10 +400,10 @@ def patch_pooler_for_spyre(pooler: nn.Module) -> tuple[int, list[str]]:
             unsupported.append(type(pooling).__name__)
     elif isinstance(pooler, TokenPooler):
         pooling = pooler.pooling
-        if isinstance(pooling, SpyreAllPool):
+        if isinstance(pooling, SpyrePaddedAllPool):
             num_patched += 1
         elif type(pooling) is AllPool:
-            pooler.pooling = SpyreAllPool(pooling.enable_chunked_prefill)
+            pooler.pooling = SpyrePaddedAllPool(pooling.enable_chunked_prefill)
             num_patched += 1
         else:
             unsupported.append(type(pooling).__name__)
@@ -324,10 +433,14 @@ def configure_pooling_for_spyre(model: nn.Module, spyre_device: torch.device) ->
         run_pooling_tail_on_cpu(model, pooler)
         return False
 
-    classifier = getattr(model, "classifier", None)
-    token_level = any(isinstance(m, SpyreAllPool) for m in pooler.modules())
+    token_level = any(isinstance(m, SpyrePaddedAllPool) for m in pooler.modules())
     if token_level:
+        pad_classifier_for_spyre(model, pooler, spyre_device)
         prepare_token_head_for_spyre(model, pooler, spyre_device)
+
+    # Re-read after pad_classifier_for_spyre: it may have replaced model.classifier
+    # with the padded module, and the checks below must see the live one.
+    classifier = getattr(model, "classifier", None)
 
     # Spyre has no FP32 batch matmul (reranker RobertaClassificationHead is
     # float32 via head_dtype). Run pooler + classifier on CPU like MEAN.
