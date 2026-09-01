@@ -24,6 +24,7 @@ from . import (
     conv,  # noqa: F401
     gate_linear,  # noqa: F401
     gemma_rms_norm,  # noqa: F401
+    layer_norm,
     linear,
     logits_processor,  # noqa: F401
     parallel_lm_head,
@@ -41,3 +42,5 @@ def register_all():
     logger.info("Registering custom ops for spyre_inference")
     register_spyre_fp8_linear_kernel()
     utils.register()
+    vocab_parallel_embedding.register()
+    layer_norm.register()
