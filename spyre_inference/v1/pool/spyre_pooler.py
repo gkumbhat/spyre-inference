@@ -112,18 +112,27 @@ def select_rows(hidden_states: torch.Tensor, row_indices_cpu: torch.Tensor) -> t
             hidden_states, 0, flat_idx.to(device=hidden_states.device, dtype=torch.long)
         )
 
+    # hidden_states is typically a slice of a larger persistent buffer (e.g.
+    # vLLM's `hidden_states[:num_scheduled_tokens]` trim before pooling).
+    # Slicing (as opposed to narrow()) leaves view metadata pointing into the
+    # parent buffer that the native scheduler can't map for index_select
+    # ("0_identity" DtException), even though the slice is already contiguous
+    # -- .contiguous() is then a no-op and doesn't help. Index the underlying
+    # base buffer directly instead (shifting indices by the slice's row
+    # offset): same result, no copy needed.
+    base = hidden_states
+    if hidden_states._base is not None:
+        base = hidden_states._base
+        row_offset = (
+            hidden_states.storage_offset() - base.storage_offset()
+        ) // hidden_states.stride(0)
+        if row_offset:
+            flat_idx = flat_idx + row_offset
+
     # Spyre has no int64 index kernel. convert() H2D is blocking
     # (copy_tensor non_blocking=False); no extra synchronize.
-    indices = convert(flat_idx.to(torch.int32), hidden_states.device)
-
-    # hidden_states is typically a slice of a larger persistent buffer (e.g. one
-    # request's rows out of the batch buffer). Slicing (as opposed to narrow())
-    # leaves view metadata pointing into the parent buffer that the native
-    # scheduler can't map for index_select ("0_identity" DtException), even
-    # though the slice is already contiguous -- .contiguous() is then a no-op
-    # and doesn't help. .clone() forces a real copy that clears it.
-    hidden_states = hidden_states.clone()
-    return torch.index_select(hidden_states, 0, indices)
+    indices = convert(flat_idx.to(torch.int32), base.device)
+    return torch.index_select(base, 0, indices)
 
 
 class SpyreCLSPool(CLSPool):
