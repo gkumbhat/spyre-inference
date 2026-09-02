@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Spyre-safe ``torch.nn.LayerNorm``.
+"""Spyre-safe ``torch.nn.LayerNorm`` replacement.
 
 ``torch.nn.LayerNorm`` is plain PyTorch, not a vLLM ``CustomOp`` (unlike
 ``RMSNorm``), so it can't be intercepted via ``register_oot``. Its default
@@ -27,9 +27,18 @@ resulting fused kernel fails at the native ``dxp_standalone`` compiler stage
 ("Not enough dimensions" matching ``layernormnorm.ddl``'s fixed 5-dim
 signature).
 
-Fix: reimplement the forward pass with plain mean/var/rsqrt arithmetic, same
-as ``SpyreRMSNorm`` does for RMSNorm, so ``aten.layer_norm.default`` (and its
-crashing decomposition) is never invoked at all.
+Fix: ``SpyreLayerNorm`` reimplements the forward pass with plain
+mean/var/rsqrt arithmetic, same as ``SpyreRMSNorm`` does for RMSNorm, so
+``aten.layer_norm.default`` (and its crashing decomposition) is never invoked
+at all.
+
+This is a drop-in subclass, not a global monkeypatch of
+``torch.nn.LayerNorm`` -- only the specific boundary LayerNorms that actually
+hit the crash (currently: CLIP's, patched in ``spyre_inference.models.clip``)
+should be swapped to it. Most ``LayerNorm`` call sites live inside a per-block
+``torch.compile`` region and never take the crashing eager path in the first
+place, so patching them too would be unnecessary blast radius onto unrelated
+models.
 """
 
 from __future__ import annotations
@@ -38,21 +47,6 @@ import torch
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
-
-_orig_init = torch.nn.LayerNorm.__init__
-_orig_forward = torch.nn.LayerNorm.forward
-
-
-def _spyre_layer_norm_init(self: torch.nn.LayerNorm, *args, **kwargs) -> None:
-    _orig_init(self, *args, **kwargs)
-    # Sampled here, same as `CompileOutermost.__init__`: construction is the only
-    # point where the vLLM config context is guaranteed live; a call during
-    # warm-up (before/outside any per-block compile) is not.
-    from vllm.config import CompilationMode, get_cached_compilation_config
-
-    mode = get_cached_compilation_config().mode
-    self._spyre_compile_enabled = mode is not CompilationMode.NONE
-    self._spyre_kernel = None
 
 
 def _layer_norm_kernel(
@@ -71,43 +65,50 @@ def _layer_norm_kernel(
     return x_norm
 
 
-def _spyre_layer_norm_forward(self: torch.nn.LayerNorm, x: torch.Tensor) -> torch.Tensor:
-    if x.device.type != "spyre":
-        return _orig_forward(self, x)
+class SpyreLayerNorm(torch.nn.LayerNorm):
+    """``torch.nn.LayerNorm`` that never invokes ``aten.layer_norm.default`` on Spyre."""
 
-    weight = self.weight if self.elementwise_affine else None
-    bias = self.bias if self.elementwise_affine else None
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # Sampled here, same as `CompileOutermost.__init__`: construction is the only
+        # point where the vLLM config context is guaranteed live; a call during
+        # warm-up (before/outside any per-block compile) is not.
+        from vllm.config import CompilationMode, get_cached_compilation_config
 
-    # Already inside a per-block compiled graph (STOCK_TORCH_COMPILE compiles one
-    # transformer block at a time): inline directly, don't re-enter torch.compile.
-    if torch.compiler.is_compiling():
-        return _layer_norm_kernel(x, weight, bias, self.eps)
+        mode = get_cached_compilation_config().mode
+        self._spyre_compile_enabled = mode is not CompilationMode.NONE
+        self._spyre_kernel = None
 
-    kernel = self._spyre_kernel
-    if kernel is None:
-        if not self._spyre_compile_enabled:
-            kernel = _layer_norm_kernel
-        else:
-            from vllm.platforms import current_platform
+    def forward(self, input: torch.Tensor) -> torch.Tensor:  # noqa: A002
+        x = input
+        if x.device.type != "spyre":
+            return super().forward(x)
 
-            logger.info_once(
-                "Compiling torch.nn.LayerNorm as its own graph: no enclosing graph "
-                "covers it."
-            )
-            # dynamic=False is mandatory: the Spyre backend rejects SymInt shapes.
-            kernel = torch.compile(
-                _layer_norm_kernel,
-                backend=current_platform.simple_compile_backend,
-                fullgraph=True,
-                dynamic=False,
-            )
-        self._spyre_kernel = kernel
-    return kernel(x, weight, bias, self.eps)
+        weight = self.weight if self.elementwise_affine else None
+        bias = self.bias if self.elementwise_affine else None
 
+        # Already inside a per-block compiled graph (STOCK_TORCH_COMPILE compiles one
+        # transformer block at a time): inline directly, don't re-enter torch.compile.
+        if torch.compiler.is_compiling():
+            return _layer_norm_kernel(x, weight, bias, self.eps)
 
-def register() -> None:
-    """Monkeypatch ``torch.nn.LayerNorm`` to bypass torch-spyre's
-    ``exx2``/``layernormscale``/``layernormnorm`` decomposition."""
-    torch.nn.LayerNorm.__init__ = _spyre_layer_norm_init
-    torch.nn.LayerNorm.forward = _spyre_layer_norm_forward
-    logger.debug_once("Patched torch.nn.LayerNorm for Spyre")
+        kernel = self._spyre_kernel
+        if kernel is None:
+            if not self._spyre_compile_enabled:
+                kernel = _layer_norm_kernel
+            else:
+                from vllm.platforms import current_platform
+
+                logger.info_once(
+                    "Compiling SpyreLayerNorm as its own graph: no enclosing graph "
+                    "covers it."
+                )
+                # dynamic=False is mandatory: the Spyre backend rejects SymInt shapes.
+                kernel = torch.compile(
+                    _layer_norm_kernel,
+                    backend=current_platform.simple_compile_backend,
+                    fullgraph=True,
+                    dynamic=False,
+                )
+            self._spyre_kernel = kernel
+        return kernel(x, weight, bias, self.eps)

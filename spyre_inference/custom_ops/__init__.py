@@ -22,7 +22,7 @@ from . import (
     activation,  # noqa: F401
     conv,  # noqa: F401
     gemma_rms_norm,  # noqa: F401
-    layer_norm,
+    layer_norm,  # noqa: F401
     linear,
     logits_processor,  # noqa: F401
     multimodal_merge,
@@ -43,5 +43,4 @@ def register_all():
     register_spyre_fp8_linear_kernel()
     utils.register()
     vocab_parallel_embedding.register()
-    layer_norm.register()
     multimodal_merge.register()

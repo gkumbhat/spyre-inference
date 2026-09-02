@@ -31,11 +31,12 @@ def apply_prelaunch_overrides(engine_args: EngineArgs) -> None:
 
 
 def install_pooling_model_patches() -> None:
-    """Install encoder/pooling model adapters (BERT / RoBERTa token_type, …)."""
-    from spyre_inference.models import bert, roberta
+    """Install encoder/pooling model adapters (BERT / RoBERTa token_type, CLIP LayerNorm, …)."""
+    from spyre_inference.models import bert, clip, roberta
 
     bert.install_spyre_patches()
     roberta.install_spyre_patches()
+    clip.install_spyre_patches()
 
 
 def install_decoder_model_patches() -> None:
