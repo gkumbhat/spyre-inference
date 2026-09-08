@@ -38,6 +38,7 @@ from typing import cast
 import torch
 import torch.nn.functional as F
 from vllm.config import get_current_vllm_config
+from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionLayer
 
 from spyre_inference.custom_ops.utils import convert
@@ -46,14 +47,20 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionImpl,
     SpyreAttentionMetadata,
     SpyrePagedKVCache,
+    _call_kernel,
+    is_warmup_complete,
     slot_major_kv_layout,
 )
 from spyre_inference.v1.pool import select_rows
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
+    batch_buckets,
     default_encoder_len_buckets,
+    next_bucket,
     pick_encoder_attention_shape,
     pooling_warmup_shapes,
 )
+
+logger = init_logger(__name__)
 
 # Pad seq length *and* head dim to the Spyre stick (64 fp16 elements).
 # L-aligned keeps P·V's K stick-aligned; D-aligned keeps QKᵀ's K stick-aligned
@@ -337,7 +344,8 @@ def _packed_masked_attention(
     pv = _compile_if_spyre(_packed_pv, device_type)
     # No eager expand: the mask is ``[B*KV, 1, 1, L]`` and the compiled add in
     # ``pv`` broadcasts both the GQA head axis and the query axis.
-    return pv(qk(query, key, scale), mask, value)
+    scores = _call_kernel("packed encoder QK", qk, query, key, scale)
+    return _call_kernel("packed encoder P.V", pv, scores, mask, value)
 
 
 def _b1_dense_attention(
@@ -357,7 +365,7 @@ def _b1_dense_attention(
         _b1_sdpa_kernel_gqa if enable_gqa else _b1_sdpa_kernel,
         query.device.type,
     )
-    result = kernel(query, key, value, scale)
+    result = _call_kernel("B=1 fused encoder SDPA", kernel, query, key, value, scale)
     if result.shape[-1] == head_size:
         return result
     if result.device.type == "spyre":
@@ -544,6 +552,40 @@ def _indices_for_device(indices: torch.Tensor, device: torch.device) -> torch.Te
     return indices.to(device=device, dtype=torch.long)
 
 
+def _ladder_encoder_shape(
+    num_seqs: int,
+    max_len: int,
+    max_num_seqs: int,
+    max_model_len: int,
+) -> tuple[int, int]:
+    """Snap a batch no warmed cell covers onto the warmup ladder.
+
+    ``pick_encoder_attention_shape`` returns None routinely, not exceptionally:
+    warmup drops every cell with ``B*L > max_num_batched_tokens``, so a batch of
+    two 300-token prompts has no warmed ``(2, 512)`` to land on. Rounding
+    ``max_len`` with ``_align_up`` instead would emit 64-granular lengths (320,
+    448, ...) that are not buckets at all, giving one Inductor compile per
+    distinct prompt length -- an unbounded family. The ladder is finite, so the
+    worst case is a bounded number of compiles that stop recurring.
+    """
+    batch = next_bucket(num_seqs, batch_buckets(max_num_seqs))
+    length = next_bucket(max_len, default_encoder_len_buckets(max_model_len))
+    if not is_warmup_complete():
+        # Warmup's own body runs land here (max_num_seqs seqs of size//B tokens),
+        # and compiling them is the point, so only a serving-path miss is news.
+        return batch, length
+    logger.warning_once(
+        "Encoder attention batch (num_seqs=%d, max_len=%d) has no warmed (B, L) cell; "
+        "using ladder shape (%d, %d), which compiles on first use. Warmup drops cells "
+        "with B*L > max_num_batched_tokens -- see pooling_warmup_shapes.",
+        num_seqs,
+        max_len,
+        batch,
+        length,
+    )
+    return batch, length
+
+
 def _ensure_encoder_pack(
     attn_metadata: SpyreAttentionMetadata,
     *,
@@ -581,7 +623,12 @@ def _ensure_encoder_pack(
         cached_max_model_len,
         cached_max_num_batched_tokens,
     )
-    batch_bucket, aligned_len = pair if pair is not None else (num_seqs, _align_up(max_len))
+    if pair is not None:
+        batch_bucket, aligned_len = pair
+    else:
+        batch_bucket, aligned_len = _ladder_encoder_shape(
+            num_seqs, max_len, cached_max_num_seqs, cached_max_model_len
+        )
     query_lens = _content_query_lens(qsl_lens, kv_lens, num_actual_tokens=n)
     orig_q_starts = q_starts
     orig_query_lens = query_lens

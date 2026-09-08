@@ -440,6 +440,11 @@ def mark_warmup_complete() -> None:
     _warmup_complete = True
 
 
+def is_warmup_complete() -> bool:
+    """True once warmup has claimed kernel coverage. Diagnostics only."""
+    return _warmup_complete
+
+
 def _call_kernel(label: str, fn, *args):
     """Dispatch a kernel, warning if it compiles once warmup has claimed coverage.
 
