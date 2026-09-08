@@ -913,21 +913,19 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 )
                 hidden_states, _ = self._dummy_run(num_tokens, force_attention=True)
                 self._dummy_pooler_run(hidden_states)
-                if batch_size != 1 or prompt_len <= 1:
-                    continue
-                # An exact bucket fill is only half the B=1 traffic. Filling it
-                # exactly satisfies _is_b1_fused_sdpa, so the runs above trace
-                # only the fused SDPA kernel; a prompt one token short takes the
-                # packed QK/P.V kernels at B=1 instead, and serving hits that
-                # side on every prompt whose length is not already a bucket.
-                logger.info(
-                    "Pooling attention warmup: partial bucket "
-                    "batch_size=1 prompt_len=%d (bucket %d)",
-                    prompt_len - 1,
-                    prompt_len,
-                )
-                hidden_states, _ = self._dummy_run(prompt_len - 1, force_attention=True)
-                self._dummy_pooler_run(hidden_states)
+                if batch_size == 1:
+                    # An exact fill satisfies _is_b1_fused_sdpa, so the run above
+                    # traces only the fused kernel. One token short takes the
+                    # packed QK/P.V kernels instead, which is what serving hits
+                    # for every prompt whose length is not already a bucket.
+                    logger.info(
+                        "Pooling attention warmup: partial bucket "
+                        "batch_size=1 prompt_len=%d (bucket %d)",
+                        prompt_len - 1,
+                        prompt_len,
+                    )
+                    hidden_states, _ = self._dummy_run(prompt_len - 1, force_attention=True)
+                    self._dummy_pooler_run(hidden_states)
         finally:
             self.scheduler_config.max_num_seqs = saved_max_num_seqs
 

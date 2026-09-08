@@ -560,29 +560,26 @@ def _ladder_encoder_shape(
 ) -> tuple[int, int]:
     """Snap a batch no warmed cell covers onto the warmup ladder.
 
-    ``pick_encoder_attention_shape`` returns None routinely, not exceptionally:
-    warmup drops every cell with ``B*L > max_num_batched_tokens``, so a batch of
-    two 300-token prompts has no warmed ``(2, 512)`` to land on. Rounding
-    ``max_len`` with ``_align_up`` instead would emit 64-granular lengths (320,
-    448, ...) that are not buckets at all, giving one Inductor compile per
-    distinct prompt length -- an unbounded family. The ladder is finite, so the
-    worst case is a bounded number of compiles that stop recurring.
+    ``pick_encoder_attention_shape`` misses routinely, not exceptionally: warmup
+    drops every cell with ``B*L > max_num_batched_tokens``, so two 300-token
+    prompts have no warmed ``(2, 512)`` to land on. Stick-aligning ``max_len``
+    instead would emit non-buckets (320, 448, ...) and so one compile per
+    distinct prompt length; the ladder is finite, so misses stop recurring.
     """
     batch = next_bucket(num_seqs, batch_buckets(max_num_seqs))
     length = next_bucket(max_len, default_encoder_len_buckets(max_model_len))
-    if not is_warmup_complete():
-        # Warmup's own body runs land here (max_num_seqs seqs of size//B tokens),
-        # and compiling them is the point, so only a serving-path miss is news.
-        return batch, length
-    logger.warning_once(
-        "Encoder attention batch (num_seqs=%d, max_len=%d) has no warmed (B, L) cell; "
-        "using ladder shape (%d, %d), which compiles on first use. Warmup drops cells "
-        "with B*L > max_num_batched_tokens -- see pooling_warmup_shapes.",
-        num_seqs,
-        max_len,
-        batch,
-        length,
-    )
+    # Warmup's own body runs miss too (max_num_seqs seqs of size//B tokens) and
+    # compiling those is the point, so only a serving-path miss is news.
+    if is_warmup_complete():
+        # Args are part of warning_once's dedup key, so they must be the ladder
+        # cell and not the request: num_seqs x max_len has thousands of values.
+        logger.warning_once(
+            "Encoder attention fell back to ladder shape (B=%d, L=%d): no warmed cell covers "
+            "the batch, so this compiles on first use. Warmup drops cells with "
+            "B*L > max_num_batched_tokens -- see pooling_warmup_shapes.",
+            batch,
+            length,
+        )
     return batch, length
 
 

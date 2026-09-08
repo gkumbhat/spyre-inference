@@ -12,17 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Encoder attention warmup coverage: every shape serving can reach is traced.
+"""Encoder attention warmup coverage: warmup traces every shape serving reaches.
 
-CPU-only. These do not check attention numerics (``test_spyre_encoder_attn.py``
-covers that); they check that the set of shapes warmup produces covers the set
-the runtime can dispatch to. That is a separate property, and it is the one that
-regressed: warmup filled every ``(1, L)`` cell exactly, which satisfies
-``_is_b1_fused_sdpa``, so the packed kernels were never traced at ``B=1`` even
-though a 512-token budget makes ``B=1`` the common serving shape.
+CPU-only, and not about numerics -- ``test_spyre_encoder_attn.py`` covers those,
+and covered them while this was broken. Warmup filled every ``(1, L)`` cell
+exactly, which satisfies ``_is_b1_fused_sdpa``, so the packed kernels were never
+traced at ``B=1`` and compiled mid-request instead.
 """
 
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 
@@ -85,12 +84,25 @@ class TestLadderFallback:
         spyre_attn._warmup_complete = False
         with caplog.at_level("WARNING"):
             _ladder_encoder_shape(64, 8, MAX_NUM_SEQS, MAX_MODEL_LEN)
-        assert "no warmed" not in caplog.text, "warmup's own body runs are not news"
+        assert "ladder shape" not in caplog.text, "warmup's own body runs are not news"
 
         spyre_attn.mark_warmup_complete()
         with caplog.at_level("WARNING"):
             _ladder_encoder_shape(3, 300, MAX_NUM_SEQS, MAX_MODEL_LEN)
-        assert "no warmed" in caplog.text
+        assert "ladder shape (B=4, L=512)" in caplog.text
+
+    def test_warning_dedup_key_is_bounded(self, caplog):
+        """``warning_once`` keys on the args, so they must not carry the request.
+
+        ``num_seqs x max_len`` has thousands of combinations; the ladder has
+        ``len(batch_buckets) * len(len_buckets)``. Keying on the request would
+        make this an unbounded log and an unbounded ``lru_cache``.
+        """
+        spyre_attn.mark_warmup_complete()
+        with caplog.at_level("WARNING"):
+            for max_len in range(257, 512):
+                _ladder_encoder_shape(3, max_len, MAX_NUM_SEQS, MAX_MODEL_LEN)
+        assert caplog.text.count("ladder shape") <= 1
 
 
 class TestPoolingWarmupCoversBothSides:
@@ -114,7 +126,9 @@ class TestPoolingWarmupCoversBothSides:
             _dummy_run=dummy_run,
             _dummy_pooler_run=lambda hidden: None,
         )
-        TorchSpyreModelRunner._warmup_pooling_bucket_shapes(runner)
+        # Unbound call with a stub self: the method's whole surface is the four
+        # attributes above, so this stays host-only instead of building a runner.
+        TorchSpyreModelRunner._warmup_pooling_bucket_shapes(cast(TorchSpyreModelRunner, runner))
         assert runner.scheduler_config.max_num_seqs == MAX_NUM_SEQS, "must restore on exit"
         return calls
 
@@ -140,6 +154,8 @@ class TestPoolingWarmupCoversBothSides:
         calls = self._run_warmup([(1, 64), (2, 64), (4, 64)])
         assert calls == [64, 63, 128, 256]
 
-    def test_partial_run_lands_on_the_packed_side(self):
-        for _, prompt_len in [(1, length) for length in default_encoder_len_buckets(MAX_MODEL_LEN)]:
-            assert not _is_b1_fused_sdpa(1, prompt_len, prompt_len, prompt_len - 1)
+    def test_every_length_bucket_can_lose_a_token(self):
+        # The warmup loop subtracts 1 from prompt_len unguarded; a bucket of 1
+        # or 0 would make that a zero/negative token count.
+        assert min(default_encoder_len_buckets(MAX_MODEL_LEN)) >= 2
+        assert min(default_encoder_len_buckets(1)) >= 2

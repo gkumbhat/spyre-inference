@@ -441,7 +441,7 @@ def mark_warmup_complete() -> None:
 
 
 def is_warmup_complete() -> bool:
-    """True once warmup has claimed kernel coverage. Diagnostics only."""
+    """Whether ``mark_warmup_complete`` has run. For diagnostics, not control flow."""
     return _warmup_complete
 
 
