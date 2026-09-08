@@ -187,9 +187,7 @@ def test_spyre_all_pool_defers_trim_only_when_asked():
     plain = SpyreAllPool(enable_chunked_prefill=False)(hidden_states, meta)
     assert [c.shape[0] for c in plain] == counts
 
-    deferred = SpyreAllPool(enable_chunked_prefill=False, defer_trim=True)(
-        hidden_states, meta
-    )
+    deferred = SpyreAllPool(enable_chunked_prefill=False, defer_trim=True)(hidden_states, meta)
     # Every chunk is padded up to the same bucket, so the gather's shape no longer
     # tracks the request's token count.
     assert {c.shape[0] for c in deferred} == {64}
