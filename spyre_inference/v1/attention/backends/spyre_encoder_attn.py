@@ -272,8 +272,7 @@ def host_key_pad_mask(mask: torch.Tensor, num_kv_heads: int) -> torch.Tensor:
     add cannot broadcast ``1 → L`` on the query axis (no stick-scatter), which
     forced a dense ``[B*KV, 1, L, L]``. The add now happens inside the compiled
     ``_packed_pv``, where Inductor broadcasts it, so the dense form is no longer
-    needed -- and it was expensive: at ``Hkv=12, L=512`` it is 6.3 MB fp16, an
-    H2D measured at ~7 ms per step against ~0.1 ms for this 12 KB form.
+    needed and it was expensive.
 
     Broadcasting also covers the GQA head axis (``G``), so the caller no longer
     needs an eager ``expand_as(...).contiguous()`` either.
@@ -301,10 +300,10 @@ def _packed_pv(scores: torch.Tensor, mask: torch.Tensor, value: torch.Tensor) ->
     """Add the pad mask, softmax, then P·V -- all in one compiled graph.
 
     The mask add belongs here rather than in the caller: eager, it is one op on
-    a ``[B*Hkv, G, L, L]`` tensor (~6 MB fp16 at L=512) per layer per request,
+    a ``[B*Hkv, G, L, L]`` tensor per layer per request,
     and every prompt that does not exactly fill its bucket takes this path
     (``_is_b1_fused_sdpa`` needs ``real_len == aligned_len``), so short prompts
-    paid it on all 12 layers.
+    paid it on all layers.
 
     Safe against the rewrite ``_packed_qk_matmul`` guards: Inductor turns
     ``matmul + mask`` into ``F.sdpa`` -- which drops ``attn_mask`` on Spyre --
@@ -335,7 +334,7 @@ def _packed_masked_attention(
     """Scatter-path attention. Compile QK separately from mask + softmax + P·V.
 
     Compiling ``matmul + mask`` lets Inductor rewrite to ``F.sdpa``, which drops
-    ``attn_mask`` on Spyre (BGE cosine ~0.46) -- so the mask must stay out of
+    ``attn_mask`` on Spyre -- so the mask must stay out of
     the Q·Kᵀ graph. It does live in the P·V graph, which cannot form that
     pattern; see ``_packed_pv``.
     """

@@ -290,7 +290,7 @@ class SpyreTokenPooler(TokenPooler):
 
     ``SpyreAllPool`` gathers a bucketed row count so ``index_select``'s shape does
     not track the request's token count. Every op in the token head is row-wise
-    (``to(head_dtype)``, the ST projector, the matryoshka last-dim slice, and
+    (``to(head_dtype)``, the ST projector, the last-dim slice, and
     normalize over ``dim=-1``), so the duplicate rows past the real length change
     nothing for the real ones and the head keeps running on device at a bucketed
     shape. They are dropped here instead, at the D2H every token-pooling output
