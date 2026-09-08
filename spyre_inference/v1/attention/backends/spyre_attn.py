@@ -575,9 +575,10 @@ class SpyreAttentionMetadata(AttentionMetadata):
     encoder_pack_batch: int | None = None
     encoder_pack_len: int | None = None
     encoder_fused_sdpa: bool = False
-    # Host-built dense key-pad ``[B * KV, 1, L, L]`` on the target device.
-    # ``None`` on the fused path. ``[BH, 1, 1, L]`` does not broadcast onto
-    # encoder scores ``[BH, G, L, L]`` (eager add; query axis ``1 → L``).
+    # Host-built key-pad ``[B * KV, 1, 1, L]`` on the target device. ``None`` on
+    # the fused path. Broadcast onto encoder scores ``[BH, G, L, L]`` by the
+    # compiled add in ``_packed_pv``; a dense ``[BH, 1, L, L]`` was needed only
+    # while that add was eager (6.3 MB fp16 at Hkv=12, L=512, ~7 ms H2D/step).
     encoder_key_pad_mask: torch.Tensor | None = None
     # Slot-major scatter scratch ``[B*L+1, H, D]``. Alloc once per step; ``zero_``
     # before each pack so pad slots stay empty. K and V must not share a buffer:

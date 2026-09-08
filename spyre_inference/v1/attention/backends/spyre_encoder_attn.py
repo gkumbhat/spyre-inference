@@ -258,19 +258,24 @@ def _b1_sdpa_kernel_gqa(
 
 
 def host_key_pad_mask(mask: torch.Tensor, num_kv_heads: int) -> torch.Tensor:
-    """CPU ``[B,1,L,L]`` → dense ``[B*KV, 1, L, L]`` for eager ``scores + mask``.
+    """CPU ``[B,1,L,L]`` → ``[B*KV, 1, 1, L]``, broadcast over the query axis.
 
-    Same key-pad row is repeated across KV and query-L. ``[B*KV, 1, 1, L]``
-    was tried (decoder ``mask_by_block``). Decode gets away with that shape
-    because Q=1; encoder scores are ``[BH, G, L, L]``. Eager Spyre add does
-    not broadcast ``1 → L`` on the query axis (no stick-scatter). Prefill
-    tiles are already ``[Q, block]``. Densify on the host once per step.
+    The same key-pad row applies to every query row, so only the KV axis needs
+    materialising. This shape was previously rejected because an *eager* Spyre
+    add cannot broadcast ``1 → L`` on the query axis (no stick-scatter), which
+    forced a dense ``[B*KV, 1, L, L]``. The add now happens inside the compiled
+    ``_packed_pv``, where Inductor broadcasts it, so the dense form is no longer
+    needed -- and it was expensive: at ``Hkv=12, L=512`` it is 6.3 MB fp16, an
+    H2D measured at ~7 ms per step against ~0.1 ms for this 12 KB form.
+
+    Broadcasting also covers the GQA head axis (``G``), so the caller no longer
+    needs an eager ``expand_as(...).contiguous()`` either.
     """
     key = mask[:, :, :1, :]
     batch, _, _, length = key.shape
     return (
-        key.expand(batch, num_kv_heads, length, length)
-        .reshape(batch * num_kv_heads, 1, length, length)
+        key.expand(batch, num_kv_heads, 1, length)
+        .reshape(batch * num_kv_heads, 1, 1, length)
         .contiguous()
     )
 
@@ -285,10 +290,24 @@ def _packed_qk_matmul(query: torch.Tensor, key: torch.Tensor, scale: float) -> t
     return torch.matmul(q, k.transpose(-2, -1)) * scale
 
 
-def _packed_pv(scores: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
+def _packed_pv(scores: torch.Tensor, mask: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
+    """Add the pad mask, softmax, then P·V -- all in one compiled graph.
+
+    The mask add belongs here rather than in the caller: eager, it is one op on
+    a ``[B*Hkv, G, L, L]`` tensor (~6 MB fp16 at L=512) per layer per request,
+    and every prompt that does not exactly fill its bucket takes this path
+    (``_is_b1_fused_sdpa`` needs ``real_len == aligned_len``), so short prompts
+    paid it on all 12 layers.
+
+    Safe against the rewrite ``_packed_qk_matmul`` guards: Inductor turns
+    ``matmul + mask`` into ``F.sdpa`` -- which drops ``attn_mask`` on Spyre --
+    only when it can see Q·Kᵀ *and* P·V in one graph. This graph has just P·V,
+    and QK stays compiled separately with the mask still out of it.
+    """
     batch, hkv, length, dim = value.shape
     g = scores.shape[1]
     v = value.reshape(batch * hkv, 1, length, dim)
+    scores = scores + mask
     scores_max = torch.amax(scores, dim=-1, keepdim=True)
     # Dummy seqs (batch_bucket > num_seqs) have all-inf key_pad, so
     # scores - scores_max is NaN. Decoder documents the same hazard where an
@@ -306,19 +325,19 @@ def _packed_masked_attention(
     mask: torch.Tensor,
     scale: float,
 ) -> torch.Tensor:
-    """Scatter-path attention. Compile QK and P·V separately; pad add is eager.
+    """Scatter-path attention. Compile QK separately from mask + softmax + P·V.
 
     Compiling ``matmul + mask`` lets Inductor rewrite to ``F.sdpa``, which drops
-    ``attn_mask`` on Spyre (BGE cosine ~0.46).
+    ``attn_mask`` on Spyre (BGE cosine ~0.46) -- so the mask must stay out of
+    the Q·Kᵀ graph. It does live in the P·V graph, which cannot form that
+    pattern; see ``_packed_pv``.
     """
     device_type = query.device.type
     qk = _compile_if_spyre(_packed_qk_matmul, device_type)
     pv = _compile_if_spyre(_packed_pv, device_type)
-    scores = qk(query, key, scale)
-    if mask.shape != scores.shape:
-        # GQA: ``[B*KV, 1, L, L]`` → ``[B*KV, G, L, L]``. Query-L is already dense.
-        mask = mask.expand_as(scores).contiguous()
-    return pv(scores + mask, value)
+    # No eager expand: the mask is ``[B*KV, 1, 1, L]`` and the compiled add in
+    # ``pv`` broadcasts both the GQA head axis and the query axis.
+    return pv(qk(query, key, scale), mask, value)
 
 
 def _b1_dense_attention(

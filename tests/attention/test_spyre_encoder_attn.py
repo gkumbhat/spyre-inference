@@ -737,7 +737,11 @@ def _assert_pad_mask(meta, real_len: int) -> None:
     key_pad = meta.encoder_key_pad_mask
     assert key_pad is not None
     key_cpu = key_pad.cpu() if key_pad.device.type != "cpu" else key_pad
-    assert key_cpu.shape[-2] == key_cpu.shape[-1]
+    # Query axis stays 1: the same key-pad row applies to every query row and the
+    # compiled add in _packed_pv broadcasts it. A dense [.., L, L] here would be
+    # 6.3 MB fp16 at Hkv=12, L=512 (~7 ms H2D per step).
+    assert key_cpu.shape[-2] == 1
+    assert key_cpu.shape[-1] == meta.encoder_pack_len
     assert key_cpu[0, 0, 0, 0].item() == 0.0
     assert key_cpu[0, 0, 0, real_len].item() < -1.0e3
 
