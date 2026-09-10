@@ -622,3 +622,145 @@ def test_padding_on_device_weights_matches_padding_on_host():
         )
         checked += 1
     assert checked, "no parameters compared -- the layer walk found nothing"
+
+
+# ---------------------------------------------------------------------------
+# Pooling: the average runs on device as one bf16 matmul
+# ---------------------------------------------------------------------------
+
+
+def _pool_setup(num_patches=90, hidden=32, k=3, pad_last=0):
+    """A k-divisible patch grid, which is what the processor emits."""
+    length = num_patches // (k * k)
+    side_x = 3 * 2
+    side_y = num_patches // side_x
+    assert side_y % k == 0 and (side_x // k) * (side_y // k) == length
+    xs = torch.arange(side_x).repeat(side_y)[:num_patches]
+    ys = torch.arange(side_y).repeat_interleave(side_x)[:num_patches]
+    pos = torch.stack([xs, ys], dim=-1).unsqueeze(0)
+    if pad_last:
+        pos[:, -pad_last:] = -1
+    torch.manual_seed(0)
+    hidden_states = torch.randn(1, num_patches, hidden, dtype=torch.float32)
+    return pos, (pos == -1).all(dim=-1), hidden_states, length, k
+
+
+@pytest.mark.parametrize("pad_last", [0, 9], ids=["no_padding", "padding_patches"])
+def test_pool_weights_reproduce_the_stock_average(pad_last):
+    """The host-built weight matrix must give stock's pooled values and stock's mask.
+
+    Padding patches are handled by zeroing their weight rows instead of `masked_fill`
+    on the hidden states, so this checks that substitution is exact -- including that
+    the mask still comes from the *unzeroed* weights, as stock derives it.
+    """
+    from spyre_inference.multimodal.gemma4_vision import _pool_weights
+
+    pos, padding, hidden_states, length, k = _pool_setup(pad_last=pad_last)
+    config = configuration_gemma4.Gemma4VisionConfig(
+        hidden_size=hidden_states.shape[-1],
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        head_dim=64,
+        pooling_kernel_size=k,
+    )
+    want, want_mask = modeling_gemma4.Gemma4VisionPooler(config)(
+        hidden_states=hidden_states,
+        pixel_position_ids=pos,
+        padding_positions=padding,
+        output_length=length,
+    )
+
+    weights, mask = _pool_weights(pos, padding, length, k)
+    got = (weights.transpose(1, 2) @ hidden_states) * (hidden_states.shape[-1] ** 0.5)
+
+    assert torch.equal(mask, want_mask)
+    torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-5)
+
+
+def test_pool_weights_rows_sum_to_one_over_each_output_cell():
+    """Each output cell is a mean of exactly k^2 patches, so its column must sum to 1
+    -- the property that makes the matmul an average rather than an arbitrary GEMM."""
+    from spyre_inference.multimodal.gemma4_vision import _pool_weights
+
+    pos, padding, _, length, k = _pool_setup()
+    weights, _ = _pool_weights(pos, padding, length, k)
+
+    torch.testing.assert_close(weights.sum(dim=1), torch.ones(1, length))
+    assert weights.count_nonzero() == length * k * k
+
+
+def test_patched_pooler_returns_stock_dtype_and_stays_on_host():
+    """The caller indexes the result with the mask and then runs an fp32 affine, so
+    the patch must preserve stock's fp32 return and host placement even though the
+    pool itself now happens on device in bf16."""
+    from spyre_inference.multimodal import gemma4_vision
+
+    pos, padding, hidden_states, length, k = _pool_setup()
+    config = configuration_gemma4.Gemma4VisionConfig(
+        hidden_size=hidden_states.shape[-1],
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        head_dim=64,
+        pooling_kernel_size=k,
+    )
+    gemma4_vision.patch_pooler()
+    pooled, mask = modeling_gemma4.Gemma4VisionPooler(config)(
+        hidden_states=hidden_states,
+        pixel_position_ids=pos,
+        padding_positions=padding,
+        output_length=length,
+    )
+
+    assert pooled.dtype == torch.float32
+    assert pooled.device.type == "cpu" and mask.device.type == "cpu"
+    assert pooled.shape == (1, length, hidden_states.shape[-1])
+
+
+def test_patched_pooler_delegates_when_there_is_nothing_to_pool():
+    """At equal lengths stock skips pooling and returns `padding_positions` as the
+    mask; taking the pooling path there would hand back a differently-derived one."""
+    from spyre_inference.multimodal import gemma4_vision
+
+    pos, padding, hidden_states, _, k = _pool_setup()
+    num_patches = hidden_states.shape[1]
+    config = configuration_gemma4.Gemma4VisionConfig(
+        hidden_size=hidden_states.shape[-1],
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        head_dim=64,
+        pooling_kernel_size=k,
+    )
+    gemma4_vision.patch_pooler()
+    _, mask = modeling_gemma4.Gemma4VisionPooler(config)(
+        hidden_states=hidden_states,
+        pixel_position_ids=pos,
+        padding_positions=padding,
+        output_length=num_patches,
+    )
+
+    assert torch.equal(mask, padding)
+
+
+def test_pooling_matmul_matches_the_host_average_on_device():
+    """The bf16 device matmul against the fp32 host average.
+
+    Stock computes this matmul in fp32 but rounds the result straight back to the
+    input dtype, so bf16 here concedes only accumulation precision.
+    """
+    if not spyre_available():
+        pytest.skip("Spyre device not available")
+
+    from spyre_inference.custom_ops.utils import convert
+    from spyre_inference.multimodal.gemma4_vision import _pool_weights
+
+    pos, padding, hidden_states, length, k = _pool_setup(num_patches=576, hidden=128)
+    weights, _ = _pool_weights(pos, padding, length, k)
+    want = weights.transpose(1, 2) @ hidden_states
+
+    device = torch.device("spyre")
+    got = torch.matmul(
+        convert(weights.to(torch.bfloat16), device=device).transpose(1, 2),
+        convert(hidden_states.to(torch.bfloat16), device=device),
+    )
+
+    torch.testing.assert_close(convert(got, device="cpu").float(), want, rtol=2e-2, atol=2e-2)

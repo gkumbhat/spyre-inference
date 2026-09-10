@@ -531,13 +531,53 @@ def patch_rms_norm() -> None:
     )
 
 
-def patch_pooler() -> None:
-    """Run ``Gemma4VisionPooler`` on the host.
+def _pool_weights(
+    pixel_position_ids: torch.Tensor,
+    padding_positions: torch.Tensor,
+    length: int,
+    k: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Host-built `[bsz, patches, length]` averaging weights, and the validity mask.
 
-    It is integer geometry, not arithmetic: a ``masked_fill`` (no Spyre kernel), a
-    ``one_hot`` over floor-divided patch coordinates, and a reduction for the validity
-    mask. Same doctrine as the other gather-shaped ops here, and cheap to move since
-    pooling is what shrinks the sequence.
+    This is everything in the stock pooler the device cannot run, and all of it is
+    integer geometry over `pixel_position_ids`, which already live on the host: the
+    coordinate arithmetic, the `one_hot`, and the `masked_fill` of padding patches.
+    The `masked_fill` folds in by zeroing those patches' weight *rows* instead --
+    `out[j] = sum_i W[i,j] * h[i]`, so zeroing either factor drops the term.
+
+    The mask comes from the unzeroed weights, matching stock: an output cell fed only
+    by padding patches still counts as valid.
+    """
+    clamped = pixel_position_ids.clamp(min=0)
+    max_x = clamped[..., 0].max(dim=-1, keepdim=True)[0] + 1
+    kernel_idxs = torch.div(clamped, k, rounding_mode="floor")
+    kernel_idxs = kernel_idxs[..., 0] + (max_x // k) * kernel_idxs[..., 1]
+    raw = F.one_hot(kernel_idxs.long(), length).float() / (k * k)
+    mask = torch.logical_not((raw == 0).all(dim=1))
+    return raw.masked_fill(padding_positions.unsqueeze(-1), 0.0), mask
+
+
+def patch_pooler() -> None:
+    """Run the ``Gemma4VisionPooler`` average as one matmul on Spyre.
+
+    Stock pools with an fp32 batchmatmul against a one-hot weight matrix, which the
+    device has no kernel for (`SPYRE_FP32_OPS` carries no matmul, torch-spyre#1794 --
+    the same limit `v1/pool`'s MEAN pooler cites). **We run that matmul in bf16
+    instead of fp32, which is worth ~2x on the whole post-encoder tail** (8.6 ms vs
+    17.4 ms measured at 26B-A4B's 2520 patches), and moves a ~0.8 GMAC GEMM off the
+    host while shrinking the encoder-output copy from 5.8 MB to 0.6 MB.
+
+    The precision given up is smaller than it looks: stock computes that matmul in
+    fp32 but rounds the result straight back to the input dtype one line later, so
+    the values it passes on are bf16 either way. Only the accumulation differs, and
+    it measures below one bf16 ULP. The `sqrt(hidden_size)` scale still happens on
+    the host in fp32, exactly as stock does it.
+
+    The weights and the validity mask stay host-side (`_pool_weights`), and the
+    pooled rows come back to the host because the tail after this -- the caller's
+    `pooled[mask]`, the standardize affine, `embed_vision` -- is host-side anyway
+    (`place_vision_tail_on_cpu`); measurement says moving that too gives the gain
+    straight back.
     """
     try:
         from transformers.models.gemma4 import modeling_gemma4
@@ -551,17 +591,37 @@ def patch_pooler() -> None:
     orig_forward = cls.forward
 
     def forward(self, hidden_states, pixel_position_ids, padding_positions, output_length=None):
-        # Both outputs stay on CPU: the caller immediately does `pooled[mask]`
-        # (`aten::index.Tensor_out`, no Spyre kernel), then the fp32 `standardize`
-        # affine, then `embed_vision` -- `place_vision_tail_on_cpu` keeps that whole
-        # tail host-side, so converting back here would just bounce it again.
-        return orig_forward(
-            self,
-            convert(hidden_states, device="cpu"),
+        num_patches = hidden_states.shape[1]
+        k = int((num_patches // output_length) ** 0.5) if output_length else 0
+        if (
+            hidden_states.device.type != "spyre"
+            or not output_length
+            # `!=`, mirroring stock's own guard: at equal lengths it skips pooling
+            # entirely and hands back `padding_positions` as the mask, so taking the
+            # pooling path here would return a differently-derived mask.
+            or num_patches == output_length
+            or output_length > num_patches
+            or k * k * output_length != num_patches
+        ):
+            # Nothing to pool (stock then only masks and scales, and its `masked_fill`
+            # has no Spyre kernel), or a ratio stock itself rejects -- let it raise.
+            return orig_forward(
+                self,
+                convert(hidden_states, device="cpu"),
+                convert(pixel_position_ids, device="cpu"),
+                convert(padding_positions, device="cpu"),
+                output_length,
+            )
+
+        weights, mask = _pool_weights(
             convert(pixel_position_ids, device="cpu"),
             convert(padding_positions, device="cpu"),
             output_length,
+            k,
         )
+        weights = convert(weights.to(hidden_states.dtype), device=hidden_states.device)
+        pooled = torch.matmul(weights.transpose(1, 2), hidden_states)
+        return convert(pooled, device="cpu").float() * self.root_hidden_size, mask
 
     forward._spyre_patched = True
     cls.forward = forward
