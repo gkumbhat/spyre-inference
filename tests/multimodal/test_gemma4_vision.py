@@ -1,0 +1,501 @@
+# Copyright 2026 The Spyre-Inference Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Tests for `spyre_inference/multimodal/gemma4_vision.py`.
+
+The head-dim padding, its channel repacking, and the two-axis rope built on top of
+it are the parts most likely to be silently wrong (an off-by-a-quarter in the
+interleave still produces plausible-looking numbers), so the load-bearing test is
+the equivalence check against the real
+`transformers.models.gemma4.modeling_gemma4.apply_multidimensional_rope`.
+
+Like `test_pixtral.py`, the patches are guarded with `getattr(..., None)`, so a
+transformers rename turns one into a silent no-op -- hence the staleness tripwires.
+Everything here is host-side tensor math and needs no card; the on-device
+equivalents were validated by `scripts/probe_gemma4_vision_*.py`.
+"""
+
+import pytest
+import torch
+
+modeling_gemma4 = pytest.importorskip("transformers.models.gemma4.modeling_gemma4")
+configuration_gemma4 = pytest.importorskip("transformers.models.gemma4.configuration_gemma4")
+
+pytestmark = [pytest.mark.gemma4_vision]
+
+# 26B-A4B's real vision head_dim; 72 is neither a 64-multiple nor evenly halvable
+# onto the stick, which is the whole reason the padding exists.
+ORIG_HEAD_DIM = 72
+PADDED_HEAD_DIM = 128
+NUM_HEADS = 4
+NUM_PATCHES = 50
+
+
+def _vision_config(head_dim: int = ORIG_HEAD_DIM, num_heads: int = NUM_HEADS):
+    return configuration_gemma4.Gemma4VisionConfig(
+        hidden_size=num_heads * head_dim,
+        num_attention_heads=num_heads,
+        num_key_value_heads=num_heads,
+        head_dim=head_dim,
+    )
+
+
+def _position_ids(num_patches: int = NUM_PATCHES) -> torch.Tensor:
+    """`[1, num_patches, 2]` (x, y) patch coordinates, as the encoder feeds them."""
+    side = 8
+    xs = torch.arange(side).repeat(side)[:num_patches]
+    ys = torch.arange(side).repeat_interleave(side)[:num_patches]
+    return torch.stack([xs, ys], dim=-1).unsqueeze(0)
+
+
+def _pad_activation_quarters(x: torch.Tensor, orig: int, padded: int) -> torch.Tensor:
+    """The `_pad_qk_linear` channel remap, applied to activations instead of weights.
+
+    Kept in the test rather than imported: it mirrors what the padded q_proj weight
+    does to its output, so writing it out independently is what makes the rope
+    equivalence check below meaningful.
+    """
+    quarter = orig // 4
+    half = padded // 2
+    out = torch.zeros((*x.shape[:-1], padded), dtype=x.dtype)
+    out[..., :quarter] = x[..., :quarter]
+    out[..., quarter : 2 * quarter] = x[..., 2 * quarter : 3 * quarter]
+    out[..., half : half + quarter] = x[..., quarter : 2 * quarter]
+    out[..., half + quarter : half + 2 * quarter] = x[..., 3 * quarter :]
+    return out
+
+
+def _unpad_activation_quarters(padded: torch.Tensor, orig: int, padded_dim: int) -> torch.Tensor:
+    quarter = orig // 4
+    half = padded_dim // 2
+    out = torch.zeros((*padded.shape[:-1], orig), dtype=padded.dtype)
+    out[..., :quarter] = padded[..., :quarter]
+    out[..., 2 * quarter : 3 * quarter] = padded[..., quarter : 2 * quarter]
+    out[..., quarter : 2 * quarter] = padded[..., half : half + quarter]
+    out[..., 3 * quarter :] = padded[..., half + quarter : half + 2 * quarter]
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Staleness tripwires: the upstream symbols the patches reach for must exist
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "Gemma4RMSNorm",
+        "Gemma4VisionEncoder",
+        "Gemma4VisionPatchEmbedder",
+        "apply_multidimensional_rope",
+        "Gemma4VisionRotaryEmbedding",
+    ],
+)
+def test_patched_upstream_symbols_still_exist(name):
+    """Every patch is `getattr`-guarded, so a rename would silently no-op it."""
+    assert getattr(modeling_gemma4, name, None) is not None, (
+        f"transformers.models.gemma4.modeling_gemma4.{name} is gone; "
+        "spyre_inference/multimodal/gemma4_vision.py needs updating."
+    )
+
+
+def test_rms_norm_forward_signature_is_what_the_patch_replaces():
+    """The patch replaces `forward` wholesale, so its contract must still hold:
+    an `eps` and a `with_scale`-gated `weight`."""
+    norm = modeling_gemma4.Gemma4RMSNorm(dim=8, eps=1e-6, with_scale=True)
+    assert hasattr(norm, "eps")
+    assert hasattr(norm, "with_scale")
+    assert hasattr(norm, "weight")
+
+
+# ---------------------------------------------------------------------------
+# Head-dim padding
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("orig", "expected"),
+    [(64, 128), (72, 128), (128, 128), (129, 256), (256, 256)],
+)
+def test_padded_head_dim_rounds_to_a_double_stick(orig, expected):
+    """Rope needs each half on a whole stick, so head_dim pads to 2*64, not 64."""
+    from spyre_inference.multimodal.gemma4_vision import _padded_head_dim
+
+    assert _padded_head_dim(orig) == expected
+
+
+def test_pad_qk_linear_preserves_every_original_channel():
+    """The quarter-interleave must be a permutation of the real channels into the
+    padded layout -- no value dropped, no value duplicated."""
+    from spyre_inference.multimodal.gemma4_vision import _pad_qk_linear
+
+    torch.manual_seed(0)
+    in_features = 32
+    linear = torch.nn.Linear(in_features, NUM_HEADS * ORIG_HEAD_DIM, bias=False)
+    linear.weight.data.normal_()
+    proj = type("_Proj", (), {"linear": linear})()
+
+    padded = _pad_qk_linear(proj, NUM_HEADS, ORIG_HEAD_DIM, PADDED_HEAD_DIM)
+
+    assert padded.weight.shape == (NUM_HEADS * PADDED_HEAD_DIM, in_features)
+    orig_w = linear.weight.detach().view(NUM_HEADS, ORIG_HEAD_DIM, in_features)
+    new_w = padded.weight.detach().view(NUM_HEADS, PADDED_HEAD_DIM, in_features)
+    quarter = ORIG_HEAD_DIM // 4
+    half = PADDED_HEAD_DIM // 2
+    # X-axis quarters land in the first slot of each half, Y-axis in the second.
+    torch.testing.assert_close(new_w[:, :quarter], orig_w[:, :quarter])
+    torch.testing.assert_close(new_w[:, quarter : 2 * quarter], orig_w[:, 2 * quarter : 3 * quarter])
+    torch.testing.assert_close(new_w[:, half : half + quarter], orig_w[:, quarter : 2 * quarter])
+    torch.testing.assert_close(
+        new_w[:, half + quarter : half + 2 * quarter], orig_w[:, 3 * quarter :]
+    )
+    # Everything else is the zero padding.
+    assert torch.all(new_w[:, 2 * quarter : half] == 0)
+    assert torch.all(new_w[:, half + 2 * quarter :] == 0)
+
+
+def test_pad_norm_weight_fills_padding_lanes_with_ones():
+    """A norm weight is multiplicative, so padding lanes must be 1.0 (not 0.0) --
+    a zero there would be harmless today but wrong if the lane ever carried data."""
+    from spyre_inference.multimodal.gemma4_vision import _pad_norm_weight
+
+    norm = modeling_gemma4.Gemma4RMSNorm(dim=ORIG_HEAD_DIM, eps=1e-6, with_scale=True)
+    norm.weight.data.normal_()
+
+    padded = _pad_norm_weight(norm, ORIG_HEAD_DIM, PADDED_HEAD_DIM)
+
+    assert padded.shape == (PADDED_HEAD_DIM,)
+    quarter = ORIG_HEAD_DIM // 4
+    half = PADDED_HEAD_DIM // 2
+    assert torch.all(padded[2 * quarter : half] == 1.0)
+    assert torch.all(padded[half + 2 * quarter :] == 1.0)
+
+
+def test_pad_mlp_is_numerically_transparent():
+    """26B-A4B's vision MLP is 4304 wide (not a 64-multiple), so it is zero-extended
+    onto the stick. The zero lanes must contribute nothing: `gelu(0) * 0 == 0`, and
+    the matching zero down-projection columns ignore whatever lands there."""
+    from spyre_inference.multimodal.gemma4_vision import _pad_mlp
+
+    torch.manual_seed(0)
+    orig, padded = 200, 256
+    config = configuration_gemma4.Gemma4VisionConfig(
+        hidden_size=128,
+        intermediate_size=orig,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        head_dim=64,
+        num_hidden_layers=1,
+        use_clipped_linears=False,
+    )
+    layer = modeling_gemma4.Gemma4VisionEncoderLayer(config=config, layer_idx=0).to(torch.float32)
+    x = torch.randn(1, 5, 128)
+
+    want = layer.mlp(x)
+    _pad_mlp(layer, orig, padded)
+    got = layer.mlp(x)
+
+    assert layer.mlp.gate_proj.linear.out_features == padded
+    assert layer.mlp.up_proj.linear.out_features == padded
+    assert layer.mlp.down_proj.linear.in_features == padded
+    torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-5)
+
+    # Idempotent: apply() runs per load, and re-padding would double the width.
+    _pad_mlp(layer, orig, padded)
+    assert layer.mlp.gate_proj.linear.out_features == padded
+
+
+def test_pad_mlp_is_a_noop_when_already_stick_aligned():
+    """E2B's 3072-wide MLP needs no padding; don't rebuild its linears."""
+    from spyre_inference.multimodal.gemma4_vision import _pad_mlp
+
+    config = configuration_gemma4.Gemma4VisionConfig(
+        hidden_size=128,
+        intermediate_size=256,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        head_dim=64,
+        num_hidden_layers=1,
+        use_clipped_linears=False,
+    )
+    layer = modeling_gemma4.Gemma4VisionEncoderLayer(config=config, layer_idx=0)
+    before = layer.mlp.gate_proj.linear
+
+    _pad_mlp(layer, 256, 256)
+
+    assert layer.mlp.gate_proj.linear is before
+
+
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_pad_proj_helpers_shapes(with_bias):
+    from spyre_inference.multimodal.gemma4_vision import (
+        _pad_proj_input_simple,
+        _pad_proj_output_simple,
+    )
+
+    hidden = 32
+    out_proj = torch.nn.Linear(hidden, NUM_HEADS * ORIG_HEAD_DIM, bias=with_bias)
+    padded_out = _pad_proj_output_simple(out_proj, NUM_HEADS, ORIG_HEAD_DIM, PADDED_HEAD_DIM)
+    assert padded_out.weight.shape == (NUM_HEADS * PADDED_HEAD_DIM, hidden)
+    assert (padded_out.bias is not None) == with_bias
+
+    in_proj = torch.nn.Linear(NUM_HEADS * ORIG_HEAD_DIM, hidden, bias=with_bias)
+    padded_in = _pad_proj_input_simple(in_proj, NUM_HEADS, ORIG_HEAD_DIM, PADDED_HEAD_DIM)
+    assert padded_in.weight.shape == (hidden, NUM_HEADS * PADDED_HEAD_DIM)
+    assert (padded_in.bias is not None) == with_bias
+
+
+# ---------------------------------------------------------------------------
+# RMSNorm: no fp32 promotion (torch-spyre gap), padding-corrected denominator
+# ---------------------------------------------------------------------------
+
+
+def test_padded_rms_norm_does_not_promote_to_fp32():
+    """The fp32 upcast in the hf-adapters original is exactly what breaks Spyre's
+    stick tiling (see the module docstring); fp16 in must stay fp16 throughout."""
+    from spyre_inference.multimodal.gemma4_vision import _padded_rms_norm
+
+    x = torch.randn(1, 4, NUM_HEADS, PADDED_HEAD_DIM, dtype=torch.float16)
+    out = _padded_rms_norm(x, None, 1e-6, ORIG_HEAD_DIM)
+    assert out.dtype == torch.float16
+
+
+def test_padded_rms_norm_does_not_promote_via_an_fp32_weight():
+    """`Gemma4RMSNorm` weights are fp32, so an unguarded `x * weight` promotes the
+    activation and blows up against the fp16 padded projections downstream. Stock
+    hid this behind a trailing `.type_as`; regression-guard the explicit cast."""
+    from spyre_inference.multimodal.gemma4_vision import _padded_rms_norm
+
+    x = torch.randn(1, 4, NUM_HEADS, PADDED_HEAD_DIM, dtype=torch.float16)
+    fp32_weight = torch.randn(PADDED_HEAD_DIM, dtype=torch.float32)
+    out = _padded_rms_norm(x, fp32_weight, 1e-6, ORIG_HEAD_DIM)
+    assert out.dtype == torch.float16
+
+
+def test_patched_rms_norm_does_not_promote_via_its_fp32_weight():
+    """Same hazard through the patched module: transformers builds these weights at
+    the default (fp32) dtype, and the vision tower feeds fp16 activations."""
+    from spyre_inference.multimodal import gemma4_vision
+
+    norm = modeling_gemma4.Gemma4RMSNorm(dim=16, eps=1e-6, with_scale=True)
+    assert norm.weight.dtype == torch.float32, "premise of this test changed upstream"
+
+    gemma4_vision.patch_rms_norm()
+    out = norm(torch.randn(2, 3, 16, dtype=torch.float16))
+    assert out.dtype == torch.float16
+
+
+def test_padded_rms_norm_ignores_zero_padding_lanes():
+    """The `padded/orig` variance rescale exists so the zero lanes don't deflate the
+    denominator: normalizing padded data must match normalizing the real data alone."""
+    from spyre_inference.multimodal.gemma4_vision import _padded_rms_norm
+
+    torch.manual_seed(0)
+    real = torch.randn(1, 4, NUM_HEADS, ORIG_HEAD_DIM, dtype=torch.float32)
+    padded = _pad_activation_quarters(real, ORIG_HEAD_DIM, PADDED_HEAD_DIM)
+
+    got = _padded_rms_norm(padded, None, 1e-6, ORIG_HEAD_DIM)
+    got_real_channels = _unpad_activation_quarters(got, ORIG_HEAD_DIM, PADDED_HEAD_DIM)
+
+    variance = (real * real).mean(-1, keepdim=True)
+    want = real * torch.rsqrt(variance + 1e-6)
+
+    torch.testing.assert_close(got_real_channels, want, rtol=1e-5, atol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# The load-bearing check: padded two-axis rope == the transformers reference
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.rotary
+def test_padded_rope_matches_transformers_reference():
+    """`x*cos + (x @ m)*sin` over the padded layout must reproduce stock
+    `apply_multidimensional_rope` on the real (unpadded) channels exactly.
+
+    This is what catches an off-by-a-quarter in the interleave, a swapped axis, or a
+    sin sign error -- all of which still produce plausible magnitudes.
+    """
+    from spyre_inference.multimodal.gemma4_vision import _apply_rope, _gemma4_rope_cos_sin
+
+    torch.manual_seed(0)
+    config = _vision_config()
+    position_ids = _position_ids()
+    x = torch.randn(1, NUM_PATCHES, NUM_HEADS, ORIG_HEAD_DIM, dtype=torch.float32)
+
+    rope = modeling_gemma4.Gemma4VisionRotaryEmbedding(config)
+    cos, sin = rope(x, position_ids)
+    want = modeling_gemma4.apply_multidimensional_rope(x, cos, sin, position_ids, unsqueeze_dim=2)
+
+    x_padded = _pad_activation_quarters(x, ORIG_HEAD_DIM, PADDED_HEAD_DIM)
+    cos_full, sin_full = _gemma4_rope_cos_sin(
+        rope.inv_freq, position_ids, PADDED_HEAD_DIM, torch.float32
+    )
+    got_padded = _apply_rope(x_padded, cos_full, sin_full)
+    got = _unpad_activation_quarters(got_padded, ORIG_HEAD_DIM, PADDED_HEAD_DIM)
+
+    torch.testing.assert_close(got, want, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.rotary
+def test_rope_cos_sin_padding_lanes_are_the_identity_rotation():
+    """Padding lanes must rotate by nothing (cos=1, sin=0) so a padded channel that
+    is not exactly zero still cannot leak into a real one."""
+    from spyre_inference.multimodal.gemma4_vision import _gemma4_rope_cos_sin
+
+    config = _vision_config()
+    rope = modeling_gemma4.Gemma4VisionRotaryEmbedding(config)
+    cos, sin = _gemma4_rope_cos_sin(
+        rope.inv_freq, _position_ids(), PADDED_HEAD_DIM, torch.float32
+    )
+
+    assert cos.shape == (1, NUM_PATCHES, 1, PADDED_HEAD_DIM)
+    assert sin.shape == (1, NUM_PATCHES, 1, PADDED_HEAD_DIM)
+    quarter = ORIG_HEAD_DIM // 4
+    half = PADDED_HEAD_DIM // 2
+    for lanes in (slice(2 * quarter, half), slice(half + 2 * quarter, PADDED_HEAD_DIM)):
+        assert torch.all(cos[..., lanes] == 1.0)
+        assert torch.all(sin[..., lanes] == 0.0)
+
+
+def test_apply_rope_swaps_halves_and_keeps_each_half_stick_aligned():
+    """The half-swap is done by slicing rather than Pixtral's matmul, which is only
+    legal because the padded head_dim makes each half a whole 64-element stick.
+
+    Guard both halves of that argument: the swap itself, and the alignment premise
+    (`_padded_head_dim` rounding to 2*64) the slice depends on.
+    """
+    from spyre_inference.multimodal.gemma4_vision import (
+        BLOCK_SIZE,
+        _apply_rope,
+        _padded_head_dim,
+    )
+
+    head_dim = 8
+    x = torch.arange(head_dim, dtype=torch.float32).view(1, 1, 1, head_dim)
+    cos = torch.zeros(1, 1, 1, head_dim)
+    sin = torch.ones(1, 1, 1, head_dim)
+    # cos=0, sin=1 isolates the swap term.
+    got = _apply_rope(x, cos, sin)
+    want = torch.cat([x[..., head_dim // 2 :], x[..., : head_dim // 2]], dim=-1)
+    torch.testing.assert_close(got, want)
+
+    assert (_padded_head_dim(ORIG_HEAD_DIM) // 2) % BLOCK_SIZE == 0, (
+        "each rope half must be a whole stick for the slice form to lower"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Patch application / dispatch
+# ---------------------------------------------------------------------------
+
+
+def test_patches_are_idempotent():
+    """`apply()` runs per model load, so every patch must be re-entrant."""
+    from spyre_inference.multimodal import gemma4_vision
+
+    gemma4_vision.patch_rms_norm()
+    first = modeling_gemma4.Gemma4RMSNorm.forward
+    gemma4_vision.patch_rms_norm()
+    assert modeling_gemma4.Gemma4RMSNorm.forward is first
+
+    gemma4_vision.patch_vision_encoder()
+    first_encoder = modeling_gemma4.Gemma4VisionEncoder.forward
+    gemma4_vision.patch_vision_encoder()
+    assert modeling_gemma4.Gemma4VisionEncoder.forward is first_encoder
+
+
+def test_patched_rms_norm_stays_in_input_dtype_and_matches_reference():
+    """The patched forward drops stock's fp32 round trip; in fp32 (where the
+    promotion is a no-op) it must still agree with stock to tight tolerance."""
+    from spyre_inference.multimodal import gemma4_vision
+
+    torch.manual_seed(0)
+    dim = 16
+    norm = modeling_gemma4.Gemma4RMSNorm(dim=dim, eps=1e-6, with_scale=True)
+    norm.weight.data.normal_()
+    x = torch.randn(2, 3, dim, dtype=torch.float32)
+
+    mean_squared = x.pow(2).mean(-1, keepdim=True) + norm.eps
+    want = x * torch.pow(mean_squared, -0.5) * norm.weight
+
+    gemma4_vision.patch_rms_norm()
+    got = norm(x)
+
+    assert got.dtype == torch.float32
+    torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-5)
+
+    x16 = x.to(torch.float16)
+    assert norm.to(torch.float16)(x16).dtype == torch.float16
+
+
+def test_dispatch_routes_gemma4_tower_away_from_pixtral(monkeypatch):
+    """`apply_multimodal_patches` keys on the tower's class name, since Pixtral and
+    Gemma 4 both hang their tower off a `vision_tower` attribute."""
+    from spyre_inference import multimodal
+
+    called = []
+    monkeypatch.setattr(
+        multimodal.gemma4_vision, "apply", lambda *a: called.append("gemma4"), raising=True
+    )
+    monkeypatch.setattr(
+        multimodal.pixtral, "apply", lambda *a: called.append("pixtral"), raising=True
+    )
+
+    # The name is the dispatch key, so it has to match upstream's exactly.
+    class Gemma4VisionModel(torch.nn.Module):
+        pass
+
+    class _PixtralTower(torch.nn.Module):
+        pass
+
+    gemma4_model = torch.nn.Module()
+    gemma4_model.vision_tower = Gemma4VisionModel()
+    multimodal.apply_multimodal_patches(gemma4_model, torch.device("cpu"))
+    assert called == ["gemma4"]
+
+    called.clear()
+    pixtral_model = torch.nn.Module()
+    pixtral_model.vision_tower = _PixtralTower()
+    multimodal.apply_multimodal_patches(pixtral_model, torch.device("cpu"))
+    assert called == ["pixtral"]
+
+    called.clear()
+    multimodal.apply_multimodal_patches(torch.nn.Module(), torch.device("cpu"))
+    assert called == [], "a text-only model must get no vision patches"
+
+
+def test_accelerator_memory_info_falls_back_to_host_ram(monkeypatch):
+    """Spyre registers no accelerator memory-info hook, so the native call raises;
+    Gemma 4's encoder chunking needs a real number back."""
+    from spyre_inference.multimodal import gemma4_vision
+
+    def _unimplemented(*args, **kwargs):
+        raise NotImplementedError("getMemoryInfo is not implemented for this allocator yet.")
+
+    monkeypatch.setattr(torch.accelerator, "get_memory_info", _unimplemented, raising=True)
+    gemma4_vision.patch_accelerator_memory_info()
+
+    free, total = torch.accelerator.get_memory_info()
+    assert free > 0
+    assert total >= free
+
+
+def test_accelerator_memory_info_passes_through_when_native_call_works(monkeypatch):
+    from spyre_inference.multimodal import gemma4_vision
+
+    monkeypatch.setattr(torch.accelerator, "get_memory_info", lambda *a, **k: (123, 456))
+    gemma4_vision.patch_accelerator_memory_info()
+
+    assert torch.accelerator.get_memory_info() == (123, 456)

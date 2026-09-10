@@ -105,14 +105,19 @@ def padded_sdpa(
     k: torch.Tensor,
     v: torch.Tensor,
     mask: torch.Tensor,
+    scale: float | None = None,
 ) -> torch.Tensor:
     """SDPA over `[B, H, L, D]` with L and D padded to the 64 stick, then cropped.
 
-    Padded keys are masked to `-inf` and padded queries cropped off. `scale` comes
-    from the unpadded head dim, so the padding cannot change it.
+    Padded keys are masked to `-inf` and padded queries cropped off. By default
+    `scale` comes from the unpadded head dim (assumes `q`/`k`/`v` arrive unpadded, so
+    the padding cannot change it) -- pass it explicitly for a caller whose head_dim
+    is already padded before this call (e.g. rope needing the padding first) or
+    whose model uses a fixed scale unrelated to head_dim (e.g. Gemma 4's `scale=1.0`).
     """
     b, _, seq, d = q.shape
-    scale = d**-0.5
+    if scale is None:
+        scale = d**-0.5
     seq_pad = _align_up(seq)
     d_pad = _align_up(d)
     device = q.device
