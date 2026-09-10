@@ -547,6 +547,10 @@ def _pool_weights(
 
     The mask comes from the unzeroed weights, matching stock: an output cell fed only
     by padding patches still counts as valid.
+
+    TODO: this is rebuilt per image, so a multi-image batch pays for it (and its
+    upload) once per image even when the patch geometry repeats. Cache it keyed on
+    that geometry before raising ``limit_mm_per_prompt`` above 1.
     """
     clamped = pixel_position_ids.clamp(min=0)
     max_x = clamped[..., 0].max(dim=-1, keepdim=True)[0] + 1
