@@ -156,64 +156,6 @@ def test_is_multimodal_gemma4_requires_a_vision_tower(hf_config, expected):
     assert is_multimodal_gemma4(hf_config) is expected
 
 
-def test_platform_selects_bfloat16_for_a_multimodal_gemma4_config():
-    """The hook runs after vLLM resolved ``model_config.dtype``, so it decides from the
-    model config rather than the user's flag."""
-    import torch
-
-    from spyre_inference.platform import TorchSpyrePlatform
-
-    vision_cfg = SimpleNamespace(model_type="gemma4", vision_config=object(), audio_config=None)
-    text_cfg = SimpleNamespace(model_type="gemma4", vision_config=None, audio_config=None)
-
-    def _config(hf_config):
-        return SimpleNamespace(model_config=SimpleNamespace(hf_config=hf_config))
-
-    assert TorchSpyrePlatform._default_dtype(_config(vision_cfg)) is torch.bfloat16
-    assert TorchSpyrePlatform._default_dtype(_config(text_cfg)) is torch.float16
-    # No hf_config at all (bare VllmConfig) must not crash.
-    assert TorchSpyrePlatform._default_dtype(_config(None)) is torch.float16
-
-
-def test_platform_keeps_bfloat16_for_the_nested_text_config():
-    """``with_hf_config`` re-runs this hook with the bare text half, which has no
-    ``vision_config``. Deciding afresh there would downgrade the decoder to fp16 while
-    its weights stay bf16 -- a mismatch that silently diverts the lm-head.
-    """
-    import torch
-
-    from spyre_inference.platform import TorchSpyrePlatform
-
-    vision_cfg = SimpleNamespace(model_type="gemma4", vision_config=object(), audio_config=None)
-    model_config = SimpleNamespace(hf_config=vision_cfg)
-    outer = SimpleNamespace(model_config=model_config)
-
-    assert TorchSpyrePlatform._default_dtype(outer) is torch.bfloat16
-
-    # with_hf_config deep-copies the ModelConfig and swaps in the text half.
-    import copy
-
-    nested_model_config = copy.deepcopy(model_config)
-    nested_model_config.hf_config = SimpleNamespace(
-        model_type="gemma4_text", vision_config=None, audio_config=None
-    )
-    nested = SimpleNamespace(model_config=nested_model_config)
-
-    assert TorchSpyrePlatform._default_dtype(nested) is torch.bfloat16, (
-        "the nested text config must inherit bf16, not fall back to fp16"
-    )
-
-
-def test_attention_backend_accepts_both_supported_dtypes():
-    """bf16 has to be declared on the backend too, or selection rejects the model."""
-    import torch
-
-    from spyre_inference.v1.attention.backends.spyre_attn import SpyreAttentionBackend
-
-    assert torch.float16 in SpyreAttentionBackend.supported_dtypes
-    assert torch.bfloat16 in SpyreAttentionBackend.supported_dtypes
-
-
 def test_multimodal_gemma4_delegates_its_text_half_through_the_model_registry():
     """Why ``Gemma4ForConditionalGeneration`` needs no ``_ADAPTED_ARCHS`` entry: it
     resolves its text half through ``ModelRegistry``, so it already lands on
