@@ -82,7 +82,10 @@ def parse_args():
         "--dtype",
         type=str,
         default="auto",
-        help="Leave as auto: the platform picks float16, or bfloat16 for checkpoints that overflow it",
+        help=(
+            "Leave as auto: the platform picks float16, or bfloat16 for checkpoints "
+            "that overflow it"
+        ),
     )
     return parser.parse_args()
 

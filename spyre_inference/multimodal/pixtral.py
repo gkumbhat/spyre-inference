@@ -31,6 +31,7 @@ from spyre_inference.multimodal.utils import padded_sdpa
 
 logger = init_logger(__name__)
 
+
 @cache
 def rope_perm_matrix(kind: str, head_dim: int, device: torch.device) -> torch.Tensor:
     """Constant `[head_dim, head_dim]` permutation `M` so `x @ M` is a rope shuffle.

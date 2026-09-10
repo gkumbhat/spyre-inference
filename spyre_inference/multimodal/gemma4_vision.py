@@ -22,6 +22,8 @@ transformers code outside vLLM's layer registries -- same category as
 
 from __future__ import annotations
 
+from typing import cast
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -37,7 +39,7 @@ def _host(t: torch.Tensor) -> torch.Tensor:
     """Detach a weight onto the host before reshaping or padding it.
 
     The padding helpers rebuild weights out of strided slice-assignments, and composed
-    on a Spyre-resident tensor those mis-lower silently -- finite but wrong weights,
+    on a Spyre-resident tensor those lower incorrectly and silently -- finite but wrong,
     costing most of the encoder's accuracy. Individual assignments are fine, so only
     the composite is affected and nothing raises. vLLM moves the model before our
     patches run, so each helper pulls its source here and the caller moves the
@@ -68,12 +70,15 @@ def _as_plain_linear(layer: nn.Module) -> nn.Linear:
             f"on {type(layer).__name__} ({type(quant_method).__name__}); it rebuilds "
             "the projection as a plain nn.Linear. Run the vision tower unquantized."
         )
-    weight_t = _host(layer.weight)  # [in, out] once vLLM's Spyre OOT method has run
+    # [in, out] once vLLM's Spyre OOT method has run. cast: `nn.Module.weight` is
+    # `Tensor | Module` generically; this layer's is always a real Tensor.
+    weight_t = _host(cast(torch.Tensor, layer.weight))
     in_features, out_features = weight_t.shape
     plain = nn.Linear(in_features, out_features, bias=layer.bias is not None)
     plain.weight = nn.Parameter(weight_t.t().contiguous(), requires_grad=False)
     if layer.bias is not None:
-        plain.bias = nn.Parameter(_host(layer.bias).clone(), requires_grad=False)
+        bias = _host(cast(torch.Tensor, layer.bias))
+        plain.bias = nn.Parameter(bias.clone(), requires_grad=False)
     return plain
 
 
@@ -108,8 +113,12 @@ def _pad_qk_linear(proj, num_heads: int, orig_head_dim: int, padded_head_dim: in
     new_weight[:, quarter : 2 * quarter] = weight[:, 2 * quarter : 3 * quarter]
     new_weight[:, padded_half : padded_half + quarter] = weight[:, quarter : 2 * quarter]
     new_weight[:, padded_half + quarter : padded_half + 2 * quarter] = weight[:, 3 * quarter :]
-    padded = nn.Linear(linear.in_features, num_heads * padded_head_dim, bias=linear.bias is not None)
-    padded.weight = nn.Parameter(new_weight.reshape(num_heads * padded_head_dim, -1), requires_grad=False)
+    padded = nn.Linear(
+        linear.in_features, num_heads * padded_head_dim, bias=linear.bias is not None
+    )
+    padded.weight = nn.Parameter(
+        new_weight.reshape(num_heads * padded_head_dim, -1), requires_grad=False
+    )
     if linear.bias is not None:
         bias = _host(linear.bias).view(num_heads, orig_head_dim)
         new_bias = torch.zeros(num_heads, padded_head_dim, dtype=bias.dtype)
@@ -121,7 +130,9 @@ def _pad_qk_linear(proj, num_heads: int, orig_head_dim: int, padded_head_dim: in
     return padded
 
 
-def _pad_proj_output_simple(proj: nn.Linear, n_heads: int, orig_head_dim: int, padded_head_dim: int) -> nn.Linear:
+def _pad_proj_output_simple(
+    proj: nn.Linear, n_heads: int, orig_head_dim: int, padded_head_dim: int
+) -> nn.Linear:
     """End-pad each head of a [n_heads*head_dim, hidden] output projection (V)."""
     w = _host(proj.weight)
     hidden = w.shape[1]
@@ -141,7 +152,9 @@ def _pad_proj_output_simple(proj: nn.Linear, n_heads: int, orig_head_dim: int, p
     return new_proj
 
 
-def _pad_proj_input_simple(proj: nn.Linear, n_heads: int, orig_head_dim: int, padded_head_dim: int) -> nn.Linear:
+def _pad_proj_input_simple(
+    proj: nn.Linear, n_heads: int, orig_head_dim: int, padded_head_dim: int
+) -> nn.Linear:
     """End-pad each head along the input dim of an O-style projection."""
     w = _host(proj.weight)
     hidden = w.shape[0]
@@ -168,7 +181,9 @@ def _pad_norm_weight(norm, orig_head_dim: int, padded_head_dim: int) -> nn.Param
     return nn.Parameter(padded, requires_grad=False)
 
 
-def _padded_rms_norm(hidden_states: torch.Tensor, weight, eps: float, orig_head_dim: int) -> torch.Tensor:
+def _padded_rms_norm(
+    hidden_states: torch.Tensor, weight, eps: float, orig_head_dim: int
+) -> torch.Tensor:
     """RMSNorm with the denominator scaled back to the unpadded head_dim, so the zero
     padding lanes do not deflate the variance the real channels are normalized by.
 
@@ -308,8 +323,12 @@ def _prepare_attention(attn, num_heads: int, orig_head_dim: int, padded_head_dim
     attn.k_proj.linear = _as_plain_linear(attn.k_proj.linear)
     attn.v_proj.linear = _as_plain_linear(attn.v_proj.linear)
     attn.o_proj.linear = _as_plain_linear(attn.o_proj.linear)
-    attn.q_proj.linear = _pad_qk_linear(attn.q_proj, num_heads, orig_head_dim, padded_head_dim).to(device)
-    attn.k_proj.linear = _pad_qk_linear(attn.k_proj, num_heads, orig_head_dim, padded_head_dim).to(device)
+    attn.q_proj.linear = _pad_qk_linear(attn.q_proj, num_heads, orig_head_dim, padded_head_dim).to(
+        device
+    )
+    attn.k_proj.linear = _pad_qk_linear(attn.k_proj, num_heads, orig_head_dim, padded_head_dim).to(
+        device
+    )
     attn.v_proj.linear = _pad_proj_output_simple(
         attn.v_proj.linear, num_heads, orig_head_dim, padded_head_dim
     ).to(device)
@@ -317,10 +336,12 @@ def _prepare_attention(attn, num_heads: int, orig_head_dim: int, padded_head_dim
         attn.o_proj.linear, num_heads, orig_head_dim, padded_head_dim
     ).to(device)
     attn.q_norm.weight = nn.Parameter(
-        _pad_norm_weight(attn.q_norm, orig_head_dim, padded_head_dim).to(device), requires_grad=False
+        _pad_norm_weight(attn.q_norm, orig_head_dim, padded_head_dim).to(device),
+        requires_grad=False,
     )
     attn.k_norm.weight = nn.Parameter(
-        _pad_norm_weight(attn.k_norm, orig_head_dim, padded_head_dim).to(device), requires_grad=False
+        _pad_norm_weight(attn.k_norm, orig_head_dim, padded_head_dim).to(device),
+        requires_grad=False,
     )
     attn._spyre_padded_head_dim = padded_head_dim
 
@@ -401,7 +422,13 @@ def patch_vision_encoder() -> None:
     if cls is None or getattr(cls.forward, "_spyre_patched", False):
         return
 
-    def _forward(self, inputs_embeds, attention_mask, pixel_position_ids=None, **kwargs):
+    def _forward(
+        self,
+        inputs_embeds: torch.Tensor,
+        attention_mask: torch.Tensor,
+        pixel_position_ids: torch.Tensor | None = None,
+        **kwargs,
+    ):
         del kwargs
         config = self.config
         if config.num_key_value_heads != config.num_attention_heads:
@@ -409,6 +436,10 @@ def patch_vision_encoder() -> None:
                 "Gemma 4 vision GQA is not supported on Spyre; num_key_value_heads "
                 "must equal num_attention_heads."
             )
+        if pixel_position_ids is None:
+            # Kept optional only to match the stock signature; every caller supplies
+            # it (rope needs real patch positions to do anything).
+            raise NotImplementedError("Gemma 4 vision requires pixel_position_ids on Spyre.")
         num_heads = config.num_attention_heads
         orig_head_dim = config.head_dim
         padded_head_dim = _padded_head_dim(orig_head_dim)
@@ -450,10 +481,12 @@ def patch_vision_encoder() -> None:
 
         from transformers.modeling_outputs import BaseModelOutputWithPast
 
-        return BaseModelOutputWithPast(last_hidden_state=hidden_states)
+        return BaseModelOutputWithPast(
+            last_hidden_state=hidden_states  # ty: ignore[invalid-argument-type]
+        )
 
     _forward._spyre_patched = True
-    cls.forward = _forward  # ty: ignore[invalid-assignment]
+    cls.forward = _forward
     logger.info_once(
         "Spyre: patched Gemma4VisionEncoder to head_dim-padded rope (Pixtral's "
         "matmul-rotate form) + padded SDPA (pad L/D to 64, mask, crop)."
@@ -491,7 +524,7 @@ def patch_rms_norm() -> None:
         return normed_output.to(dtype)
 
     forward._spyre_patched = True
-    cls.forward = forward  # ty: ignore[invalid-assignment]
+    cls.forward = forward
     logger.info_once(
         "Spyre: Gemma4RMSNorm runs without fp32 promotion and uses torch.rsqrt "
         "instead of torch.pow(x, -0.5); expect small numerical differences."
@@ -531,7 +564,7 @@ def patch_pooler() -> None:
         )
 
     forward._spyre_patched = True
-    cls.forward = forward  # ty: ignore[invalid-assignment]
+    cls.forward = forward
     logger.info_once("Spyre: Gemma4VisionPooler runs on CPU (masked_fill/one_hot geometry).")
 
 
@@ -591,10 +624,8 @@ def patch_patch_embedder() -> None:
         return convert(position_embeddings, device=device)
 
     _position_embeddings._spyre_patched = True
-    cls._position_embeddings = _position_embeddings  # ty: ignore[invalid-assignment]
-    logger.info_once(
-        "Spyre: Gemma4VisionPatchEmbedder position-embedding gather runs on CPU."
-    )
+    cls._position_embeddings = _position_embeddings
+    logger.info_once("Spyre: Gemma4VisionPatchEmbedder position-embedding gather runs on CPU.")
 
 
 def place_vision_tail_on_cpu(model: torch.nn.Module) -> None:

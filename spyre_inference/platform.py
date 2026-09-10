@@ -530,9 +530,10 @@ class TorchSpyrePlatform(CpuPlatform):
             # overflow it (see _default_dtype). Both are 2 bytes, so every stick
             # alignment constant in this plugin is unaffected by the choice.
             if vllm_config.model_config.dtype not in _SUPPORTED_DTYPES:
+                supported = sorted(str(d) for d in _SUPPORTED_DTYPES)
                 raise ValueError(
-                    f"The model dtype needs to be one of {sorted(str(d) for d in _SUPPORTED_DTYPES)} "
-                    f"for spyre, but was specified to be {vllm_config.model_config.dtype}"
+                    f"The model dtype needs to be one of {supported} for spyre, but "
+                    f"was specified to be {vllm_config.model_config.dtype}"
                 )
 
             # Pad attention head_dim up to a stick-aligned size on the native path.

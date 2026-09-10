@@ -114,7 +114,9 @@ def test_vision_plus_audio_checkpoint_is_allowed_for_its_vision_path(monkeypatch
 
 def test_multimodal_head_dim_override_repairs_access_without_touching_architectures():
     text_config = SimpleNamespace(architectures=None)
-    config = SimpleNamespace(architectures=["Gemma4ForConditionalGeneration"], text_config=text_config)
+    config = SimpleNamespace(
+        architectures=["Gemma4ForConditionalGeneration"], text_config=text_config
+    )
 
     result = _gemma4_multimodal_head_dim_override(config)
 
@@ -161,9 +163,7 @@ def test_platform_selects_bfloat16_for_a_multimodal_gemma4_config():
 
     from spyre_inference.platform import TorchSpyrePlatform
 
-    vision_cfg = SimpleNamespace(
-        model_type="gemma4", vision_config=object(), audio_config=None
-    )
+    vision_cfg = SimpleNamespace(model_type="gemma4", vision_config=object(), audio_config=None)
     text_cfg = SimpleNamespace(model_type="gemma4", vision_config=None, audio_config=None)
 
     def _config(hf_config):
@@ -184,9 +184,7 @@ def test_platform_keeps_bfloat16_for_the_nested_text_config():
 
     from spyre_inference.platform import TorchSpyrePlatform
 
-    vision_cfg = SimpleNamespace(
-        model_type="gemma4", vision_config=object(), audio_config=None
-    )
+    vision_cfg = SimpleNamespace(model_type="gemma4", vision_config=object(), audio_config=None)
     model_config = SimpleNamespace(hf_config=vision_cfg)
     outer = SimpleNamespace(model_config=model_config)
 

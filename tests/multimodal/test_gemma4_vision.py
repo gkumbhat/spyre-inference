@@ -143,7 +143,9 @@ def test_pad_qk_linear_preserves_every_original_channel():
     half = PADDED_HEAD_DIM // 2
     # X-axis quarters land in the first slot of each half, Y-axis in the second.
     torch.testing.assert_close(new_w[:, :quarter], orig_w[:, :quarter])
-    torch.testing.assert_close(new_w[:, quarter : 2 * quarter], orig_w[:, 2 * quarter : 3 * quarter])
+    torch.testing.assert_close(
+        new_w[:, quarter : 2 * quarter], orig_w[:, 2 * quarter : 3 * quarter]
+    )
     torch.testing.assert_close(new_w[:, half : half + quarter], orig_w[:, quarter : 2 * quarter])
     torch.testing.assert_close(
         new_w[:, half + quarter : half + 2 * quarter], orig_w[:, 3 * quarter :]
@@ -312,9 +314,7 @@ def test_rope_cos_sin_padding_lanes_are_the_identity_rotation():
 
     config = _vision_config()
     rope = modeling_gemma4.Gemma4VisionRotaryEmbedding(config)
-    cos, sin = _gemma4_rope_cos_sin(
-        rope.inv_freq, _position_ids(), PADDED_HEAD_DIM, torch.float32
-    )
+    cos, sin = _gemma4_rope_cos_sin(rope.inv_freq, _position_ids(), PADDED_HEAD_DIM, torch.float32)
 
     assert cos.shape == (1, NUM_PATCHES, 1, PADDED_HEAD_DIM)
     assert sin.shape == (1, NUM_PATCHES, 1, PADDED_HEAD_DIM)
@@ -570,8 +570,8 @@ def test_padding_on_device_weights_matches_padding_on_host():
     host and moving afterwards.
 
     This is the regression `_host` exists for: composed on device-resident weights the
-    helpers' strided slice-assignments mis-lower, producing finite but wrong padded
-    weights and costing most of the encoder's accuracy. Individual assignments are
+    helpers' strided slice-assignments lower incorrectly, producing finite but wrong
+    padded weights and costing most of the encoder's accuracy. Individual assignments are
     fine, so only the composite is affected and nothing raises -- and vLLM moves the
     model before our patches run, so the bad ordering is the one that happens in
     production.
