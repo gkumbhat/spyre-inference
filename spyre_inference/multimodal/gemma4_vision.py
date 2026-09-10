@@ -79,9 +79,24 @@ def _as_plain_linear(layer: nn.Module) -> nn.Linear:
     bounce through this first; the result replaces `.linear` outright (this module's
     patches don't need the Spyre fast-path GEMM to still apply to these four
     projections specifically -- `F.linear` lowers fine here regardless).
+
+    Replacing the layer also discards its ``quant_method``, so a quantized tower is
+    rejected rather than silently dequantized. Unreachable today: vLLM only passes a
+    quant config to the towers when both ``vision_config.hidden_size`` and
+    ``intermediate_size`` are multiples of 64, and 26B-A4B's 4304-wide MLP is not --
+    but that is vLLM's condition to change, not ours to depend on.
     """
     if isinstance(layer, nn.Linear):
         return layer
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+    quant_method = getattr(layer, "quant_method", None)
+    if quant_method is not None and not isinstance(quant_method, UnquantizedLinearMethod):
+        raise NotImplementedError(
+            "Gemma 4 vision head-dim padding cannot preserve the quantization method "
+            f"on {type(layer).__name__} ({type(quant_method).__name__}); it rebuilds "
+            "the projection as a plain nn.Linear. Run the vision tower unquantized."
+        )
     weight_t = _host(layer.weight)  # [in, out] once vLLM's Spyre OOT method has run
     in_features, out_features = weight_t.shape
     plain = nn.Linear(in_features, out_features, bias=layer.bias is not None)
@@ -100,6 +115,33 @@ def _host_linear(proj: nn.Linear) -> nn.Linear:
     if proj.bias is not None:
         shim.bias = nn.Parameter(_host(proj.bias), requires_grad=False)
     return shim
+
+
+def _assert_clipping_preserves_zero(proj, name: str) -> None:
+    """A clipped projection's output range must contain zero when we pad its heads.
+
+    `Gemma4ClippableLinear` clamps its output to learned `[output_min, output_max]`
+    bounds from the checkpoint. Head-dim padding relies on the padded lanes being
+    exactly zero -- `_padded_rms_norm` rescales the variance by `padded/orig` on that
+    basis, and the zero columns of `o_proj`/`down_proj` ignore them. If the clamp
+    range excluded zero it would map those lanes to a nonzero bound *after* the
+    projection, quietly invalidating both.
+
+    Inert for 26B-A4B (`use_clipped_linears=False`) and satisfied by E2B's bounds,
+    which straddle zero; this exists so a checkpoint that violates it fails loudly
+    instead of returning plausible numbers. Mirrors hf-adapters#495's
+    `_assert_output_clamp_preserves_zero`.
+    """
+    if not getattr(proj, "use_clipped_linears", False):
+        return
+    lo = _host(proj.output_min)
+    hi = _host(proj.output_max)
+    if not bool(torch.all((lo <= 0) & (hi >= 0)).item()):
+        raise NotImplementedError(
+            f"{name}: output clipping must include zero when the head dim is padded, "
+            f"or padded channels stop being zero before RMSNorm. Got "
+            f"output_min={lo.tolist()}, output_max={hi.tolist()}."
+        )
 
 
 def _pad_qk_linear(proj, num_heads: int, orig_head_dim: int, padded_head_dim: int) -> nn.Linear:
@@ -302,6 +344,9 @@ def _pad_mlp(layer, orig_intermediate: int, padded_intermediate: int) -> None:
     if getattr(layer.mlp, "_spyre_padded_intermediate", None) == padded_intermediate:
         return
     mlp = layer.mlp
+    for _name in ("gate_proj", "up_proj", "down_proj"):
+        _assert_clipping_preserves_zero(getattr(mlp, _name), f"vision mlp {_name}")
+
     device = mlp.gate_proj.linear.weight.device
     for name in ("gate_proj", "up_proj"):
         proj = getattr(mlp, name)
@@ -327,6 +372,9 @@ def _prepare_attention(attn, num_heads: int, orig_head_dim: int, padded_head_dim
     # torch.zeros/ones -- no device= -- so they land on CPU regardless of the source
     # weight's device. Here the model is already on Spyre, so move every padded
     # result back explicitly.
+    for _name in ("q_proj", "k_proj", "v_proj", "o_proj"):
+        _assert_clipping_preserves_zero(getattr(attn, _name), f"vision attention {_name}")
+
     device = attn.q_norm.weight.device
     attn.q_proj.linear = _as_plain_linear(attn.q_proj.linear)
     attn.k_proj.linear = _as_plain_linear(attn.k_proj.linear)

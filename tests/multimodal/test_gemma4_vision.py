@@ -561,3 +561,100 @@ def test_fp32_inv_freq_is_recomputed_not_read_off_a_downcast_buffer():
     recovered = _fp32_inv_freq(rope, config)
     assert recovered.dtype == torch.float32
     torch.testing.assert_close(recovered, exact, rtol=1e-6, atol=1e-9)
+
+
+# ---------------------------------------------------------------------------
+# Guards on assumptions the padding makes about the projections it rewrites
+# ---------------------------------------------------------------------------
+
+
+def _clipped_proj(output_min: float, output_max: float):
+    """A `Gemma4ClippableLinear` with real (finite) output clipping bounds."""
+    config = configuration_gemma4.Gemma4VisionConfig(
+        hidden_size=NUM_HEADS * ORIG_HEAD_DIM,
+        num_attention_heads=NUM_HEADS,
+        num_key_value_heads=NUM_HEADS,
+        head_dim=ORIG_HEAD_DIM,
+        use_clipped_linears=True,
+    )
+    proj = modeling_gemma4.Gemma4ClippableLinear(config, 32, NUM_HEADS * ORIG_HEAD_DIM)
+    proj.output_min = torch.nn.Buffer(torch.tensor(output_min))
+    proj.output_max = torch.nn.Buffer(torch.tensor(output_max))
+    return proj
+
+
+@pytest.mark.parametrize(
+    ("lo", "hi"),
+    [(-6.0, 6.0), (0.0, 6.0), (-6.0, 0.0), (-float("inf"), float("inf"))],
+)
+def test_clipping_that_includes_zero_is_accepted(lo, hi):
+    """Padding lanes stay zero as long as the clamp range contains zero (the bound
+    itself being zero is fine -- clamp(0) is still 0)."""
+    from spyre_inference.multimodal.gemma4_vision import _assert_clipping_preserves_zero
+
+    _assert_clipping_preserves_zero(_clipped_proj(lo, hi), "test proj")
+
+
+@pytest.mark.parametrize(("lo", "hi"), [(0.5, 6.0), (-6.0, -0.5)])
+def test_clipping_that_excludes_zero_is_rejected(lo, hi):
+    """A clamp range excluding zero maps the padded lanes to a nonzero bound after the
+    projection, silently invalidating `_padded_rms_norm`'s variance correction."""
+    from spyre_inference.multimodal.gemma4_vision import _assert_clipping_preserves_zero
+
+    with pytest.raises(NotImplementedError, match="must include zero"):
+        _assert_clipping_preserves_zero(_clipped_proj(lo, hi), "test proj")
+
+
+def test_unclipped_projection_skips_the_clipping_check():
+    """26B-A4B has `use_clipped_linears=False`, so the check must be inert -- and must
+    not touch bounds buffers that do not exist."""
+    from spyre_inference.multimodal.gemma4_vision import _assert_clipping_preserves_zero
+
+    config = _vision_config()
+    assert not config.use_clipped_linears, "premise: this config is unclipped"
+    proj = modeling_gemma4.Gemma4ClippableLinear(config, 32, NUM_HEADS * ORIG_HEAD_DIM)
+    assert not hasattr(proj, "output_min")
+
+    _assert_clipping_preserves_zero(proj, "test proj")  # must not raise
+
+
+def test_quantized_projection_is_rejected_rather_than_dequantized():
+    """`_as_plain_linear` rebuilds the projection as a plain nn.Linear, which drops the
+    quantization method; that must fail loudly instead of silently dequantizing."""
+    from spyre_inference.multimodal.gemma4_vision import _as_plain_linear
+
+    class _FakeQuantMethod:
+        pass
+
+    class _FakeQuantLinear(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.zeros(32, 8))
+            self.bias = None
+            self.quant_method = _FakeQuantMethod()
+
+    with pytest.raises(NotImplementedError, match="quantization method"):
+        _as_plain_linear(_FakeQuantLinear())
+
+
+def test_unquantized_vllm_linear_is_bounced_to_a_plain_linear():
+    """The normal path: an unquantized vLLM linear stores `Wᵀ`, so the bounce must
+    transpose it back into nn.Linear's `[out, in]` layout."""
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+    from spyre_inference.multimodal.gemma4_vision import _as_plain_linear
+
+    class _FakeReplicatedLinear(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            torch.manual_seed(0)
+            self.weight = torch.nn.Parameter(torch.randn(8, 32))  # [in, out]
+            self.bias = None
+            self.quant_method = UnquantizedLinearMethod()
+
+    src = _FakeReplicatedLinear()
+    plain = _as_plain_linear(src)
+
+    assert isinstance(plain, torch.nn.Linear)
+    assert plain.weight.shape == (32, 8)  # [out, in]
+    torch.testing.assert_close(plain.weight, src.weight.t().contiguous())
