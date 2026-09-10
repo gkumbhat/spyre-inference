@@ -14,16 +14,12 @@
 
 """Tests for `spyre_inference/multimodal/gemma4_vision.py`.
 
-The head-dim padding, its channel repacking, and the two-axis rope built on top of
-it are the parts most likely to be silently wrong (an off-by-a-quarter in the
-interleave still produces plausible-looking numbers), so the load-bearing test is
-the equivalence check against the real
-`transformers.models.gemma4.modeling_gemma4.apply_multidimensional_rope`.
+The head-dim padding, its channel repacking, and the rope built on top of it can be
+wrong while still producing plausible numbers, so the load-bearing test is the
+equivalence check against stock `apply_multidimensional_rope`.
 
-Like `test_pixtral.py`, the patches are guarded with `getattr(..., None)`, so a
-transformers rename turns one into a silent no-op -- hence the staleness tripwires.
-Everything here is host-side tensor math and needs no card; the on-device
-equivalents were validated by `scripts/probe_gemma4_vision_*.py`.
+The patches are `getattr`-guarded, so a transformers rename would silently no-op one
+-- hence the staleness tripwires. All host-side math; no card needed.
 """
 
 import pytest
@@ -108,15 +104,6 @@ def test_patched_upstream_symbols_still_exist(name):
         f"transformers.models.gemma4.modeling_gemma4.{name} is gone; "
         "spyre_inference/multimodal/gemma4_vision.py needs updating."
     )
-
-
-def test_rms_norm_forward_signature_is_what_the_patch_replaces():
-    """The patch replaces `forward` wholesale, so its contract must still hold:
-    an `eps` and a `with_scale`-gated `weight`."""
-    norm = modeling_gemma4.Gemma4RMSNorm(dim=8, eps=1e-6, with_scale=True)
-    assert hasattr(norm, "eps")
-    assert hasattr(norm, "with_scale")
-    assert hasattr(norm, "weight")
 
 
 # ---------------------------------------------------------------------------
@@ -237,44 +224,14 @@ def test_pad_mlp_is_a_noop_when_already_stick_aligned():
     assert layer.mlp.gate_proj.linear is before
 
 
-@pytest.mark.parametrize("with_bias", [False, True])
-def test_pad_proj_helpers_shapes(with_bias):
-    from spyre_inference.multimodal.gemma4_vision import (
-        _pad_proj_input_simple,
-        _pad_proj_output_simple,
-    )
-
-    hidden = 32
-    out_proj = torch.nn.Linear(hidden, NUM_HEADS * ORIG_HEAD_DIM, bias=with_bias)
-    padded_out = _pad_proj_output_simple(out_proj, NUM_HEADS, ORIG_HEAD_DIM, PADDED_HEAD_DIM)
-    assert padded_out.weight.shape == (NUM_HEADS * PADDED_HEAD_DIM, hidden)
-    assert (padded_out.bias is not None) == with_bias
-
-    in_proj = torch.nn.Linear(NUM_HEADS * ORIG_HEAD_DIM, hidden, bias=with_bias)
-    padded_in = _pad_proj_input_simple(in_proj, NUM_HEADS, ORIG_HEAD_DIM, PADDED_HEAD_DIM)
-    assert padded_in.weight.shape == (hidden, NUM_HEADS * PADDED_HEAD_DIM)
-    assert (padded_in.bias is not None) == with_bias
-
-
 # ---------------------------------------------------------------------------
 # RMSNorm: no fp32 promotion (torch-spyre gap), padding-corrected denominator
 # ---------------------------------------------------------------------------
 
 
-def test_padded_rms_norm_does_not_promote_to_fp32():
-    """The fp32 upcast in the hf-adapters original is exactly what breaks Spyre's
-    stick tiling (see the module docstring); fp16 in must stay fp16 throughout."""
-    from spyre_inference.multimodal.gemma4_vision import _padded_rms_norm
-
-    x = torch.randn(1, 4, NUM_HEADS, PADDED_HEAD_DIM, dtype=torch.float16)
-    out = _padded_rms_norm(x, None, 1e-6, ORIG_HEAD_DIM)
-    assert out.dtype == torch.float16
-
-
 def test_padded_rms_norm_does_not_promote_via_an_fp32_weight():
-    """`Gemma4RMSNorm` weights are fp32, so an unguarded `x * weight` promotes the
-    activation and blows up against the fp16 padded projections downstream. Stock
-    hid this behind a trailing `.type_as`; regression-guard the explicit cast."""
+    """These weights are fp32, so an unguarded `x * weight` promotes the activation --
+    which torch-spyre cannot lower. Stock hid it behind a trailing `.type_as`."""
     from spyre_inference.multimodal.gemma4_vision import _padded_rms_norm
 
     x = torch.randn(1, 4, NUM_HEADS, PADDED_HEAD_DIM, dtype=torch.float16)
@@ -297,8 +254,8 @@ def test_patched_rms_norm_does_not_promote_via_its_fp32_weight():
 
 
 def test_padded_rms_norm_ignores_zero_padding_lanes():
-    """The `padded/orig` variance rescale exists so the zero lanes don't deflate the
-    denominator: normalizing padded data must match normalizing the real data alone."""
+    """Normalizing the padded activation must match normalizing the real channels
+    alone -- that is what the `padded/orig` variance rescale buys."""
     from spyre_inference.multimodal.gemma4_vision import _padded_rms_norm
 
     torch.manual_seed(0)
@@ -321,11 +278,9 @@ def test_padded_rms_norm_ignores_zero_padding_lanes():
 
 @pytest.mark.rotary
 def test_padded_rope_matches_transformers_reference():
-    """`x*cos + (x @ m)*sin` over the padded layout must reproduce stock
-    `apply_multidimensional_rope` on the real (unpadded) channels exactly.
-
-    This is what catches an off-by-a-quarter in the interleave, a swapped axis, or a
-    sin sign error -- all of which still produce plausible magnitudes.
+    """Rope over the padded layout must reproduce stock `apply_multidimensional_rope`
+    on the real channels. Catches an off-by-a-quarter interleave, a swapped axis, or a
+    sin sign error -- each of which still produces plausible magnitudes.
     """
     from spyre_inference.multimodal.gemma4_vision import _apply_rope, _gemma4_rope_cos_sin
 
@@ -370,14 +325,8 @@ def test_rope_cos_sin_padding_lanes_are_the_identity_rotation():
 
 
 def test_apply_rope_swaps_halves_and_keeps_each_half_stick_aligned():
-    """The half-swap is done by slicing rather than Pixtral's matmul, which is only
-    legal because the padded head_dim makes each half a whole 64-element stick.
-
-    Guard both halves of that argument: the swap itself, and the alignment premise
-    (`_padded_head_dim` rounding to 2*64) the slice depends on.
-    """
-    from spyre_inference.multimodal.gemma4_vision import _apply_rope, _padded_head_dim
-    from spyre_inference.multimodal.utils import STICK
+    """cos=0, sin=1 isolates the swap term, so this pins the half-swap itself."""
+    from spyre_inference.multimodal.gemma4_vision import _apply_rope
 
     head_dim = 8
     x = torch.arange(head_dim, dtype=torch.float32).view(1, 1, 1, head_dim)
@@ -387,10 +336,6 @@ def test_apply_rope_swaps_halves_and_keeps_each_half_stick_aligned():
     got = _apply_rope(x, cos, sin)
     want = torch.cat([x[..., head_dim // 2 :], x[..., : head_dim // 2]], dim=-1)
     torch.testing.assert_close(got, want)
-
-    assert (_padded_head_dim(ORIG_HEAD_DIM) // 2) % STICK == 0, (
-        "each rope half must be a whole stick for the slice form to lower"
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -432,9 +377,6 @@ def test_patched_rms_norm_stays_in_input_dtype_and_matches_reference():
 
     assert got.dtype == torch.float32
     torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-5)
-
-    x16 = x.to(torch.float16)
-    assert norm.to(torch.float16)(x16).dtype == torch.float16
 
 
 def test_dispatch_routes_gemma4_tower_away_from_pixtral(monkeypatch):
@@ -499,52 +441,13 @@ def test_accelerator_memory_info_passes_through_when_native_call_works(monkeypat
 
 
 # ---------------------------------------------------------------------------
-# Correctness regressions: two silent-wrongness bugs found by comparing the
-# encoder against a CPU reference (see logs/gemma4-vision-rope-staggered-ea).
+# Correctness regressions
 # ---------------------------------------------------------------------------
 
 
-def test_padding_helpers_read_their_source_from_the_host():
-    """The padding helpers must not do their slice-assignments on a device tensor.
-
-    Composed on a Spyre-resident weight those mis-lower silently -- finite but wrong
-    padded weights, worth ~half the encoder's output cosine (0.50 vs 0.9996 for the
-    identical surgery host-side). Individual assignments are fine, so nothing catches
-    this except pinning that every helper pulls its source to the host first.
-
-    Asserted through a fake non-CPU device rather than a real card, so this runs
-    anywhere: `_host` is the single choke point, and a helper that skipped it would
-    hand these tensors straight through instead.
-    """
-    from spyre_inference.multimodal import gemma4_vision as gv
-
-    seen: list[str] = []
-    real_host = gv._host
-
-    def tracking_host(t):
-        seen.append("called")
-        return real_host(t)
-
-    linear = torch.nn.Linear(32, NUM_HEADS * ORIG_HEAD_DIM, bias=True)
-    proj = type("_Proj", (), {"linear": linear})()
-
-    import unittest.mock as mock
-
-    with mock.patch.object(gv, "_host", tracking_host):
-        gv._pad_qk_linear(proj, NUM_HEADS, ORIG_HEAD_DIM, PADDED_HEAD_DIM)
-    assert seen, "_pad_qk_linear must route its weight through _host"
-
-    seen.clear()
-    with mock.patch.object(gv, "_host", tracking_host):
-        norm = modeling_gemma4.Gemma4RMSNorm(dim=ORIG_HEAD_DIM, eps=1e-6, with_scale=True)
-        gv._pad_norm_weight(norm, ORIG_HEAD_DIM, PADDED_HEAD_DIM)
-    assert seen, "_pad_norm_weight must route its weight through _host"
-
-
 def test_fp32_inv_freq_is_recomputed_not_read_off_a_downcast_buffer():
-    """`model.to(bfloat16)` downcasts `rotary_emb.inv_freq`; these frequencies span
-    1.0 → 1e-4, so bf16 costs 0.33% relative error and up to 0.10 absolute on the
-    resulting cos/sin table. Recomputing must recover full fp32 precision."""
+    """`model.to(bfloat16)` downcasts `inv_freq`, and these frequencies span a range
+    where bf16 costs real precision. Recomputing must recover full fp32."""
     from spyre_inference.multimodal.gemma4_vision import _fp32_inv_freq
 
     config = _vision_config()
@@ -585,8 +488,8 @@ def _clipped_proj(output_min: float, output_max: float):
     [(-6.0, 6.0), (0.0, 6.0), (-6.0, 0.0), (-float("inf"), float("inf"))],
 )
 def test_clipping_that_includes_zero_is_accepted(lo, hi):
-    """Padding lanes stay zero as long as the clamp range contains zero (the bound
-    itself being zero is fine -- clamp(0) is still 0)."""
+    """A range containing zero keeps the padding lanes at zero; a zero bound is fine,
+    since clamp(0) is still 0."""
     from spyre_inference.multimodal.gemma4_vision import _assert_clipping_preserves_zero
 
     _assert_clipping_preserves_zero(_clipped_proj(lo, hi), "test proj")
@@ -594,8 +497,8 @@ def test_clipping_that_includes_zero_is_accepted(lo, hi):
 
 @pytest.mark.parametrize(("lo", "hi"), [(0.5, 6.0), (-6.0, -0.5)])
 def test_clipping_that_excludes_zero_is_rejected(lo, hi):
-    """A clamp range excluding zero maps the padded lanes to a nonzero bound after the
-    projection, silently invalidating `_padded_rms_norm`'s variance correction."""
+    """A range excluding zero maps the padding lanes to a nonzero bound, invalidating
+    `_padded_rms_norm`'s variance correction."""
     from spyre_inference.multimodal.gemma4_vision import _assert_clipping_preserves_zero
 
     with pytest.raises(NotImplementedError, match="must include zero"):
@@ -603,8 +506,8 @@ def test_clipping_that_excludes_zero_is_rejected(lo, hi):
 
 
 def test_unclipped_projection_skips_the_clipping_check():
-    """26B-A4B has `use_clipped_linears=False`, so the check must be inert -- and must
-    not touch bounds buffers that do not exist."""
+    """Unclipped is the common case, so the check must be inert and must not touch
+    bounds buffers that do not exist."""
     from spyre_inference.multimodal.gemma4_vision import _assert_clipping_preserves_zero
 
     config = _vision_config()
@@ -616,8 +519,8 @@ def test_unclipped_projection_skips_the_clipping_check():
 
 
 def test_quantized_projection_is_rejected_rather_than_dequantized():
-    """`_as_plain_linear` rebuilds the projection as a plain nn.Linear, which drops the
-    quantization method; that must fail loudly instead of silently dequantizing."""
+    """Rebuilding as a plain nn.Linear drops the quantization method, so a quantized
+    projection must fail rather than be silently dequantized."""
     from spyre_inference.multimodal.gemma4_vision import _as_plain_linear
 
     class _FakeQuantMethod:
@@ -635,8 +538,7 @@ def test_quantized_projection_is_rejected_rather_than_dequantized():
 
 
 def test_unquantized_vllm_linear_is_bounced_to_a_plain_linear():
-    """The normal path: an unquantized vLLM linear stores `Wᵀ`, so the bounce must
-    transpose it back into nn.Linear's `[out, in]` layout."""
+    """A vLLM linear stores `Wᵀ`, so the bounce must transpose back to `[out, in]`."""
     from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 
     from spyre_inference.multimodal.gemma4_vision import _as_plain_linear

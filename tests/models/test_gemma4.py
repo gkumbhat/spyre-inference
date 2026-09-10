@@ -66,11 +66,9 @@ def test_force_text_backbone_applies_for_pure_text_checkpoint(monkeypatch, model
 
 
 def test_force_text_backbone_skips_for_vlm_checkpoint_with_vision_config(monkeypatch):
-    """A real multimodal Gemma4Config (populated vision_config) must not be forced
-    onto the text-only backbone — that would strip vision entirely — but still needs
-    the heterogeneous head-dim repair (transformers>=5.16), since
-    Gemma4ForConditionalGeneration re-triggers a bare head_dim read on the nested
-    text_config."""
+    """A vision checkpoint must keep its architectures -- forcing the text backbone
+    would strip the tower -- but still needs the head-dim repair, since
+    Gemma4ForConditionalGeneration re-triggers the bare head_dim read."""
     hf_config = SimpleNamespace(
         model_type="gemma4",
         vision_config=SimpleNamespace(model_type="gemma4_vision"),
@@ -85,8 +83,8 @@ def test_force_text_backbone_skips_for_vlm_checkpoint_with_vision_config(monkeyp
 
 
 def test_audio_only_checkpoint_is_rejected(monkeypatch):
-    """Audio is unsupported, and falling through to the text backbone would silently
-    drop the tower -- a model that looks fine but ignores its audio inputs."""
+    """Falling through to the text backbone would silently drop the tower, leaving a
+    model that looks fine but ignores its audio inputs."""
     hf_config = SimpleNamespace(
         model_type="gemma4",
         vision_config=None,
@@ -99,8 +97,8 @@ def test_audio_only_checkpoint_is_rejected(monkeypatch):
 
 
 def test_vision_plus_audio_checkpoint_is_allowed_for_its_vision_path(monkeypatch):
-    """A checkpoint with both towers still works for image and text; only the audio
-    input is unsupported, so it warns rather than refusing to load."""
+    """Both towers present: the vision path still works, so this warns rather than
+    refusing to load."""
     hf_config = SimpleNamespace(
         model_type="gemma4",
         vision_config=SimpleNamespace(model_type="gemma4_vision"),
@@ -149,16 +147,16 @@ def test_force_text_backbone_ignores_unrelated_model_type(monkeypatch):
     ],
 )
 def test_is_multimodal_gemma4_requires_a_vision_tower(hf_config, expected):
-    """Gemma-4 overflows fp16's range, but the bf16 switch this gates is scoped to the
-    vision checkpoints -- widening it would change every existing Gemma deployment."""
+    """The bf16 switch this gates is scoped to vision checkpoints; widening it would
+    change the dtype of every existing Gemma deployment."""
     from spyre_inference.models.gemma4 import is_multimodal_gemma4
 
     assert is_multimodal_gemma4(hf_config) is expected
 
 
 def test_platform_selects_bfloat16_for_a_multimodal_gemma4_config():
-    """The platform's dtype default runs after vLLM has already resolved
-    ``model_config.dtype``, so it has to decide from the model config."""
+    """The hook runs after vLLM resolved ``model_config.dtype``, so it decides from the
+    model config rather than the user's flag."""
     import torch
 
     from spyre_inference.platform import TorchSpyrePlatform
@@ -178,14 +176,9 @@ def test_platform_selects_bfloat16_for_a_multimodal_gemma4_config():
 
 
 def test_platform_keeps_bfloat16_for_the_nested_text_config():
-    """The regression that motivated the sticky marker.
-
-    A multimodal model builds its decoder via ``init_vllm_registered_model`` ->
-    ``VllmConfig.with_hf_config``, which re-runs this hook with the bare
-    ``gemma4_text`` half (no ``vision_config``). Deciding afresh there downgrades the
-    text decoder to fp16 while its weights stay bf16; ``head_dtype`` then disagrees
-    with the hidden states and the lm-head silently takes upstream's ``F.linear``
-    fallback, which reads a ``weight`` the Spyre path deliberately leaves on CPU.
+    """``with_hf_config`` re-runs this hook with the bare text half, which has no
+    ``vision_config``. Deciding afresh there would downgrade the decoder to fp16 while
+    its weights stay bf16 -- a mismatch that silently diverts the lm-head.
     """
     import torch
 
@@ -224,13 +217,10 @@ def test_attention_backend_accepts_both_supported_dtypes():
 
 
 def test_multimodal_gemma4_delegates_its_text_half_through_the_model_registry():
-    """Why ``Gemma4ForConditionalGeneration`` needs no ``_ADAPTED_ARCHS`` entry.
-
-    It builds its text half with ``init_vllm_registered_model(architectures=
-    ["Gemma4ForCausalLM"])``, which resolves through ``ModelRegistry`` and therefore
-    already lands on ``SpyreGemma4ForCausalLM`` (PLE aliased scalars + the Spyre MoE
-    expert recipe). If upstream ever constructs the text model directly instead,
-    those adaptations vanish silently -- hence this tripwire rather than a comment.
+    """Why ``Gemma4ForConditionalGeneration`` needs no ``_ADAPTED_ARCHS`` entry: it
+    resolves its text half through ``ModelRegistry``, so it already lands on
+    ``SpyreGemma4ForCausalLM``. If upstream ever built that model directly, the PLE and
+    MoE adaptations would vanish silently -- hence a tripwire rather than a comment.
     """
     import inspect
 
