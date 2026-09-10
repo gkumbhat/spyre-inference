@@ -24,6 +24,7 @@ The patches are `getattr`-guarded, so a transformers rename would silently no-op
 
 import pytest
 import torch
+from spyre_testing_plugin.pytest_plugin import spyre_available
 
 modeling_gemma4 = pytest.importorskip("transformers.models.gemma4.modeling_gemma4")
 configuration_gemma4 = pytest.importorskip("transformers.models.gemma4.configuration_gemma4")
@@ -557,3 +558,67 @@ def test_unquantized_vllm_linear_is_bounced_to_a_plain_linear():
     assert isinstance(plain, torch.nn.Linear)
     assert plain.weight.shape == (32, 8)  # [out, in]
     torch.testing.assert_close(plain.weight, src.weight.t().contiguous())
+
+
+# ---------------------------------------------------------------------------
+# On-card: the padding must not be computed on device-resident weights
+# ---------------------------------------------------------------------------
+
+
+def test_padding_on_device_weights_matches_padding_on_host():
+    """Padding a layer already on Spyre must give the same weights as padding it on the
+    host and moving afterwards.
+
+    This is the regression `_host` exists for: composed on device-resident weights the
+    helpers' strided slice-assignments mis-lower, producing finite but wrong padded
+    weights and costing most of the encoder's accuracy. Individual assignments are
+    fine, so only the composite is affected and nothing raises -- and vLLM moves the
+    model before our patches run, so the bad ordering is the one that happens in
+    production.
+    """
+    if not spyre_available():
+        pytest.skip("Spyre device not available")
+
+    import copy
+
+    from spyre_inference.multimodal import gemma4_vision as gv
+
+    # Real 26B-A4B vision proportions: head_dim 72 -> 128, intermediate 4304 -> 4352.
+    config = configuration_gemma4.Gemma4VisionConfig(
+        hidden_size=NUM_HEADS * 72,
+        intermediate_size=4304,
+        num_attention_heads=NUM_HEADS,
+        num_key_value_heads=NUM_HEADS,
+        head_dim=72,
+        num_hidden_layers=1,
+        use_clipped_linears=False,
+    )
+    orig_hd = config.head_dim
+    padded_hd = gv._padded_head_dim(orig_hd)
+    padded_inter = 4352
+
+    torch.manual_seed(0)
+    layer = modeling_gemma4.Gemma4VisionEncoderLayer(config=config, layer_idx=0)
+    layer = layer.to(torch.bfloat16).eval()
+
+    # Reference: pad on the host, then move.
+    on_host = copy.deepcopy(layer)
+    gv._prepare_attention(on_host.self_attn, NUM_HEADS, orig_hd, padded_hd)
+    gv._pad_mlp(on_host, config.intermediate_size, padded_inter)
+    on_host = on_host.to(torch.device("spyre"))
+
+    # Production ordering: move first, then pad.
+    on_device = copy.deepcopy(layer).to(torch.device("spyre"))
+    gv._prepare_attention(on_device.self_attn, NUM_HEADS, orig_hd, padded_hd)
+    gv._pad_mlp(on_device, config.intermediate_size, padded_inter)
+
+    checked = 0
+    for name, want in on_host.named_parameters():
+        got = dict(on_device.named_parameters())[name]
+        torch.testing.assert_close(
+            got.detach().to("cpu").float(),
+            want.detach().to("cpu").float(),
+            msg=lambda m, name=name: f"{name} differs when padded on device:\n{m}",
+        )
+        checked += 1
+    assert checked, "no parameters compared -- the layer walk found nothing"
