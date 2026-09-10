@@ -4,14 +4,15 @@ Where each part of the Gemma 4 multimodal (`Gemma4ForConditionalGeneration`) ima
 path runs — **host vs Spyre**, **dtype**, and **eager vs compiled** — as implemented
 by `spyre_inference/multimodal/gemma4_vision.py`.
 
-!!! warning "Status: executes end-to-end, not yet numerically correct"
-    The pipeline below runs to completion and produces fluent text, but the encoder's
-    device output currently diverges from a CPU reference (**cosine ≈ 0.25**, finite
-    values), so generations are effectively blind to the image. The same code is
-    numerically exact on CPU in fp32 (cosine 1.000000) and fine on CPU in bf16
-    (0.999680), which localises the divergence to the device lowering rather than to
-    this placement or to precision. Treat this document as a map of the *implemented*
-    placement, not of a validated-correct one.
+!!! note "Status"
+    The pipeline below runs end-to-end, and the encoder matches a stock CPU fp32
+    reference to **cosine 0.9959** (2 layers, real 26B-A4B vision config) after two
+    correctness fixes described under [What the comparison
+    caught](#what-the-comparison-caught): host-side weight padding and an fp32 rope
+    frequency recompute. End-to-end on a real ChartQA image it now describes the chart
+    and its title accurately (before those fixes it hallucinated unrelated content),
+    so the vision path is functionally correct; a full-length generation confirming an
+    exact benchmark answer has not been run yet.
 
 ## dtype
 
@@ -107,6 +108,81 @@ introduced another (`coarse_tile: hint_id … appears in both group 0 and group 
 the eager path is what is implemented here. If the remaining numerical divergence
 turns out to be a per-kernel tiling disagreement, revisiting this is the natural next
 lever.
+
+## Comparison with the hf-adapters reference
+
+Compared against `hf_adapters/hf_gemma4_vision.py` and the Gemma 4 VLM section of
+ARCHITECTURE.md on `torch-spyre/hf-adapters#495`.
+
+### Matches
+
+The host/Spyre boundary agrees on every point the reference states: dense encoder
+blocks on Spyre; integer XY position lookup, spatial pooling, and the text-space
+`embed_vision` projector on host; the 2520→2560 right-pad so the score matmul has no
+ragged final stick; padded key columns masked once; fp32 output standardization on
+host with the pooler. The numeric adaptations agree too — head_dim 64/72 → 128, the
+Q/K channel and norm-weight rearrangement that lets one rotation serve both rope axes,
+padded Q/K/V RMSNorm preserving the native-width denominator, the explicit attention
+scale of 1.0, and the 4304→4352 MLP padding. E2B's clipping bounds are preserved for
+free here, since we call the stock `Gemma4ClippableLinear` module rather than
+reimplementing it.
+
+### Where we do *less* on the host (keep)
+
+| | Reference | Here |
+|---|---|---|
+| Patch projection `input_proj` | **host** (`pixel_values.to("cpu")` before `patch_embedder`) | **Spyre** |
+
+Only the integer position gather needs the host; the projection itself is a plain
+GEMM. Worth keeping.
+
+### Where we still do *more* on the host than necessary
+
+1. **The attention mask is O(L²) here and O(L) in the reference.** `_build_attention_mask`
+   there returns `[B, 1, 1, padded_len]` and lets SDPA broadcast it over queries — about
+   5 KB. We reuse Pixtral's `_padded_attn_mask`, which materialises `[B, 1, L, L]`:
+   at L=2560 in bf16 that is **~13 MB assembled on host and uploaded per image**, to
+   carry information that is one bit per key. This is the clearest remaining win —
+   it costs host time, H2D bandwidth, and device memory. It needs a `padded_sdpa`
+   variant (or a Gemma-4-local SDPA) that accepts a key-only mask; the shared helper
+   currently reshapes the mask to `[seq, seq]`.
+2. **Padded rows get a real rotation rather than the identity.** The reference appends
+   identity rope matrices for the pad region; we clamp `position_ids == -1` to 0, so
+   pad rows are rotated as if at position 0. Harmless today (those keys are masked and
+   those query rows are cropped), but it is extra work and a latent trap if the mask
+   ever regresses.
+
+### Differences that are *not* host/device, but matter
+
+3. **RMSNorm reduction precision.** The reference's `_padded_rms_norm` computes in fp32
+   and casts back; ours reduces natively in bf16, because a full-width fp32 round trip
+   on device leaves a tiling state the next eager op cannot broadcast against. Note
+   ARCHITECTURE.md describes a middle ground we have not tried: promote only the
+   mean/variance **reduction** to fp32 while keeping the affine multiply in bf16 (the
+   `[…, 1]` variance is tiny, so it may not trip the layout problem the full-width
+   tensor did). That is the first lever if more encoder accuracy is needed.
+4. **Compiled blocks vs eager ops.** The reference compiles each block as a
+   parameter-explicit executor shared across structurally identical layers — a large
+   cold-start win, and it gives each graph one consistent layout. We run eager, so
+   torch-spyre compiles each op separately and adjacent kernels can disagree about
+   tiling. Revisiting this is the other lever for the residual accuracy gap.
+5. **The reference `.clone()`s each block's output** before feeding the next layer,
+   which breaks layout aliasing between layers. We do not; worth trying if per-layer
+   error accumulation shows up.
+
+### What the comparison caught
+
+The reference does all of its weight surgery in `prepare_for_spyre(model)` **before the
+model is ever moved to the device**. We cannot copy that structure, because vLLM moves
+the model before our patches run — and doing the same padding on device-resident
+weights turned out to produce silently wrong weights: encoder cosine **0.50** versus
+**0.9996** for the identical surgery done host-side. Individual slice-assignments are
+fine on device, so only the composite is affected and nothing raised. Reading the
+reference's ordering is what prompted checking it.
+
+Fixing that, plus recomputing the rope frequencies in fp32 (`model.to(bfloat16)` had
+downcast `rotary_emb.inv_freq`, worth up to 0.10 absolute on the cos/sin table), moved
+the whole encoder from cosine **0.252 → 0.9959** against the stock CPU reference.
 
 ## Constraints asserted loudly
 

@@ -50,6 +50,22 @@ BLOCK_SIZE = 64
 # ---------------------------------------------------------------------------
 
 
+def _host(t: torch.Tensor) -> torch.Tensor:
+    """Detach a weight onto the host before reshaping/padding it.
+
+    Every helper below rebuilds a weight out of strided slice-assignments. Composed
+    on a Spyre-resident tensor those mis-lower silently -- the padded weights come
+    back finite but wrong, which costs roughly half the encoder's output cosine
+    (0.50 vs 0.9996 for the identical surgery done host-side, see
+    logs/gemma4-vision-rope-staggered-ea). Individual assignments are fine, so this
+    only shows up in the composite; hf-adapters#495 sidesteps it by running its
+    `prepare_for_spyre` pass before the model is moved at all. We cannot do that
+    (vLLM moves the model before our patches run), so each helper pulls its source
+    to the host and the caller moves the finished weight back.
+    """
+    return convert(t.detach(), device="cpu")
+
+
 def _as_plain_linear(layer: nn.Module) -> nn.Linear:
     """Bounce a vLLM linear layer into a plain `nn.Linear`.
 
@@ -66,19 +82,30 @@ def _as_plain_linear(layer: nn.Module) -> nn.Linear:
     """
     if isinstance(layer, nn.Linear):
         return layer
-    weight_t = layer.weight.detach()  # [in, out] once vLLM's Spyre OOT method has run
+    weight_t = _host(layer.weight)  # [in, out] once vLLM's Spyre OOT method has run
     in_features, out_features = weight_t.shape
     plain = nn.Linear(in_features, out_features, bias=layer.bias is not None)
     plain.weight = nn.Parameter(weight_t.t().contiguous(), requires_grad=False)
     if layer.bias is not None:
-        plain.bias = nn.Parameter(layer.bias.detach().clone(), requires_grad=False)
+        plain.bias = nn.Parameter(_host(layer.bias).clone(), requires_grad=False)
     return plain
+
+
+def _host_linear(proj: nn.Linear) -> nn.Linear:
+    """A host-side stand-in for `proj`, so the padders' slice-assignments are host math."""
+    if proj.weight.device.type == "cpu":
+        return proj
+    shim = nn.Linear(proj.in_features, proj.out_features, bias=proj.bias is not None)
+    shim.weight = nn.Parameter(_host(proj.weight), requires_grad=False)
+    if proj.bias is not None:
+        shim.bias = nn.Parameter(_host(proj.bias), requires_grad=False)
+    return shim
 
 
 def _pad_qk_linear(proj, num_heads: int, orig_head_dim: int, padded_head_dim: int) -> nn.Linear:
     """Pad and reorder two-axis RoPE channels into one matrix-RoPE layout."""
     linear = proj.linear
-    weight = linear.weight.detach().view(num_heads, orig_head_dim, -1)
+    weight = _host(linear.weight).view(num_heads, orig_head_dim, -1)
     new_weight = torch.zeros(num_heads, padded_head_dim, weight.shape[-1], dtype=weight.dtype)
     quarter = orig_head_dim // 4
     padded_half = padded_head_dim // 2
@@ -89,7 +116,7 @@ def _pad_qk_linear(proj, num_heads: int, orig_head_dim: int, padded_head_dim: in
     padded = nn.Linear(linear.in_features, num_heads * padded_head_dim, bias=linear.bias is not None)
     padded.weight = nn.Parameter(new_weight.reshape(num_heads * padded_head_dim, -1), requires_grad=False)
     if linear.bias is not None:
-        bias = linear.bias.detach().view(num_heads, orig_head_dim)
+        bias = _host(linear.bias).view(num_heads, orig_head_dim)
         new_bias = torch.zeros(num_heads, padded_head_dim, dtype=bias.dtype)
         new_bias[:, :quarter] = bias[:, :quarter]
         new_bias[:, quarter : 2 * quarter] = bias[:, 2 * quarter : 3 * quarter]
@@ -101,6 +128,7 @@ def _pad_qk_linear(proj, num_heads: int, orig_head_dim: int, padded_head_dim: in
 
 def _pad_proj_output_simple(proj: nn.Linear, n_heads: int, orig_head_dim: int, padded_head_dim: int) -> nn.Linear:
     """End-pad each head of a [n_heads*head_dim, hidden] output projection (V)."""
+    proj = _host_linear(proj)
     w = proj.weight
     hidden = w.shape[1]
     new_w = torch.zeros(n_heads * padded_head_dim, hidden, dtype=w.dtype)
@@ -120,6 +148,7 @@ def _pad_proj_output_simple(proj: nn.Linear, n_heads: int, orig_head_dim: int, p
 
 def _pad_proj_input_simple(proj: nn.Linear, n_heads: int, orig_head_dim: int, padded_head_dim: int) -> nn.Linear:
     """End-pad each head along the input dim of an O-style projection."""
+    proj = _host_linear(proj)
     w = proj.weight
     hidden = w.shape[0]
     new_w = torch.zeros(hidden, n_heads * padded_head_dim, dtype=w.dtype)
@@ -134,7 +163,7 @@ def _pad_proj_input_simple(proj: nn.Linear, n_heads: int, orig_head_dim: int, pa
 
 
 def _pad_norm_weight(norm, orig_head_dim: int, padded_head_dim: int) -> nn.Parameter:
-    weight = norm.weight.detach()
+    weight = _host(norm.weight)
     padded = torch.ones(padded_head_dim, dtype=weight.dtype)
     quarter = orig_head_dim // 4
     padded_half = padded_head_dim // 2
@@ -210,6 +239,28 @@ def _gemma4_rope_cos_sin(
     cos_full = torch.cat([cos_half, cos_half], dim=-1).unsqueeze(2)  # [bsz, seq, 1, D]
     sin_full = torch.cat([sin_half_neg, sin_half_pos], dim=-1).unsqueeze(2)
     return cos_full.to(dtype), sin_full.to(dtype)
+
+
+def _fp32_inv_freq(rotary_emb, config) -> torch.Tensor:
+    """Rope frequencies in fp32, recomputed rather than read off the module buffer.
+
+    `model.to(bfloat16)` downcasts `rotary_emb.inv_freq`, and these frequencies span
+    1.0 down to ~1e-4 where bf16's ~3 significant digits cost 0.33% relative error --
+    which becomes up to 0.10 absolute on the resulting cos/sin table, since the angle
+    is `position * inv_freq` and positions reach into the tens. Stock HF keeps the
+    whole rope computation in fp32 (explicit `.float()` plus an autocast-disabled
+    block) for exactly this reason, so recompute instead of upcasting what is already
+    rounded.
+    """
+    params = getattr(config, "rope_parameters", None) or {}
+    rope_type = params.get("rope_type", "default")
+    if rope_type == "default":
+        inv_freq, _ = type(rotary_emb).compute_default_rope_parameters(config)
+    else:
+        from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+
+        inv_freq, _ = ROPE_INIT_FUNCTIONS[rope_type](config, None)
+    return inv_freq.float()
 
 
 def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
@@ -394,7 +445,7 @@ def patch_vision_encoder() -> None:
         dtype = inputs_embeds.dtype
 
         cos, sin = _gemma4_rope_cos_sin(
-            self.rotary_emb.inv_freq, pixel_position_ids, padded_head_dim, dtype
+            _fp32_inv_freq(self.rotary_emb, config), pixel_position_ids, padded_head_dim, dtype
         )
         cos = convert(cos, device=device)
         sin = convert(sin, device=device)

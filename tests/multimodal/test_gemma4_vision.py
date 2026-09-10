@@ -499,3 +499,65 @@ def test_accelerator_memory_info_passes_through_when_native_call_works(monkeypat
     gemma4_vision.patch_accelerator_memory_info()
 
     assert torch.accelerator.get_memory_info() == (123, 456)
+
+
+# ---------------------------------------------------------------------------
+# Correctness regressions: two silent-wrongness bugs found by comparing the
+# encoder against a CPU reference (see logs/gemma4-vision-rope-staggered-ea).
+# ---------------------------------------------------------------------------
+
+
+def test_padding_helpers_read_their_source_from_the_host():
+    """The padding helpers must not do their slice-assignments on a device tensor.
+
+    Composed on a Spyre-resident weight those mis-lower silently -- finite but wrong
+    padded weights, worth ~half the encoder's output cosine (0.50 vs 0.9996 for the
+    identical surgery host-side). Individual assignments are fine, so nothing catches
+    this except pinning that every helper pulls its source to the host first.
+
+    Asserted through a fake non-CPU device rather than a real card, so this runs
+    anywhere: `_host` is the single choke point, and a helper that skipped it would
+    hand these tensors straight through instead.
+    """
+    from spyre_inference.multimodal import gemma4_vision as gv
+
+    seen: list[str] = []
+    real_host = gv._host
+
+    def tracking_host(t):
+        seen.append("called")
+        return real_host(t)
+
+    linear = torch.nn.Linear(32, NUM_HEADS * ORIG_HEAD_DIM, bias=True)
+    proj = type("_Proj", (), {"linear": linear})()
+
+    import unittest.mock as mock
+
+    with mock.patch.object(gv, "_host", tracking_host):
+        gv._pad_qk_linear(proj, NUM_HEADS, ORIG_HEAD_DIM, PADDED_HEAD_DIM)
+    assert seen, "_pad_qk_linear must route its weight through _host"
+
+    seen.clear()
+    with mock.patch.object(gv, "_host", tracking_host):
+        norm = modeling_gemma4.Gemma4RMSNorm(dim=ORIG_HEAD_DIM, eps=1e-6, with_scale=True)
+        gv._pad_norm_weight(norm, ORIG_HEAD_DIM, PADDED_HEAD_DIM)
+    assert seen, "_pad_norm_weight must route its weight through _host"
+
+
+def test_fp32_inv_freq_is_recomputed_not_read_off_a_downcast_buffer():
+    """`model.to(bfloat16)` downcasts `rotary_emb.inv_freq`; these frequencies span
+    1.0 → 1e-4, so bf16 costs 0.33% relative error and up to 0.10 absolute on the
+    resulting cos/sin table. Recomputing must recover full fp32 precision."""
+    from spyre_inference.multimodal.gemma4_vision import _fp32_inv_freq
+
+    config = _vision_config()
+    rope = modeling_gemma4.Gemma4VisionRotaryEmbedding(config)
+    exact = rope.inv_freq.float().clone()
+
+    # Simulate the bf16 cast the real model applies to the whole tower.
+    rope.inv_freq = rope.inv_freq.to(torch.bfloat16)
+    assert not torch.allclose(rope.inv_freq.float(), exact), "premise: bf16 loses bits"
+
+    recovered = _fp32_inv_freq(rope, config)
+    assert recovered.dtype == torch.float32
+    torch.testing.assert_close(recovered, exact, rtol=1e-6, atol=1e-9)
