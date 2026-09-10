@@ -308,31 +308,29 @@ class TorchSpyrePlatform(CpuPlatform):
 
     @classmethod
     def _default_dtype(cls, vllm_config: VllmConfig) -> torch.dtype:
-        """float16 for Spyre, except checkpoints that overflow it.
+        """float16, except multimodal gemma-4, which overflows it to NaN logits.
 
-        Runs after vLLM has already resolved ``model_config.dtype``, so an explicit
-        ``--dtype`` is indistinguishable from ``auto`` by then; the decision has to
-        come from the model config instead of the user's flag.
+        Scoped to the vision checkpoints on purpose: text-only gemma-4 is validated in
+        fp16 here, and widening this would change the dtype of existing deployments.
+
+        Runs after vLLM resolved ``model_config.dtype``, so an explicit ``--dtype`` is
+        indistinguishable from ``auto``; the decision comes from the config instead.
 
         The choice is recorded on the ``ModelConfig`` because this hook runs again for
-        the *nested* text config a multimodal model builds its decoder from
-        (``VllmConfig.with_hf_config``, via ``init_vllm_registered_model``). That
-        nested ``hf_config`` is the bare ``gemma4_text`` half with no ``vision_config``,
-        so re-deciding from scratch would downgrade the text decoder back to fp16 while
-        its weights and activations stayed bf16 -- which silently disagrees with
-        ``head_dtype`` and pushes the lm-head onto an unintended fallback path.
-        ``with_hf_config`` deep-copies the ``ModelConfig``, so the marker rides along.
+        the nested text config a multimodal model builds its decoder from
+        (``VllmConfig.with_hf_config``). That nested config has no ``vision_config``, so
+        re-deciding would downgrade the decoder to fp16 while its weights stayed bf16 --
+        which disagrees with ``head_dtype`` and silently diverts the lm-head onto a
+        fallback path. ``with_hf_config`` deep-copies the config, so the marker rides along.
         """
-        from spyre_inference.models.gemma4 import requires_bfloat16
+        from spyre_inference.models.gemma4 import is_multimodal_gemma4
 
         model_config = vllm_config.model_config
         hf_config = getattr(model_config, "hf_config", None)
         already_chosen = getattr(model_config, "_spyre_requires_bfloat16", False)
-        if already_chosen or (hf_config is not None and requires_bfloat16(hf_config)):
+        if already_chosen or (hf_config is not None and is_multimodal_gemma4(hf_config)):
             if not already_chosen:
-                logger.info(
-                    "Selecting torch.bfloat16: this checkpoint overflows float16's range."
-                )
+                logger.info("Selecting torch.bfloat16: this checkpoint overflows float16.")
             model_config._spyre_requires_bfloat16 = True
             return torch.bfloat16
         return torch.float16

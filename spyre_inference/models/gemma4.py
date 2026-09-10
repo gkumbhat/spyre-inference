@@ -103,29 +103,10 @@ _GEMMA4_TEXT_MODEL_TYPES = {"gemma4", "gemma4_text"}
 
 
 def is_multimodal_gemma4(hf_config: Any) -> bool:
-    """True for a gemma-4 config carrying a real vision (or audio) tower."""
+    """True for a gemma-4 config carrying a vision tower. Audio is out of scope."""
     if getattr(hf_config, "model_type", None) not in _GEMMA4_TEXT_MODEL_TYPES:
         return False
-    return (
-        getattr(hf_config, "vision_config", None) is not None
-        or getattr(hf_config, "audio_config", None) is not None
-    )
-
-
-def requires_bfloat16(hf_config: Any) -> bool:
-    """Whether this checkpoint must run in bf16 rather than the platform's fp16.
-
-    Gemma-4 overflows its residual stream in fp16 -- ``inf`` propagating to NaN
-    logits end-to-end -- so the multimodal checkpoints run in bf16, which is also
-    their checkpoint dtype (hf-adapters#495's ARCHITECTURE.md records the same
-    finding for the rest of the Gemma family).
-
-    Deliberately narrower than "any Gemma": the text-only gemma-4 path is already
-    validated in fp16 here, and widening this would silently change the dtype of
-    every existing Gemma deployment. The vision path is new, so it carries no such
-    expectation.
-    """
-    return is_multimodal_gemma4(hf_config)
+    return getattr(hf_config, "vision_config", None) is not None
 
 
 def force_text_backbone(engine_args: EngineArgs) -> None:
@@ -137,9 +118,9 @@ def force_text_backbone(engine_args: EngineArgs) -> None:
     attributes vLLM needs are consumed into ``per_layer_config``. The override restores the
     <=5.14 view before ``ModelConfig`` is built; skipped when the user set ``hf_overrides``.
 
-    A real multimodal checkpoint (populated ``vision_config``/``audio_config``) gets the
-    same head-dim repair but keeps its real ``architectures`` (``Gemma4ForConditionalGeneration``)
-    -- forcing ``Gemma4ForCausalLM`` there would strip vision/audio entirely.
+    A vision checkpoint gets the same head-dim repair but keeps its real
+    ``architectures``; forcing ``Gemma4ForCausalLM`` there would strip the tower. An
+    audio-only checkpoint is rejected rather than silently reduced to text.
     """
     if engine_args.hf_overrides:
         return
@@ -161,17 +142,26 @@ def force_text_backbone(engine_args: EngineArgs) -> None:
         return
     if getattr(hf_config, "model_type", None) not in _GEMMA4_TEXT_MODEL_TYPES:
         return
-    # A full multimodal Gemma4Config (vision and/or audio tower) reports the same
-    # model_type ("gemma4") as a plain text checkpoint under transformers>=5.16 — the
-    # heterogeneous-config issue this override works around is unrelated to
-    # multimodality, so don't strip vision/audio off a real VLM checkpoint by forcing
-    # it onto the text-only backbone; just repair the head-dim access it also needs.
-    if getattr(hf_config, "vision_config", None) is not None or (
-        getattr(hf_config, "audio_config", None) is not None
-    ):
+    has_audio = getattr(hf_config, "audio_config", None) is not None
+    # A multimodal Gemma4Config reports the same model_type as a text checkpoint, and
+    # the head-dim repair below is unrelated to multimodality -- so repair it but keep
+    # the real architectures, or the vision tower is stripped off.
+    if is_multimodal_gemma4(hf_config):
+        if has_audio:
+            logger.warning(
+                "gemma-4: this checkpoint has an audio tower, which is not supported on "
+                "Spyre; image and text inputs work, audio input will fail."
+            )
         engine_args.hf_overrides = _gemma4_multimodal_head_dim_override
-        logger.info("gemma-4: repairing heterogeneous head-dim config access for a multimodal checkpoint.")
+        logger.info("gemma-4: repairing head-dim config access for a multimodal checkpoint.")
         return
+    if has_audio:
+        # Falling through would force the text-only backbone and silently drop the
+        # tower, leaving a model that looks fine but ignores its audio inputs.
+        raise NotImplementedError(
+            "gemma-4 audio is not supported on Spyre, and this checkpoint has an audio "
+            "tower but no vision tower. Use a text-only or vision checkpoint."
+        )
     engine_args.hf_overrides = _gemma4_text_backbone_override
     logger.info("gemma-4: loading text-only backbone Gemma4ForCausalLM.")
 

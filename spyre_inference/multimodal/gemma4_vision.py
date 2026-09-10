@@ -12,17 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Gemma 4 full-vision-tower workarounds for Spyre.
+"""Gemma 4 vision-tower workarounds for Spyre.
 
-``Gemma4Model.vision_tower`` is ``transformers.models.gemma4.modeling_gemma4.
-Gemma4VisionModel``, loaded via plain ``AutoModel.from_config`` -- outside vLLM's
-layer registries, same category as Pixtral (``multimodal/pixtral.py``). Every fix
-here is a guarded, idempotent monkeypatch; ``apply()`` is the only entry point.
+vLLM loads the tower with plain ``AutoModel.from_config``, so it is stock
+transformers code outside vLLM's layer registries -- same category as
+``multimodal/pixtral.py``. Every fix is a guarded, idempotent monkeypatch and
+``apply()`` is the only entry point. The tensor math follows hf-adapters#495.
 """
 
 from __future__ import annotations
-
-import math
 
 import torch
 import torch.nn as nn
@@ -30,38 +28,20 @@ import torch.nn.functional as F
 from vllm.logger import init_logger
 
 from spyre_inference.custom_ops.utils import convert
-from spyre_inference.multimodal.pixtral import padded_sdpa
+from spyre_inference.multimodal.utils import STICK, align_up, padded_sdpa
 
 logger = init_logger(__name__)
 
-# Spyre stick size at fp16 (128 bytes / 2 bytes per element); head_dim must pad to a
-# multiple of this, and the two-axis RoPE quarter-interleave (below) additionally
-# needs 2*BLOCK_SIZE so each axis's half lands on a whole stick.
-BLOCK_SIZE = 64
-
-
-# ---------------------------------------------------------------------------
-# Ported (verbatim tensor math, adapted to operate on the real transformers
-# Gemma4VisionModel tree rather than a separate compiled executor) from the
-# hardware-validated reference at torch-spyre/hf-adapters#495, branch
-# gemma4_vlm_ple_moe, hf_adapters/hf_gemma4_vision.py + hf_adapters/hf_common.py.
-# Validated against the real transformers RoPE reference and on real Spyre
-# hardware by scripts/probe_gemma4_vision_rope.py and probe_gemma4_vision_attn.py.
-# ---------------------------------------------------------------------------
-
 
 def _host(t: torch.Tensor) -> torch.Tensor:
-    """Detach a weight onto the host before reshaping/padding it.
+    """Detach a weight onto the host before reshaping or padding it.
 
-    Every helper below rebuilds a weight out of strided slice-assignments. Composed
-    on a Spyre-resident tensor those mis-lower silently -- the padded weights come
-    back finite but wrong, which costs roughly half the encoder's output cosine
-    (0.50 vs 0.9996 for the identical surgery done host-side, see
-    logs/gemma4-vision-rope-staggered-ea). Individual assignments are fine, so this
-    only shows up in the composite; hf-adapters#495 sidesteps it by running its
-    `prepare_for_spyre` pass before the model is moved at all. We cannot do that
-    (vLLM moves the model before our patches run), so each helper pulls its source
-    to the host and the caller moves the finished weight back.
+    The padding helpers rebuild weights out of strided slice-assignments, and composed
+    on a Spyre-resident tensor those mis-lower silently -- finite but wrong weights,
+    costing most of the encoder's accuracy. Individual assignments are fine, so only
+    the composite is affected and nothing raises. vLLM moves the model before our
+    patches run, so each helper pulls its source here and the caller moves the
+    finished weight back.
     """
     return convert(t.detach(), device="cpu")
 
@@ -69,22 +49,13 @@ def _host(t: torch.Tensor) -> torch.Tensor:
 def _as_plain_linear(layer: nn.Module) -> nn.Linear:
     """Bounce a vLLM linear layer into a plain `nn.Linear`.
 
-    `Gemma4ClippableLinear.linear` is a raw `torch.nn.Linear` in the reference HF
-    model, but `Gemma4ForConditionalGeneration.__init__` runs `recursive_replace_linear`
-    over the whole vision tower, so on Spyre it's actually a `SpyreReplicatedLinear`
-    (`custom_ops/linear.py`) whose `.weight` is stored *transposed* -- `[in, out]`,
-    for the Spyre-fast `x @ Wᵀ` GEMM (`SpyreTransposedWeightMethod.build_weight_t`) --
-    and which exposes `.input_size`/`.output_size`, not `.in_features`/`.out_features`.
-    The padding helpers below assume nn.Linear's standard `[out, in]` layout, so
-    bounce through this first; the result replaces `.linear` outright (this module's
-    patches don't need the Spyre fast-path GEMM to still apply to these four
-    projections specifically -- `F.linear` lowers fine here regardless).
+    vLLM runs `recursive_replace_linear` over the tower, so `Gemma4ClippableLinear.linear`
+    is a `SpyreReplicatedLinear` whose weight is stored transposed (`[in, out]`, for the
+    Spyre-fast `x @ Wᵀ` GEMM). The padding helpers assume nn.Linear's `[out, in]`, and
+    `F.linear` lowers fine for these projections, so bounce rather than special-case.
 
-    Replacing the layer also discards its ``quant_method``, so a quantized tower is
-    rejected rather than silently dequantized. Unreachable today: vLLM only passes a
-    quant config to the towers when both ``vision_config.hidden_size`` and
-    ``intermediate_size`` are multiples of 64, and 26B-A4B's 4304-wide MLP is not --
-    but that is vLLM's condition to change, not ours to depend on.
+    This also discards the layer's `quant_method`, hence the guard: a quantized tower
+    must fail rather than be silently dequantized.
     """
     if isinstance(layer, nn.Linear):
         return layer
@@ -106,31 +77,13 @@ def _as_plain_linear(layer: nn.Module) -> nn.Linear:
     return plain
 
 
-def _host_linear(proj: nn.Linear) -> nn.Linear:
-    """A host-side stand-in for `proj`, so the padders' slice-assignments are host math."""
-    if proj.weight.device.type == "cpu":
-        return proj
-    shim = nn.Linear(proj.in_features, proj.out_features, bias=proj.bias is not None)
-    shim.weight = nn.Parameter(_host(proj.weight), requires_grad=False)
-    if proj.bias is not None:
-        shim.bias = nn.Parameter(_host(proj.bias), requires_grad=False)
-    return shim
-
-
 def _assert_clipping_preserves_zero(proj, name: str) -> None:
     """A clipped projection's output range must contain zero when we pad its heads.
 
-    `Gemma4ClippableLinear` clamps its output to learned `[output_min, output_max]`
-    bounds from the checkpoint. Head-dim padding relies on the padded lanes being
-    exactly zero -- `_padded_rms_norm` rescales the variance by `padded/orig` on that
-    basis, and the zero columns of `o_proj`/`down_proj` ignore them. If the clamp
-    range excluded zero it would map those lanes to a nonzero bound *after* the
-    projection, quietly invalidating both.
-
-    Inert for 26B-A4B (`use_clipped_linears=False`) and satisfied by E2B's bounds,
-    which straddle zero; this exists so a checkpoint that violates it fails loudly
-    instead of returning plausible numbers. Mirrors hf-adapters#495's
-    `_assert_output_clamp_preserves_zero`.
+    Padding relies on the padded lanes being exactly zero: `_padded_rms_norm` rescales
+    the variance on that basis and the zero columns of `o_proj`/`down_proj` ignore
+    them. A clamp range excluding zero would map those lanes to a nonzero bound after
+    the projection, invalidating both while still returning plausible numbers.
     """
     if not getattr(proj, "use_clipped_linears", False):
         return
@@ -170,8 +123,7 @@ def _pad_qk_linear(proj, num_heads: int, orig_head_dim: int, padded_head_dim: in
 
 def _pad_proj_output_simple(proj: nn.Linear, n_heads: int, orig_head_dim: int, padded_head_dim: int) -> nn.Linear:
     """End-pad each head of a [n_heads*head_dim, hidden] output projection (V)."""
-    proj = _host_linear(proj)
-    w = proj.weight
+    w = _host(proj.weight)
     hidden = w.shape[1]
     new_w = torch.zeros(n_heads * padded_head_dim, hidden, dtype=w.dtype)
     for h in range(n_heads):
@@ -180,18 +132,18 @@ def _pad_proj_output_simple(proj: nn.Linear, n_heads: int, orig_head_dim: int, p
     new_proj = nn.Linear(hidden, n_heads * padded_head_dim, bias=proj.bias is not None)
     new_proj.weight = nn.Parameter(new_w, requires_grad=False)
     if proj.bias is not None:
-        new_b = torch.zeros(n_heads * padded_head_dim, dtype=proj.bias.dtype)
+        bias = _host(proj.bias)
+        new_b = torch.zeros(n_heads * padded_head_dim, dtype=bias.dtype)
         for h in range(n_heads):
             s, d = h * orig_head_dim, h * padded_head_dim
-            new_b[d : d + orig_head_dim] = proj.bias[s : s + orig_head_dim]
+            new_b[d : d + orig_head_dim] = bias[s : s + orig_head_dim]
         new_proj.bias = nn.Parameter(new_b, requires_grad=False)
     return new_proj
 
 
 def _pad_proj_input_simple(proj: nn.Linear, n_heads: int, orig_head_dim: int, padded_head_dim: int) -> nn.Linear:
     """End-pad each head along the input dim of an O-style projection."""
-    proj = _host_linear(proj)
-    w = proj.weight
+    w = _host(proj.weight)
     hidden = w.shape[0]
     new_w = torch.zeros(hidden, n_heads * padded_head_dim, dtype=w.dtype)
     for h in range(n_heads):
@@ -200,7 +152,7 @@ def _pad_proj_input_simple(proj: nn.Linear, n_heads: int, orig_head_dim: int, pa
     new_proj = nn.Linear(n_heads * padded_head_dim, hidden, bias=proj.bias is not None)
     new_proj.weight = nn.Parameter(new_w, requires_grad=False)
     if proj.bias is not None:
-        new_proj.bias = nn.Parameter(proj.bias.detach().clone(), requires_grad=False)
+        new_proj.bias = nn.Parameter(_host(proj.bias).clone(), requires_grad=False)
     return new_proj
 
 
@@ -217,28 +169,21 @@ def _pad_norm_weight(norm, orig_head_dim: int, padded_head_dim: int) -> nn.Param
 
 
 def _padded_rms_norm(hidden_states: torch.Tensor, weight, eps: float, orig_head_dim: int) -> torch.Tensor:
-    """RMSNorm whose denominator is scaled back to the *unpadded* head_dim, so the
-    zero-filled padding lanes (which would otherwise deflate the variance) don't
-    change the normalization the real channels get.
+    """RMSNorm with the denominator scaled back to the unpadded head_dim, so the zero
+    padding lanes do not deflate the variance the real channels are normalized by.
 
-    No fp32 promotion, unlike the hf-adapters reference the rest of this is ported
-    from: torch-spyre does not support it (``custom_ops/rms_norm.py``), and an
-    on-device fp16->fp32->fp16 round trip here leaves the result in a stick-tiling
-    state a later eager elementwise op cannot broadcast against ("Multi-arg
-    pointwise with mixed EA ... no staggered operand is broadcastable either").
-    Same trade as ``SpyreRMSNorm``/``SpyreGemmaRMSNorm``: expect small numerical
-    differences from upstream.
+    No fp32 promotion, unlike the hf-adapters reference: torch-spyre does not support
+    it (``custom_ops/rms_norm.py``), and an on-device round trip through fp32 leaves a
+    stick-tiling state a later eager elementwise op cannot broadcast against. Same
+    trade as ``SpyreRMSNorm``: expect small numerical differences from upstream.
     """
     dtype = hidden_states.dtype
     variance = (hidden_states * hidden_states).mean(-1, keepdim=True)
     variance = variance * (hidden_states.shape[-1] / orig_head_dim)
     hidden_states = hidden_states * torch.rsqrt(variance + eps)
     if weight is not None:
-        # `Gemma4RMSNorm` weights are fp32 (transformers builds them at the default
-        # dtype and nothing downcasts them), so multiplying without this cast would
-        # silently promote the whole activation to fp32 -- which is both the
-        # unsupported promotion above and a dtype mismatch against the fp16 padded
-        # projections. Stock hid this behind a trailing `.type_as(hidden_states)`.
+        # These weights are fp32 (transformers builds them at the default dtype), so an
+        # unguarded multiply would promote the activation -- the promotion above.
         hidden_states = hidden_states * weight.to(dtype)
     return hidden_states
 
@@ -249,20 +194,16 @@ def _gemma4_rope_cos_sin(
     padded_head_dim: int,
     dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """`[bsz, seq, 1, padded_head_dim]` cos and signed-sin tensors for
-    `multimodal.pixtral.rope_rotate_matmul`'s `x*cos + (x @ m)*sin` form (the heads
-    dim broadcasts, same as Pixtral's own `[1, patches, 1, head_dim]`), adapted to
-    Gemma 4 vision's two-axis, `rotate_half`-per-axis convention
-    (`transformers.models.gemma4.modeling_gemma4.apply_multidimensional_rope`) and
-    the head-dim padding/channel packing `_pad_qk_linear` above already applies:
-    padded layout is `[X_quarter, Y_quarter, zeros | X_quarter, Y_quarter, zeros]`
-    (two half-width blocks), so a single first-half/second-half swap (`m`,
-    `kind="half"`) plays the role of `rotate_half` for *both* axes at once, and each
-    axis's angle is duplicated into both blocks with the sign flip `rotate_half`
-    needs baked into `sin` rather than into `m`.
+    """`[bsz, seq, 1, padded_head_dim]` cos and signed-sin tables for `_apply_rope`.
 
-    Built on CPU in fp32 and cast on the way out, like Pixtral's own freqs table:
-    the trig is exact there and only the fp16 result reaches the device.
+    Gemma 4 vision rotates its two position axes independently, each with its own
+    `rotate_half` (stock `apply_multidimensional_rope`). `_pad_qk_linear` packs the
+    padded head as `[X, Y, zeros | X, Y, zeros]`, so one first-half/second-half swap
+    serves both axes at once: each axis's angle is duplicated into both blocks, with
+    `rotate_half`'s sign flip baked into `sin`.
+
+    Built on the host in fp32 and cast on the way out, so only the rounded result
+    reaches the device.
     """
     positions = position_ids.to("cpu").clamp(min=0).float()
     angles = positions[..., None] * inv_freq.to("cpu").float()  # [bsz, seq, 2, quarter]
@@ -286,13 +227,10 @@ def _gemma4_rope_cos_sin(
 def _fp32_inv_freq(rotary_emb, config) -> torch.Tensor:
     """Rope frequencies in fp32, recomputed rather than read off the module buffer.
 
-    `model.to(bfloat16)` downcasts `rotary_emb.inv_freq`, and these frequencies span
-    1.0 down to ~1e-4 where bf16's ~3 significant digits cost 0.33% relative error --
-    which becomes up to 0.10 absolute on the resulting cos/sin table, since the angle
-    is `position * inv_freq` and positions reach into the tens. Stock HF keeps the
-    whole rope computation in fp32 (explicit `.float()` plus an autocast-disabled
-    block) for exactly this reason, so recompute instead of upcasting what is already
-    rounded.
+    `model.to(bfloat16)` downcasts `inv_freq`, and these frequencies span 1.0 down to
+    ~1e-4 where bf16 costs real precision -- amplified because the angle is
+    `position * inv_freq`. Upcasting the buffer cannot recover the lost bits, so
+    recompute; stock HF keeps the whole rope computation in fp32 for the same reason.
     """
     params = getattr(config, "rope_parameters", None) or {}
     rope_type = params.get("rope_type", "default")
@@ -306,21 +244,15 @@ def _fp32_inv_freq(rotary_emb, config) -> torch.Tensor:
 
 
 def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    """`x*cos + rotate_half(x)*sin` with the half-swap done by slicing.
+    """`x*cos + rotate_half(x)*sin`, with the half-swap done by slicing.
 
-    Pixtral needs the matmul form (`multimodal/pixtral.py::rope_rotate_matmul`)
-    because its head_dim is 64, so each `rotate_half` half is 32 wide -- narrower
-    than the stick, which torch-spyre cannot lay out. Gemma 4 vision pads head_dim
-    to 128 (rope needs that padding anyway, for the two-axis channel layout), so
-    each half is exactly one 64-element stick and slicing is stick-legal.
+    Slicing is legal here where Pixtral needs a matmul instead: the padded head_dim
+    puts each half on a whole stick, whereas Pixtral's 64-wide heads give 32-wide
+    halves. It is also required, not just simpler -- at this tower's shapes the
+    matmul form's reduction fails to tile after the RMSNorm reduction preceding it.
 
-    Preferring the slice here is not just simplification: at this tower's real
-    shapes the `[N, D] @ [D, D]` rotation reduction fails to tile once it follows
-    the RMSNorm reduction that precedes it in the layer ("buf2 (Reduction): no
-    mechanism to resolve stick incompatibility"), while the slice form lowers.
-
-    `sin` already carries `rotate_half`'s sign flip as `cat([-sin, +sin])` (see
-    `_gemma4_rope_cos_sin`), so the swap here is a plain `cat([x2, x1])`.
+    `sin` already carries `rotate_half`'s sign flip, so the swap is a plain
+    `cat([x2, x1])`.
     """
     half = x.shape[-1] // 2
     swapped = torch.cat([x[..., half:], x[..., :half]], dim=-1)
@@ -328,16 +260,16 @@ def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.
 
 
 def _padded_head_dim(orig_head_dim: int) -> int:
-    return math.ceil(orig_head_dim / (2 * BLOCK_SIZE)) * (2 * BLOCK_SIZE)
+    """Pad to two sticks, not one: rope rotates each half independently, so both
+    halves have to be stick-aligned."""
+    return align_up(orig_head_dim, 2 * STICK)
 
 
 def _pad_mlp(layer, orig_intermediate: int, padded_intermediate: int) -> None:
     """Zero-extend the MLP's intermediate width onto the stick, once per layer.
 
-    26B-A4B's vision tower is 4304 wide, which is not a multiple of 64; E2B's 3072
-    already is, so this is a no-op there. Gate/up gain zero output rows and down
-    gains matching zero input columns, so the padding contributes nothing to the
-    result (`gelu(0) * 0 == 0`, and a zero down-projection column ignores it).
+    A no-op for an already-aligned width. Gate/up gain zero output rows and down
+    matching zero input columns, so the padding cannot change the result.
     """
     if padded_intermediate == orig_intermediate:
         return
@@ -367,14 +299,10 @@ def _prepare_attention(attn, num_heads: int, orig_head_dim: int, padded_head_dim
         raise NotImplementedError(
             "Scaled Gemma 4 vision V normalization is not supported on Spyre."
         )
-    # The padding helpers (ported from hf-adapters, which pads on CPU and moves the
-    # whole model to device afterward in one step) build their scratch tensors with
-    # torch.zeros/ones -- no device= -- so they land on CPU regardless of the source
-    # weight's device. Here the model is already on Spyre, so move every padded
-    # result back explicitly.
     for _name in ("q_proj", "k_proj", "v_proj", "o_proj"):
         _assert_clipping_preserves_zero(getattr(attn, _name), f"vision attention {_name}")
 
+    # The helpers pad on the host (see `_host`), so every result is moved back.
     device = attn.q_norm.weight.device
     attn.q_proj.linear = _as_plain_linear(attn.q_proj.linear)
     attn.k_proj.linear = _as_plain_linear(attn.k_proj.linear)
@@ -459,14 +387,10 @@ def _run_layer(
 def patch_vision_encoder() -> None:
     """Replace `Gemma4VisionEncoder.forward` with a Spyre-safe walk over its layers.
 
-    Three things the stock forward does don't work on Spyre: it builds the mask via
-    `masking_utils.create_bidirectional_mask`, it feeds stock `rotate_half`-style
-    rope (which slices the head into halves -- 36 wide at Gemma 4 vision's native
-    head_dim=72, so not stick-aligned, and 72 is not a 64-multiple to begin with),
-    and its attention has no padding for a patch count coprime with the 64 stick.
-    So: pad head_dim to 128, rotate via Pixtral's stick-aligned matmul form, and run
-    attention through Pixtral's `padded_sdpa`. Both of those are already validated on
-    real Spyre hardware (see scripts/probe_gemma4_vision_*.py).
+    Three things in the stock forward do not lower: the mask built by
+    `create_bidirectional_mask`, rope over a head_dim that is not stick-aligned, and
+    attention over a patch count coprime with the stick. So pad the head dim, rotate
+    with `_apply_rope`, and attend through `padded_sdpa`.
     """
     try:
         from transformers.models.gemma4 import modeling_gemma4
@@ -507,7 +431,7 @@ def patch_vision_encoder() -> None:
         attn_mask = key_valid.unsqueeze(0).expand(seq_len, seq_len)
 
         orig_intermediate = config.intermediate_size
-        padded_intermediate = math.ceil(orig_intermediate / BLOCK_SIZE) * BLOCK_SIZE
+        padded_intermediate = align_up(orig_intermediate)
 
         hidden_states = inputs_embeds
         for layer in self.layers[: config.num_hidden_layers]:
@@ -537,21 +461,12 @@ def patch_vision_encoder() -> None:
 
 
 def patch_rms_norm() -> None:
-    """Give ``Gemma4RMSNorm`` the same treatment ``SpyreGemmaRMSNorm`` gives vLLM's:
-    no fp32 promotion, and ``torch.rsqrt`` instead of ``torch.pow(x, -0.5)``.
+    """Give ``Gemma4RMSNorm`` the treatment ``SpyreGemmaRMSNorm`` gives vLLM's: no fp32
+    promotion, and ``rsqrt`` instead of ``pow(x, -0.5)``, which has no lowering here.
 
-    ``forward`` is what needs patching, not just ``_norm``: stock forward is
-    ``self._norm(hidden_states.float())`` with a ``self.weight.float()`` scale, and
-    both fp32 casts have to go. torch-spyre does not support dtype promotion
-    (``custom_ops/rms_norm.py``), and an on-device fp16->fp32->fp16 round trip also
-    leaves the result in a stick-tiling state a later eager elementwise op cannot
-    broadcast against (see ``_padded_rms_norm``). ``pow`` additionally has no
-    lowering in this fused-kernel context ("Invoked sdsc_fused_pow_0 which contains
-    unimplemented operation pow"), and it is only there for JAX/Torch compiler
-    parity per transformers' own comment -- ``rsqrt`` is exactly equivalent.
-
-    Same trade the sibling Spyre norms already accept: expect small numerical
-    differences from upstream.
+    ``forward`` is the patch point, not ``_norm``: stock casts to fp32 in both, and
+    both casts have to go (see ``_padded_rms_norm``). Expect small numerical
+    differences from upstream, as with the sibling Spyre norms.
     """
     try:
         from transformers.models.gemma4 import modeling_gemma4
@@ -584,18 +499,12 @@ def patch_rms_norm() -> None:
 
 
 def patch_pooler() -> None:
-    """Run ``Gemma4VisionPooler`` on CPU and hand its result back on device.
+    """Run ``Gemma4VisionPooler`` on the host.
 
-    The pooler is integer-geometry work, not arithmetic: a ``masked_fill`` of the
-    padding patches (``aten::masked_fill_.Scalar`` has no Spyre kernel at all), a
-    ``one_hot`` over floor-divided patch coordinates, and a ``max``/``all`` reduction
-    to derive the validity mask. Same doctrine as every other gather-shaped op here
-    (Pixtral's ``PatchMerger``, the patch-embed position lookup), and the same split
-    hf-adapters#495 documents: "integer position lookup, spatial pooling, and the
-    text-space projector stay on CPU".
-
-    It is also cheap to move: the pooler reduces 2520 patches to 280 soft tokens, so
-    only the smaller side crosses back.
+    It is integer geometry, not arithmetic: a ``masked_fill`` (no Spyre kernel), a
+    ``one_hot`` over floor-divided patch coordinates, and a reduction for the validity
+    mask. Same doctrine as the other gather-shaped ops here, and cheap to move since
+    pooling is what shrinks the sequence.
     """
     try:
         from transformers.models.gemma4 import modeling_gemma4
@@ -629,14 +538,9 @@ def patch_pooler() -> None:
 def patch_accelerator_memory_info() -> None:
     """Fall back to host RAM for ``torch.accelerator.get_memory_info()``.
 
-    ``Gemma4ForConditionalGeneration._process_image_input`` calls this to size its
-    memory-safe encoder-chunking budget. Spyre (a CPU-based platform in vLLM's
-    device-config sense) registers no accelerator memory-info hook, so the native
-    call raises ``NotImplementedError`` unconditionally -- not Gemma4-vision-specific,
-    but this is the first path in this codebase to hit it. ``psutil``'s host RAM
-    is the correct substitute here: the dominant transient this budget guards
-    against runs on CPU (this codebase's doctrine for the gather/pooling ops in
-    Gemma4's vision tower), not on-device.
+    ``_process_image_input`` calls this to size its encoder-chunking budget, and Spyre
+    registers no accelerator memory-info hook, so the native call always raises. Host
+    RAM is the right substitute: the transients this budget guards run on the host.
     """
     orig = torch.accelerator.get_memory_info
     if getattr(orig, "_spyre_patched", False):
@@ -660,14 +564,11 @@ def patch_accelerator_memory_info() -> None:
 
 
 def patch_patch_embedder() -> None:
-    """Run ``Gemma4VisionPatchEmbedder``'s position-embedding gather on CPU.
+    """Run ``Gemma4VisionPatchEmbedder``'s position-embedding gather on the host.
 
-    ``F.embedding`` needs its index and weight tensors on the same device.
-    ``pixel_position_ids`` arrives on CPU (``SpyreModelWrapper.embed_multimodal`` only
-    moves floating-point multimodal inputs to Spyre; positions are int64) while
-    ``position_embedding_table`` lives on Spyre with the rest of the model. Same
-    doctrine as every other integer-gather op in this codebase (Pixtral's position
-    lookup, the vision pooler): do the lookup on CPU, move the result.
+    ``F.embedding`` needs index and weight on one device, and ``pixel_position_ids``
+    stays on the host (``embed_multimodal`` only moves float inputs) while the table
+    lives on Spyre. Same doctrine as the other integer gathers here.
     """
     try:
         from transformers.models.gemma4 import modeling_gemma4
@@ -697,20 +598,13 @@ def patch_patch_embedder() -> None:
 
 
 def place_vision_tail_on_cpu(model: torch.nn.Module) -> None:
-    """Keep everything after the encoder host-side: standardize buffers + embed_vision.
+    """Keep the post-pooler tail on the host: standardize buffers and ``embed_vision``.
 
-    ``_process_image_input`` runs `pooled[valid_mask]` (``aten::index.Tensor_out``,
-    which has no Spyre kernel), then the fp32 ``standardize`` affine, then the
-    text-space projection -- all on the pooler's output. Since ``patch_pooler``
-    already returns CPU, these operands have to follow, or each step trips a
-    device mismatch. hf-adapters#495 draws the line in the same place: "integer
-    position lookup, spatial pooling, and the text-space projector stay on CPU".
-
-    The projector is also the cheap end of the tower (1152 -> text hidden over ~280
-    pooled soft tokens, versus 2520 patches through 27 encoder layers), and its
-    output goes straight into the CPU-side image-embedding merge in
-    ``SpyreModelWrapper.embed_input_ids`` -- so this avoids a round trip rather than
-    adding one.
+    ``_process_image_input`` boolean-selects the pooled rows (no Spyre kernel), applies
+    the fp32 standardize affine, then projects to text space -- all on the pooler's
+    output, which ``patch_pooler`` already returns on the host. These operands have to
+    follow or each step trips a device mismatch. It also avoids a round trip: the
+    projection is the cheap end of the tower and its output feeds a host-side merge.
     """
     tower = getattr(model, "vision_tower", None)
     if tower is not None and getattr(tower.config, "standardize", False):

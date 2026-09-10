@@ -376,11 +376,8 @@ def test_apply_rope_swaps_halves_and_keeps_each_half_stick_aligned():
     Guard both halves of that argument: the swap itself, and the alignment premise
     (`_padded_head_dim` rounding to 2*64) the slice depends on.
     """
-    from spyre_inference.multimodal.gemma4_vision import (
-        BLOCK_SIZE,
-        _apply_rope,
-        _padded_head_dim,
-    )
+    from spyre_inference.multimodal.gemma4_vision import _apply_rope, _padded_head_dim
+    from spyre_inference.multimodal.utils import STICK
 
     head_dim = 8
     x = torch.arange(head_dim, dtype=torch.float32).view(1, 1, 1, head_dim)
@@ -391,7 +388,7 @@ def test_apply_rope_swaps_halves_and_keeps_each_half_stick_aligned():
     want = torch.cat([x[..., head_dim // 2 :], x[..., : head_dim // 2]], dim=-1)
     torch.testing.assert_close(got, want)
 
-    assert (_padded_head_dim(ORIG_HEAD_DIM) // 2) % BLOCK_SIZE == 0, (
+    assert (_padded_head_dim(ORIG_HEAD_DIM) // 2) % STICK == 0, (
         "each rope half must be a whole stick for the slice form to lower"
     )
 

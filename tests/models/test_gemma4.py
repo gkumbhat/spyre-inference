@@ -84,10 +84,26 @@ def test_force_text_backbone_skips_for_vlm_checkpoint_with_vision_config(monkeyp
     assert engine_args.hf_overrides is _gemma4_multimodal_head_dim_override
 
 
-def test_force_text_backbone_skips_for_audio_config(monkeypatch):
+def test_audio_only_checkpoint_is_rejected(monkeypatch):
+    """Audio is unsupported, and falling through to the text backbone would silently
+    drop the tower -- a model that looks fine but ignores its audio inputs."""
     hf_config = SimpleNamespace(
         model_type="gemma4",
         vision_config=None,
+        audio_config=SimpleNamespace(model_type="gemma4_audio"),
+    )
+    _patch_get_config(monkeypatch, hf_config)
+
+    with pytest.raises(NotImplementedError, match="audio is not supported"):
+        force_text_backbone(_engine_args())
+
+
+def test_vision_plus_audio_checkpoint_is_allowed_for_its_vision_path(monkeypatch):
+    """A checkpoint with both towers still works for image and text; only the audio
+    input is unsupported, so it warns rather than refusing to load."""
+    hf_config = SimpleNamespace(
+        model_type="gemma4",
+        vision_config=SimpleNamespace(model_type="gemma4_vision"),
         audio_config=SimpleNamespace(model_type="gemma4_audio"),
     )
     _patch_get_config(monkeypatch, hf_config)
@@ -124,19 +140,20 @@ def test_force_text_backbone_ignores_unrelated_model_type(monkeypatch):
     ("hf_config", "expected"),
     [
         (SimpleNamespace(model_type="gemma4", vision_config=object(), audio_config=None), True),
-        (SimpleNamespace(model_type="gemma4", vision_config=None, audio_config=object()), True),
+        # Audio is out of scope, so an audio-only config is not "multimodal" here.
+        (SimpleNamespace(model_type="gemma4", vision_config=None, audio_config=object()), False),
         # Text-only gemma-4 is already validated in fp16 here; don't move it.
         (SimpleNamespace(model_type="gemma4", vision_config=None, audio_config=None), False),
         (SimpleNamespace(model_type="gemma4_text", vision_config=None, audio_config=None), False),
         (SimpleNamespace(model_type="llama", vision_config=None, audio_config=None), False),
     ],
 )
-def test_requires_bfloat16_only_for_multimodal_gemma4(hf_config, expected):
-    """Gemma-4 overflows fp16's range, but the switch is scoped to the vision/audio
-    checkpoints -- widening it would silently change every existing Gemma deployment."""
-    from spyre_inference.models.gemma4 import requires_bfloat16
+def test_is_multimodal_gemma4_requires_a_vision_tower(hf_config, expected):
+    """Gemma-4 overflows fp16's range, but the bf16 switch this gates is scoped to the
+    vision checkpoints -- widening it would change every existing Gemma deployment."""
+    from spyre_inference.models.gemma4 import is_multimodal_gemma4
 
-    assert requires_bfloat16(hf_config) is expected
+    assert is_multimodal_gemma4(hf_config) is expected
 
 
 def test_platform_selects_bfloat16_for_a_multimodal_gemma4_config():
