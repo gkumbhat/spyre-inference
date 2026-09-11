@@ -80,26 +80,32 @@ class TestLadderFallback:
         # bucket, so every distinct prompt length compiled its own graph.
         assert _ladder_encoder_shape(3, 300, MAX_NUM_SEQS, MAX_MODEL_LEN) == (4, 512)
 
-    def test_silent_during_warmup_and_warns_after(self, caplog):
+    def test_silent_during_warmup_and_logs_after(self, caplog):
+        """Logged at info: above 8 sequences this is the ordinary path.
+
+        Only batch buckets 1/2/4/8 are warmed at the 512 token budget, so a
+        larger batch lands here with nothing wrong and no action to take.
+        """
         spyre_attn._warmup_complete = False
-        with caplog.at_level("WARNING"):
+        with caplog.at_level("INFO"):
             _ladder_encoder_shape(64, 8, MAX_NUM_SEQS, MAX_MODEL_LEN)
         assert "ladder shape" not in caplog.text, "warmup's own body runs are not news"
 
         spyre_attn.mark_warmup_complete()
-        with caplog.at_level("WARNING"):
+        with caplog.at_level("INFO"):
             _ladder_encoder_shape(3, 300, MAX_NUM_SEQS, MAX_MODEL_LEN)
         assert "ladder shape (B=4, L=512)" in caplog.text
+        assert not [r for r in caplog.records if r.levelname == "WARNING"]
 
-    def test_warning_dedup_key_is_bounded(self, caplog):
-        """``warning_once`` keys on the args, so they must not carry the request.
+    def test_log_dedup_key_is_bounded(self, caplog):
+        """``info_once`` keys on the args, so they must not carry the request.
 
         ``num_seqs x max_len`` has thousands of combinations; the ladder has
         ``len(batch_buckets) * len(len_buckets)``. Keying on the request would
         make this an unbounded log and an unbounded ``lru_cache``.
         """
         spyre_attn.mark_warmup_complete()
-        with caplog.at_level("WARNING"):
+        with caplog.at_level("INFO"):
             for max_len in range(257, 512):
                 _ladder_encoder_shape(3, max_len, MAX_NUM_SEQS, MAX_MODEL_LEN)
         assert caplog.text.count("ladder shape") <= 1

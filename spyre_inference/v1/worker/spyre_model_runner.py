@@ -491,7 +491,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # FP32 linear heads stay on CPU.
         self._pooling_on_spyre = False
         if self.model_config.runner_type == "pooling":
-            self._pooling_on_spyre = configure_pooling_for_spyre(self.model, self._spyre_device)
+            self._pooling_on_spyre = configure_pooling_for_spyre(
+                self.model, self._spyre_device, self.model_config.max_model_len
+            )
 
         logger.info("Spyre-native layer weights moved to %s", self._spyre_device)
         logger.info("Model loaded for Spyre in %.3fs.", time.time() - t0)

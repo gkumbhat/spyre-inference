@@ -569,10 +569,16 @@ def _ladder_encoder_shape(
     length = next_bucket(max_len, default_encoder_len_buckets(max_model_len))
     # Warmup's own body runs miss too (max_num_seqs seqs of size//B tokens) and
     # compiling those is the point, so only a serving-path miss is news.
+    #
+    # info, not warning: the platform caps pooling max_num_batched_tokens at 512
+    # and pooling_warmup_shapes drops every cell over that budget, so only batch
+    # buckets 1/2/4/8 are warmed at max_num_seqs=64 and any larger batch takes
+    # this path normally. Nothing is wrong and there is no action to take, and
+    # _call_kernel already reports the compile itself.
     if is_warmup_complete():
-        # Args are part of warning_once's dedup key, so they must be the ladder
+        # Args are part of info_once's dedup key, so they must be the ladder
         # cell and not the request: num_seqs x max_len has thousands of values.
-        logger.warning_once(
+        logger.info_once(
             "Encoder attention fell back to ladder shape (B=%d, L=%d): no warmed cell covers "
             "the batch, so this compiles on first use. Warmup drops cells with "
             "B*L > max_num_batched_tokens -- see pooling_warmup_shapes.",
