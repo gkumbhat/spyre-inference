@@ -14,6 +14,7 @@
 
 """Tests for Spyre FP8 linear kernel — aten._scaled_mm path."""
 
+import os
 import warnings
 
 import pytest
@@ -27,6 +28,17 @@ from spyre_inference.custom_ops.fp8_linear_kernel import (
 )
 
 FP8_E4M3FN_MIN = -FP8_E4M3FN_MAX
+
+# Executing the fp8 ``_scaled_mm`` graph on the card raises a PCIe bus master fence
+# (``RAS::PCI::BusFence``, 0xa35e). senlib throws it from its MSI polling thread, so it
+# lands as a bare SIGABRT that takes the interpreter — and with it every test that had
+# not run yet, in whatever files random ordering put after this one. Twenty fences in
+# 24h deconfigure the card, so this stays opt-in until the firmware bug is fixed.
+_SKIP_BUS_FENCE = pytest.mark.skipif(
+    os.environ.get("SPYRE_TEST_FP8_SCALED_MM") != "1",
+    reason="fp8 _scaled_mm on Spyre aborts the process with RAS::PCI::BusFence (0xa35e); "
+    "set SPYRE_TEST_FP8_SCALED_MM=1 to run anyway",
+)
 
 
 def _quantize_weight_fp8(weight_fp16: torch.Tensor):
@@ -204,6 +216,7 @@ class TestSpyreFp8LinearKernel:
         assert actual.device.type == "spyre", actual.device
         return actual
 
+    @_SKIP_BUS_FENCE
     @pytest.mark.parametrize("num_tokens", [1, 4, 128])
     def test_scaled_mm_apply(self, num_tokens):
         """apply_weights runs aten._scaled_mm on Spyre."""
@@ -228,6 +241,7 @@ class TestSpyreFp8LinearKernel:
         assert actual.dtype == torch.float16
         assert actual.shape == (num_tokens, out_features)
 
+    @_SKIP_BUS_FENCE
     @pytest.mark.parametrize("num_tokens", [1, 4, 128])
     def test_scaled_mm_apply_per_channel(self, num_tokens):
         """apply_weights with Granite per-channel weight scales + per-token acts."""
