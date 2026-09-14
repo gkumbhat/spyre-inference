@@ -32,8 +32,7 @@ def apply_multimodal_patches(model: torch.nn.Module, device: torch.device) -> No
     """
     # Both spellings: mistral-format Pixtral names the tower `vision_encoder`, HF-format
     # Mistral3 and Gemma 4 `vision_tower`. Ungated, the patches rewrite vLLM's shared
-    # module. Explicit `is not None` rather than `or`: a tower is an nn.Module, and
-    # container modules are falsy when empty.
+    # module. `is not None` rather than `or`: an empty container module is falsy.
     vision_tower = getattr(model, "vision_tower", None)
     if vision_tower is None:
         vision_tower = getattr(model, "vision_encoder", None)

@@ -83,9 +83,9 @@ def padded_sdpa(
     padding is a correctness requirement rather than a tuning choice. Padded keys are
     masked to `-inf` and padded queries cropped off.
 
-    `scale` defaults to the head dim seen here, which assumes `q`/`k`/`v` arrive
-    unpadded so the padding cannot change it. Pass it explicitly when the head dim is
-    already padded, or when the model uses a fixed scale (Gemma 4 vision: 1.0).
+    `scale` defaults to the head dim seen here, which assumes `q`/`k`/`v` arrive unpadded
+    so the padding cannot change it. Pass it explicitly when the head dim is already
+    padded, or when the model carries its own scale.
     """
     b, _, seq, d = q.shape
     if scale is None:

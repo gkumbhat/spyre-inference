@@ -1187,8 +1187,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
     def _model_dtype(self) -> torch.dtype:
         """The activation dtype the platform settled on (float16, or bfloat16 for
-        checkpoints that overflow it). Resolved to a real ``torch.dtype`` by
-        ``TorchSpyrePlatform.check_and_update_config``."""
+        checkpoints that overflow it)."""
         dtype = self.model_config.dtype
         return dtype if isinstance(dtype, torch.dtype) else torch.float16
 
@@ -1228,8 +1227,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
             num_blocks = kv_cache_tensor.size // spec.page_size_bytes
 
             # Host-allocated then transferred: only .to() takes a device_layout.
-            # The KV cache carries activations, so it follows the model dtype
-            # (float16, or bfloat16 for checkpoints that overflow it).
             kv_dtype = self._model_dtype()
             layout = slot_major_kv_layout(
                 num_blocks * spec.block_size, spec.num_kv_heads, spec.head_size, kv_dtype

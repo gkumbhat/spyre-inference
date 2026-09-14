@@ -569,12 +569,9 @@ def test_padding_on_device_weights_matches_padding_on_host():
     """Padding a layer already on Spyre must give the same weights as padding it on the
     host and moving afterwards.
 
-    This is the regression `_host` exists for: composed on device-resident weights the
-    helpers' strided slice-assignments lower incorrectly, producing finite but wrong
-    padded weights and costing most of the encoder's accuracy. Individual assignments are
-    fine, so only the composite is affected and nothing raises -- and vLLM moves the
-    model before our patches run, so the bad ordering is the one that happens in
-    production.
+    The regression `_host` exists for: composed on device-resident weights, the helpers'
+    strided slice-assignments lower silently wrong. vLLM moves the model before our
+    patches run, so the bad ordering is the one that happens in production.
     """
     if not spyre_available():
         pytest.skip("Spyre device not available")
@@ -690,9 +687,9 @@ def test_pool_weights_rows_sum_to_one_over_each_output_cell():
 
 
 def test_patched_pooler_returns_stock_dtype_and_stays_on_host():
-    """The caller indexes the result with the mask and then runs an fp32 affine, so
-    the patch must preserve stock's fp32 return and host placement even though the
-    pool itself now happens on device in bf16."""
+    """The caller indexes the result with the mask and then runs an fp32 affine, so the
+    patch must preserve stock's fp32 return and host placement even though the pool
+    itself runs on device."""
     from spyre_inference.multimodal import gemma4_vision
 
     pos, padding, hidden_states, length, k = _pool_setup()
@@ -742,11 +739,8 @@ def test_patched_pooler_delegates_when_there_is_nothing_to_pool():
 
 
 def test_pooling_matmul_matches_the_host_average_on_device():
-    """The bf16 device matmul against the fp32 host average.
-
-    Stock computes this matmul in fp32 but rounds the result straight back to the
-    input dtype, so bf16 here concedes only accumulation precision.
-    """
+    """The bf16 device matmul against the fp32 host average. Stock rounds its fp32 result
+    straight back to the input dtype, so bf16 concedes only accumulation precision."""
     if not spyre_available():
         pytest.skip("Spyre device not available")
 

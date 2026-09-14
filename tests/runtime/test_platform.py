@@ -605,8 +605,7 @@ def test_configure_threading_raises_when_undetectable(monkeypatch):
 
 
 def test_default_dtype_selects_bfloat16_for_a_multimodal_gemma4_config():
-    """The hook runs after vLLM resolved ``model_config.dtype``, so it decides from the
-    model config rather than the user's flag."""
+    """bf16 only when the resolved architecture builds a vision tower."""
     from spyre_inference.platform import TorchSpyrePlatform
 
     vision_cfg = SimpleNamespace(model_type="gemma4", vision_config=object(), audio_config=None)

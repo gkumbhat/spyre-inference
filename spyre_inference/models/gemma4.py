@@ -56,12 +56,9 @@ def _gemma4_repair_head_dim_access(config: Any) -> None:
     """Let bare reads (config.head_dim, config.num_key_value_heads) return the
     sliding/global scalar, matching vLLM's sliding-layer path.
 
-    This is the transformers>=5.16 heterogeneous-config repair
-    (``force_text_backbone``'s docstring) applied in place. It's needed whether or
-    not the checkpoint is multimodal: the ambiguous per-layer read lives in
-    ``Gemma4TextConfig`` regardless of whether a sibling ``vision_config``/
-    ``audio_config`` is also present, so a VLM checkpoint's nested ``text_config``
-    needs the exact same fix as a plain text checkpoint's top-level config.
+    The transformers>=5.16 repair described in ``force_text_backbone``, applied in place.
+    The ambiguous read lives in ``Gemma4TextConfig``, so a multimodal checkpoint's nested
+    ``text_config`` needs it just as much as a text-only top-level config.
     """
     text_config = getattr(config, "text_config", config)
     for cfg in {id(config): config, id(text_config): text_config}.values():
@@ -86,11 +83,10 @@ def _gemma4_text_backbone_override(config: Any) -> Any:
 
 
 def _gemma4_multimodal_head_dim_override(config: Any) -> Any:
-    """Repair the same heterogeneous-config head-dim access on a real multimodal
-    Gemma4Config, without touching ``architectures`` -- vision/audio stay intact so
-    vLLM resolves ``Gemma4ForConditionalGeneration`` normally. Needed because that
-    class builds its nested text decoder via ``init_vllm_registered_model(hf_config=
-    config.text_config, ...)``, which re-triggers the same bare ``head_dim`` read.
+    """The same head-dim repair, without touching ``architectures`` so vLLM still resolves
+    ``Gemma4ForConditionalGeneration``. That class builds its nested text decoder via
+    ``init_vllm_registered_model(hf_config=config.text_config, ...)``, which re-triggers
+    the bare ``head_dim`` read.
     """
     _gemma4_repair_head_dim_access(config)
     return config
@@ -143,9 +139,7 @@ def force_text_backbone(engine_args: EngineArgs) -> None:
     if getattr(hf_config, "model_type", None) not in _GEMMA4_TEXT_MODEL_TYPES:
         return
     has_audio = getattr(hf_config, "audio_config", None) is not None
-    # A multimodal Gemma4Config reports the same model_type as a text checkpoint, and
-    # the head-dim repair below is unrelated to multimodality -- so repair it but keep
-    # the real architectures, or the vision tower is stripped off.
+    # A multimodal Gemma4Config reports the same model_type as a text checkpoint.
     if is_multimodal_gemma4(hf_config):
         if has_audio:
             logger.warning(

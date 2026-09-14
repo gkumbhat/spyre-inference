@@ -47,8 +47,9 @@ else:
 
 logger = init_logger(__name__)
 
-# Dtypes torch-spyre can run. Both are 2 bytes wide, so the 64-element stick
-# alignment every constant in this plugin is derived from holds for either.
+# Dtypes torch-spyre can run; bfloat16 only for checkpoints that overflow float16 (see
+# `_default_dtype`). Both are 2 bytes wide, so every stick-alignment constant in this
+# plugin holds for either.
 _SUPPORTED_DTYPES = frozenset({torch.float16, torch.bfloat16})
 
 
@@ -308,21 +309,20 @@ class TorchSpyrePlatform(CpuPlatform):
 
     @classmethod
     def _default_dtype(cls, vllm_config: VllmConfig) -> torch.dtype:
-        """float16, except a gemma-4 run that builds its vision tower, which overflows
-        it to NaN logits.
+        """float16, except a gemma-4 run that builds its vision tower, which overflows it
+        to NaN logits.
 
         Scoped to the vision checkpoints on purpose: text-only gemma-4 is validated in
-        fp16 here, and widening this would change the dtype of existing deployments.
+        fp16 here. Runs after vLLM resolved ``model_config.dtype``, so an explicit
+        ``--dtype`` is indistinguishable from ``auto`` and the decision comes from the
+        config instead.
 
-        Runs after vLLM resolved ``model_config.dtype``, so an explicit ``--dtype`` is
-        indistinguishable from ``auto``; the decision comes from the config instead.
-
-        The choice is recorded on the ``ModelConfig`` because this hook runs again for
-        the nested text config a multimodal model builds its decoder from
-        (``VllmConfig.with_hf_config``). That nested config has no ``vision_config``, so
-        re-deciding would downgrade the decoder to fp16 while its weights stayed bf16 --
-        which disagrees with ``head_dtype`` and silently diverts the lm-head onto a
-        fallback path. ``with_hf_config`` deep-copies the config, so the marker rides along.
+        The choice is recorded on the ``ModelConfig`` because this hook runs again for the
+        nested text config a multimodal model builds its decoder from
+        (``VllmConfig.with_hf_config``, which deep-copies, so the marker rides along).
+        That nested config resolves ``Gemma4ForCausalLM``, so re-deciding would downgrade
+        the decoder to fp16 while its weights stayed bf16 -- disagreeing with
+        ``head_dtype`` and silently diverting the lm-head onto a fallback path.
         """
         from spyre_inference.models.gemma4 import is_multimodal_gemma4
 
@@ -536,9 +536,6 @@ class TorchSpyrePlatform(CpuPlatform):
         # A bare VllmConfig() (no model) reaches this hook too; guard each
         # model_config access like upstream CpuPlatform.
         if vllm_config.model_config is not None:
-            # float16 is the Spyre default; bfloat16 is accepted for checkpoints that
-            # overflow it (see _default_dtype). Both are 2 bytes, so every stick
-            # alignment constant in this plugin is unaffected by the choice.
             if vllm_config.model_config.dtype not in _SUPPORTED_DTYPES:
                 supported = sorted(str(d) for d in _SUPPORTED_DTYPES)
                 raise ValueError(
@@ -573,11 +570,9 @@ class TorchSpyrePlatform(CpuPlatform):
                 f"(got {parallel_config.pipeline_parallel_size})."
             )
 
-        # torch-spyre's all_reduce is float16-only on both paths: eager goes through
-        # SpyreCCLBackend, which rejects bfloat16 outright ("Allreduce only supports
-        # float16 tensors"), and the compiled lowering (`spyre.allreduce_plan`) hands
-        # bfloat16 to spyre-comms as the reduction's compute dtype, where there is no
-        # bfloat16 `add`. Reject here rather than crash minutes into warmup.
+        # torch-spyre's all_reduce is float16-only on both paths: eager SpyreCCLBackend
+        # rejects bfloat16 outright, and the compiled `spyre.allreduce_plan` lowering has
+        # no bfloat16 `add`. Reject here rather than crash minutes into warmup.
         if (
             parallel_config.tensor_parallel_size > 1
             and vllm_config.model_config is not None
