@@ -401,6 +401,31 @@ def test_only_tensor_parallelism_is_accepted(field):
         TorchSpyrePlatform.check_and_update_config(vllm_config)
 
 
+def test_bfloat16_is_rejected_under_tensor_parallelism():
+    """torch-spyre's all_reduce is fp16-only on both the eager (SpyreCCLBackend) and
+    compiled (`spyre.allreduce_plan`) paths, so bf16 + TP>1 must fail at startup rather
+    than minutes into warmup.
+    """
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = _defaults_config(enforce_eager=True, mode=None)
+    vllm_config.model_config.dtype = torch.bfloat16
+    vllm_config.parallel_config.tensor_parallel_size = 2
+
+    with pytest.raises(ValueError, match="tensor_parallel_size > 1 with"):
+        TorchSpyrePlatform.check_and_update_config(vllm_config)
+
+
+def test_bfloat16_is_accepted_at_tp1():
+    """The guard above must not reject the single-card bf16 path."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = _defaults_config(enforce_eager=True, mode=None)
+    vllm_config.model_config.dtype = torch.bfloat16
+
+    TorchSpyrePlatform.check_and_update_config(vllm_config)
+
+
 def test_raise_dynamo_recompile_limits_survives_a_clobber():
     """torch_spyre's autoload lowers cache_size_limit to 1024; re-asserting must win."""
     import torch._dynamo
@@ -587,13 +612,30 @@ def test_default_dtype_selects_bfloat16_for_a_multimodal_gemma4_config():
     vision_cfg = SimpleNamespace(model_type="gemma4", vision_config=object(), audio_config=None)
     text_cfg = SimpleNamespace(model_type="gemma4", vision_config=None, audio_config=None)
 
-    def _config(hf_config):
-        return SimpleNamespace(model_config=SimpleNamespace(hf_config=hf_config))
+    def _config(hf_config, architecture="Gemma4ForConditionalGeneration"):
+        return SimpleNamespace(
+            model_config=SimpleNamespace(hf_config=hf_config, architecture=architecture)
+        )
 
     assert TorchSpyrePlatform._default_dtype(_config(vision_cfg)) is torch.bfloat16
     assert TorchSpyrePlatform._default_dtype(_config(text_cfg)) is torch.float16
     # No hf_config at all (bare VllmConfig) must not crash.
     assert TorchSpyrePlatform._default_dtype(_config(None)) is torch.float16
+
+
+def test_default_dtype_stays_float16_when_the_text_backbone_is_pinned():
+    """``hf_overrides`` pinning ``Gemma4ForCausalLM`` leaves ``vision_config`` on the
+    config, but no tower is built -- so the validated fp16 text path must be kept (it is
+    also the only one that runs under TP>1).
+    """
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vision_cfg = SimpleNamespace(model_type="gemma4", vision_config=object(), audio_config=None)
+    pinned = SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=vision_cfg, architecture="Gemma4ForCausalLM")
+    )
+
+    assert TorchSpyrePlatform._default_dtype(pinned) is torch.float16
 
 
 def test_default_dtype_keeps_bfloat16_for_the_nested_text_config():
@@ -604,7 +646,9 @@ def test_default_dtype_keeps_bfloat16_for_the_nested_text_config():
     from spyre_inference.platform import TorchSpyrePlatform
 
     vision_cfg = SimpleNamespace(model_type="gemma4", vision_config=object(), audio_config=None)
-    model_config = SimpleNamespace(hf_config=vision_cfg)
+    model_config = SimpleNamespace(
+        hf_config=vision_cfg, architecture="Gemma4ForConditionalGeneration"
+    )
     outer = SimpleNamespace(model_config=model_config)
 
     assert TorchSpyrePlatform._default_dtype(outer) is torch.bfloat16
