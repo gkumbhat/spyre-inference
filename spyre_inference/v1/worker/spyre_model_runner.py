@@ -346,14 +346,12 @@ class _SpyreModelWrapper:
         spyre_device: torch.device,
         keep_outputs_on_device: bool = False,
         logits_row_buckets: list[int] | None = None,
-        shape_bucketer: SpyreShapeBucketer | None = None,
     ):
         # Use object.__setattr__ to avoid triggering __setattr__ override
         object.__setattr__(self, "_model", model)
         object.__setattr__(self, "_spyre_device", spyre_device)
         object.__setattr__(self, "_keep_outputs_on_device", keep_outputs_on_device)
         object.__setattr__(self, "_logits_row_buckets", logits_row_buckets or [])
-        object.__setattr__(self, "_shape_bucketer", shape_bucketer)
 
     def __call__(self, *args, **kwargs):
         # Convert integer tensor inputs to Spyre int64. Do not use int32:
@@ -397,85 +395,6 @@ class _SpyreModelWrapper:
         logger.debug("t_token: %.2fms [num tokens %d]", (time.time() - t0) * 1000, num_tokens)
 
         return result
-
-    def embed_multimodal(self, **kwargs):
-        """Move float multimodal inputs (e.g. ``pixel_values``) onto Spyre.
-
-        The runner reaches this through ``__getattr__``, bypassing ``__call__``'s
-        input conversion, so pixel tensors would otherwise arrive on CPU while the
-        vision weights are on Spyre.
-        """
-
-        def _to_spyre_float(t):
-            if isinstance(t, torch.Tensor) and t.is_floating_point():
-                return convert(t, dtype=torch.float16, device=self._spyre_device)
-            return t
-
-        kwargs = tree_map(_to_spyre_float, kwargs)
-        out = self._model.embed_multimodal(**kwargs)
-        return out
-
-    def embed_input_ids(
-        self,
-        input_ids,
-        multimodal_embeddings=None,
-        *,
-        is_multimodal=None,
-    ):
-        """Text-token embedding + multimodal merge, Spyre-aware.
-
-        Like ``embed_multimodal``, this is reached through ``__getattr__`` with
-        ``input_ids`` still on CPU. The text lookup runs on-card either way; when
-        images are present the merge is done on CPU, because upstream scatters image
-        rows with a dim-0 boolean mask that Spyre cannot do.
-        """
-        has_mm = multimodal_embeddings is not None and len(multimodal_embeddings) > 0
-        if has_mm and is_multimodal is None:
-            raise ValueError(
-                "embed_input_ids got multimodal_embeddings without is_multimodal; the "
-                "CPU merge below needs the mask."
-            )
-        # The text lookup skips upstream's `masked_fill(is_multimodal, 0)`, so an
-        # out-of-vocab placeholder id would index the embedding table out of range.
-        if is_multimodal is not None and getattr(self._model, "_has_oov_mm_tokens", False):
-            raise NotImplementedError(
-                "SpyreModelWrapper.embed_input_ids does not support models with "
-                "out-of-vocab multimodal tokens; mask them before the text embedding."
-            )
-
-        # Bucket the token count: this runs on the raw scheduled count, so at TP>1 the
-        # vocab-parallel all_reduce is `num_tokens * hidden` for every distinct prompt
-        # length, and some of those collective schedules fail to build. Pad on CPU and
-        # trim after; padding inside a compiled collective corrupts output.
-        num_tokens = input_ids.shape[0]
-        bucketer = self._shape_bucketer
-        padded_tokens = bucketer.find_bucket(num_tokens) if bucketer is not None else None
-        if padded_tokens is not None and padded_tokens != num_tokens:
-            input_ids = torch.nn.functional.pad(input_ids, (0, padded_tokens - num_tokens))
-        else:
-            padded_tokens = None
-
-        input_ids = convert(input_ids, dtype=torch.int64, device=self._spyre_device)
-        inputs_embeds = self._model.embed_input_ids(input_ids)
-        if padded_tokens is not None:
-            inputs_embeds = select_rows(inputs_embeds, torch.arange(num_tokens))
-
-        if not has_mm:
-            return inputs_embeds
-
-        from vllm.model_executor.models.utils import _merge_multimodal_embeddings
-
-        inputs_embeds = convert(inputs_embeds, device="cpu")
-        mm_embeds_cpu = tree_map(
-            lambda t: convert(t, device="cpu") if isinstance(t, torch.Tensor) else t,
-            multimodal_embeddings,
-        )
-        merged = _merge_multimodal_embeddings(
-            inputs_embeds=inputs_embeds,
-            multimodal_embeddings=mm_embeds_cpu,
-            is_multimodal=is_multimodal.to("cpu"),
-        )
-        return convert(merged, device=self._spyre_device)
 
     def compute_logits(self, hidden_states, *args, **kwargs):
         """Move hidden_states onto Spyre for the lm_head custom op.
@@ -696,7 +615,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 if bucketer is None
                 else logits_row_buckets(bucketer.bucket_sizes, self.max_num_reqs)
             ),
-            shape_bucketer=bucketer,
         )
 
     @staticmethod
