@@ -263,7 +263,7 @@ def test_spyre_fancy_index_tensor(spyre_device):
     reason=(
         "Boolean-mask index_put_ (aten::_index_put_impl_) has no Spyre kernel at "
         "all -- a hard NotImplementedError, not a CPU FallbackWarning. "
-        "spyre_inference.custom_ops.multimodal_merge works around this by "
+        "spyre_inference.custom_ops.multimodal_embeddings works around this by "
         "monkeypatching vllm's _merge_multimodal_embeddings to scatter on CPU and "
         "torch.where the result back in. When this probe passes, revisit that "
         "workaround."

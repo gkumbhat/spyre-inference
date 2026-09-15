@@ -27,7 +27,7 @@ from . import (
     layer_norm,  # noqa: F401
     linear,
     logits_processor,  # noqa: F401
-    multimodal_merge,
+    multimodal_embeddings,
     parallel_lm_head,
     rotary_embedding,
     utils,
@@ -43,5 +43,4 @@ def register_all():
     logger.info("Registering custom ops for spyre_inference")
     register_spyre_fp8_linear_kernel()
     utils.register()
-    vocab_parallel_embedding.register()
-    multimodal_merge.register()
+    multimodal_embeddings.register()
