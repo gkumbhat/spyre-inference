@@ -12,151 +12,88 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Cheap unit tests for the CLIP boundary-LayerNorm patch installer.
+"""Cheap unit tests for the Spyre CLIP embedding model adaptation.
 
-No Spyre hardware: exercises `_patch_boundary_layer_norms`/`_to_spyre_layer_norm`
-against minimal stand-in classes (mirroring CLIPVisionTransformer's shape) rather
-than constructing real vLLM CLIP transformers, and checks `install_spyre_patches`
-wires the exact attribute names/classes it's supposed to.
+No Spyre hardware, no real ``VllmConfig``: ``CLIPEmbeddingModel.__init__`` is
+monkeypatched to build a minimal stand-in with real ``nn.LayerNorm`` instances
+(mirroring ``vision_model``/``text_model``'s shape) so the subclass's own
+``__init__`` runs for real and its boundary-norm swap can be checked directly.
+``tests/models/test_model_registration.py`` covers the ``_ADAPTED_ARCHS``
+registration wiring generically for every architecture, this one included.
 """
 
 from __future__ import annotations
 
 import sys
+import types
 
 import pytest
 import torch
 
-from spyre_inference.models.clip import (
-    _patch_boundary_layer_norms,
-    _to_spyre_layer_norm,
-)
+from spyre_inference.custom_ops.layer_norm import SpyreLayerNorm
+from spyre_inference.models.clip import SpyreCLIPEmbeddingModel, _to_spyre_layer_norm
 
 
-class _SpyreMarkerLayerNorm(torch.nn.LayerNorm):
-    """Stand-in for SpyreLayerNorm: only identity matters for these tests."""
+def _fake_clip_embedding_init(hidden_size: int = 64, with_post_norm: bool = True):
+    """Monkeypatch target for ``CLIPEmbeddingModel.__init__``: skips the real
+    ``VllmConfig``/weight-construction machinery, but sets up
+    ``text_model``/``vision_model`` with real ``nn.LayerNorm`` boundary norms,
+    matching what ``SpyreCLIPEmbeddingModel.__init__`` reads and swaps."""
+
+    def _init(self, *, vllm_config, prefix: str = "") -> None:
+        torch.nn.Module.__init__(self)
+        self.text_model = types.SimpleNamespace(
+            final_layer_norm=torch.nn.LayerNorm(hidden_size)
+        )
+        self.vision_model = types.SimpleNamespace(
+            pre_layrnorm=torch.nn.LayerNorm(hidden_size),
+            post_layernorm=(torch.nn.LayerNorm(hidden_size) if with_post_norm else None),
+        )
+
+    return _init
 
 
-def _fresh_vision_like_cls(with_post_norm: bool = True):
-    """A new class each call, so `_spyre_patched` state never leaks across tests."""
+def _build(monkeypatch, with_post_norm: bool = True) -> SpyreCLIPEmbeddingModel:
+    from vllm.model_executor.models.clip import CLIPEmbeddingModel
 
-    class _FakeVisionTransformer:
-        def __init__(self, hidden_size: int, eps: float = 1e-5):
-            self.pre_layrnorm = torch.nn.LayerNorm(hidden_size, eps=eps)
-            self.post_layernorm = (
-                torch.nn.LayerNorm(hidden_size, eps=eps) if with_post_norm else None
-            )
-            # Untouched attribute: only pre_layrnorm/post_layernorm are boundary norms.
-            self.layer_norm1 = torch.nn.LayerNorm(hidden_size, eps=eps)
-
-    return _FakeVisionTransformer
-
-
-def test_patch_boundary_layer_norms_swaps_matching_attrs():
-    cls = _fresh_vision_like_cls()
-    _patch_boundary_layer_norms(
-        cls, ("pre_layrnorm", "post_layernorm"), _SpyreMarkerLayerNorm
+    monkeypatch.setattr(
+        CLIPEmbeddingModel, "__init__", _fake_clip_embedding_init(with_post_norm=with_post_norm)
     )
+    return SpyreCLIPEmbeddingModel(vllm_config=None)
 
-    instance = cls(hidden_size=64)
 
-    assert isinstance(instance.pre_layrnorm, _SpyreMarkerLayerNorm)
-    assert isinstance(instance.post_layernorm, _SpyreMarkerLayerNorm)
-    # Not in attr_names: left as a plain nn.LayerNorm.
-    assert not isinstance(instance.layer_norm1, _SpyreMarkerLayerNorm)
-    assert cls._spyre_patched is True
+def test_boundary_norms_swapped_to_spyre_layer_norm(monkeypatch):
+    model = _build(monkeypatch)
+
+    assert isinstance(model.text_model.final_layer_norm, SpyreLayerNorm)
+    assert isinstance(model.vision_model.pre_layrnorm, SpyreLayerNorm)
+    assert isinstance(model.vision_model.post_layernorm, SpyreLayerNorm)
+
+
+def test_missing_post_layernorm_is_left_none(monkeypatch):
+    """CLIPVisionTransformer.post_layernorm can be None (require_post_norm=False);
+    the swap must not crash on a missing/None attribute."""
+    model = _build(monkeypatch, with_post_norm=False)
+
+    assert isinstance(model.vision_model.pre_layrnorm, SpyreLayerNorm)
+    assert model.vision_model.post_layernorm is None
 
 
 @pytest.mark.parametrize("elementwise_affine", [True, False])
 @pytest.mark.parametrize("bias", [True, False])
-def test_patch_boundary_layer_norms_preserves_shape_eps_affine_bias(
-    elementwise_affine, bias
-):
+def test_to_spyre_layer_norm_preserves_shape_eps_affine_bias(elementwise_affine, bias):
     hidden_size, eps = 128, 1e-6
     original = torch.nn.LayerNorm(
         hidden_size, eps=eps, elementwise_affine=elementwise_affine, bias=bias
     )
 
-    patched = _to_spyre_layer_norm(original, _SpyreMarkerLayerNorm)
+    patched = _to_spyre_layer_norm(original, SpyreLayerNorm)
 
-    assert isinstance(patched, _SpyreMarkerLayerNorm)
+    assert isinstance(patched, SpyreLayerNorm)
     assert patched.normalized_shape == original.normalized_shape
     assert patched.eps == original.eps
     assert patched.elementwise_affine == original.elementwise_affine
     assert (patched.bias is not None) == (original.bias is not None)
-
-
-def test_patch_boundary_layer_norms_skips_missing_attr():
-    """CLIPVisionTransformer.post_layernorm can be None (require_post_norm=False);
-    the patch must not crash trying to swap a missing/None attribute."""
-    cls = _fresh_vision_like_cls(with_post_norm=False)
-    _patch_boundary_layer_norms(
-        cls, ("pre_layrnorm", "post_layernorm"), _SpyreMarkerLayerNorm
-    )
-
-    instance = cls(hidden_size=64)
-
-    assert isinstance(instance.pre_layrnorm, _SpyreMarkerLayerNorm)
-    assert instance.post_layernorm is None
-
-
-def test_patch_boundary_layer_norms_idempotent():
-    cls = _fresh_vision_like_cls()
-    _patch_boundary_layer_norms(cls, ("pre_layrnorm",), _SpyreMarkerLayerNorm)
-    wrapped_init = cls.__init__
-
-    _patch_boundary_layer_norms(cls, ("pre_layrnorm",), _SpyreMarkerLayerNorm)
-
-    # Second call is a no-op: same __init__, no double-wrapping.
-    assert cls.__init__ is wrapped_init
-
-    instance = cls(hidden_size=32)
-    assert isinstance(instance.pre_layrnorm, _SpyreMarkerLayerNorm)
-
-
-def test_install_spyre_patches_wires_expected_attrs(monkeypatch):
-    """Verify the exact (class, attr_names, spyre_cls) wiring without mutating
-    the real vLLM CLIP classes -- a rename of pre_layrnorm/post_layernorm/
-    final_layer_norm upstream should fail this test."""
-    from spyre_inference.models import clip as clip_patches
-
-    calls = []
-    monkeypatch.setattr(
-        clip_patches,
-        "_patch_boundary_layer_norms",
-        lambda cls, attr_names, spyre_cls: calls.append((cls, attr_names, spyre_cls)),
-    )
-
-    clip_patches.install_spyre_patches()
-
-    from vllm.model_executor.models import clip
-
-    from spyre_inference.custom_ops.layer_norm import SpyreLayerNorm
-
-    assert (
-        clip.CLIPVisionTransformer,
-        ("pre_layrnorm", "post_layernorm"),
-        SpyreLayerNorm,
-    ) in calls
-    assert (clip.CLIPTextTransformer, ("final_layer_norm",), SpyreLayerNorm) in calls
-
-
-def test_install_pooling_model_patches_includes_clip(monkeypatch):
-    """models/__init__.py's install_pooling_model_patches must call
-    clip.install_spyre_patches() alongside bert/roberta."""
-    import spyre_inference.models.bert as bert_mod
-    import spyre_inference.models.clip as clip_mod
-    import spyre_inference.models.roberta as roberta_mod
-    from spyre_inference import models
-
-    called = set()
-    monkeypatch.setattr(bert_mod, "install_spyre_patches", lambda: called.add("bert"))
-    monkeypatch.setattr(roberta_mod, "install_spyre_patches", lambda: called.add("roberta"))
-    monkeypatch.setattr(clip_mod, "install_spyre_patches", lambda: called.add("clip"))
-
-    models.install_pooling_model_patches()
-
-    assert called == {"bert", "roberta", "clip"}
 
 
 if __name__ == "__main__":
