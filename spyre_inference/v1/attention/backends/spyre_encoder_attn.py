@@ -17,19 +17,46 @@
 Selected by ``TorchSpyrePlatform.get_attn_backend_cls`` for ENCODER/ENCODER_ONLY
 layers. Operates on direct Q/K/V tensors rather than the paged KV-cache path.
 
-Blocked flash, modelled on the decoder's ``page_attn_kernel``. The packed
-``[T, H, D]`` list goes to the kernel whole and request boundaries ride in int32
-row-index tables, so a Spyre card never has to do offset arithmetic on *shapes* --
-offsets are data. The kernel gathers its own sequence in-graph, walks KV in
-``ENCODER_BLOCK_SIZE``-token blocks carrying a running softmax max/sum, and
-scatters the result back with ``index_copy_``. Nothing is sliced or copied on the
-host, no ``(B, L)`` grid or ``[B, 1, L, L]`` mask is materialised, and the only
-compile axis is the block count.
+Dense per-sequence attention over the packed ``[T, H, D]`` list; request
+boundaries ride in int32 row-index tables, so a Spyre card never has to do
+offset arithmetic on *shapes* -- offsets are data. Unlike the decoder, there is
+no paged KV cache forcing a block-wise walk: a sequence's whole K/V already
+fits in one gathered tensor, so attention is one dense
+``QKᵀ -> +mask -> softmax -> ·V``, not an online-softmax loop. That was blocked
+on torch-spyre#4526 (Inductor rewrites a visible ``matmul + mask + softmax +
+matmul`` into an ``F.sdpa``-equivalent that drops the additive mask on Spyre);
+now that it is fixed, the dense form is safe.
 
-Two torch-spyre bugs shape the design. A compiled region reads its arguments from
-offset 0 and ignores ``storage_offset`` (#3770), so a sequence cannot be sliced
-outside the graph; and a gather that selects its whole source faults the card
-(#4033), so an identity gather is skipped instead.
+Three separate compiled functions, not one, and that split is the point:
+
+- ``_encoder_gather_kernel`` pulls one sequence's rows out of the step's full
+  body buffer via ``index_select``.
+- ``_encoder_dense_attn_kernel`` does the actual attention math on those
+  already-gathered, sequence-sized tensors.
+- ``_encoder_store_kernel`` scatters the result back with ``index_copy_``.
+
+Under ``dynamic=False`` Dynamo guards on every argument's exact shape, not just
+the ones the graph's output depends on. A step's Q/K/V/output buffers are sized
+to the *body token bucket* (``buffer_rows``), which varies across the whole
+compile_sizes ladder -- if the gather, the attention math, and the store were
+one function, that function's cache key would include ``buffer_rows``, and the
+expensive attention graph would recompile once per ``(buffer_rows, extent)``
+pair instead of once per ``extent``. Splitting gather/store (cheap: a handful
+of ops, keyed on ``buffer_rows``) away from the attention math (the expensive
+part, keyed only on the sequence's own padded length) collapses that back down
+to one compile per distinct length -- mirroring the decoder's own
+``_index_copy_kernel``, which is "compiled alone" for the same reason.
+
+Two torch-spyre bugs still shape the design. A compiled region reads its
+arguments from offset 0 and ignores ``storage_offset`` (#3770), so a sequence
+is gathered with ``index_select`` rather than sliced. A gather that selects its
+whole source faults the card (#4033), so an identity gather is skipped instead.
+
+No fallbacks: torch-spyre has no on-device ``arange``, ``full``, or similar
+construction op, so every index and mask tensor this file touches -- row
+tables, mask tiles -- is built on the host and ``convert``'d once, then cached
+and reused across sequences, layers, and steps. None of that construction
+happens inside a compiled kernel.
 """
 
 from __future__ import annotations
@@ -49,7 +76,8 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     _call_kernel,
 )
 
-# KV block width, in tokens. One Spyre stick of fp16.
+# KV block width, in tokens. One Spyre stick of fp16. The only remaining use
+# is as the length-bucket granularity -- there is no per-block loop anymore.
 ENCODER_BLOCK_SIZE = 64
 
 
@@ -57,9 +85,9 @@ def _blocks_for(length: int) -> int:
     """Block count covering ``length`` tokens, rounded up to a power of two.
 
     Encoder self-attention has ``q_len == kv_len``, so this single number fixes
-    both the query extent (``num_blocks * ENCODER_BLOCK_SIZE``) and the KV loop
-    trip count -- the kernel cache has one shape axis, not two. Rounding to a
-    power of two keeps that axis to a handful of buckets, matching the ladder
+    the sequence's padded extent (``num_blocks * ENCODER_BLOCK_SIZE``) -- the
+    attention kernel's cache has one shape axis, not two. Rounding to a power
+    of two keeps that axis to a handful of buckets, matching the ladder
     ``_powers_of_two_up_to`` gives decoder attention.
     """
     blocks = max(1, (length + ENCODER_BLOCK_SIZE - 1) // ENCODER_BLOCK_SIZE)
@@ -69,185 +97,110 @@ def _blocks_for(length: int) -> int:
     return bucket
 
 
-def _encoder_block_kernel(
-    query,
-    key,
-    value,
-    row_index,
-    mask_tiles,
+def _encoder_gather_kernel(query, key, value, row_index):
+    """Pull one sequence's rows out of the step's full body buffer.
+
+    Compiled alone, cheap, and keyed on ``(query.shape[0], row_index.shape[0])``
+    -- i.e. on ``buffer_rows`` (the body bucket) as well as the sequence's own
+    padded length. That is fine: this graph is a handful of ops, so recompiling
+    it once per ``(buffer_rows, extent)`` pair costs little. Keeping it
+    separate from the attention math is what keeps *that* graph off this
+    dependency -- see the module docstring.
+    """
+    q_rows = query.index_select(0, row_index)
+    k_rows = key.index_select(0, row_index)
+    v_rows = value.index_select(0, row_index)
+    return q_rows, k_rows, v_rows
+
+
+_encoder_gather_compiled = torch.compile(_encoder_gather_kernel, dynamic=False)
+
+
+def _encoder_dense_attn_kernel(
+    q_rows,
+    k_rows,
+    v_rows,
+    mask,
     scale,
-    num_blocks,
     num_heads,
     num_kv_heads,
     head_size,
-    needs_gather,
-    out=None,
 ):
-    """Blocked online-softmax attention over one sequence of the packed list.
-
-    Under ``dynamic=False`` Dynamo specializes on every non-tensor argument, so
-    the KV loop is unrolled per ``num_blocks`` / ``needs_gather`` variant.
+    """Dense masked self-attention over one already-gathered sequence.
 
     ``head_size`` need not be stick-aligned: the kernel never slices a matmul
     operand, so Inductor's ``insert_bmm_padding`` can pad the contraction
     dimension itself.
 
     Expected shapes:
-        query: [num_tokens, num_heads, head_size], the whole batch's query
-        key/value: [num_tokens, num_kv_heads, head_size], likewise
-        row_index: [num_blocks * ENCODER_BLOCK_SIZE] int32 device tensor of
-            this sequence's absolute rows. Lanes past its length repeat the
-            last real row, so the gather never reads another request's
-            tokens and the mask discards the duplicates.
-        mask_tiles: num_blocks additive tiles, each
-            [num_kv_heads, num_queries_per_kv, 1, ENCODER_BLOCK_SIZE]. The
+        q_rows: [extent, num_heads, head_size], one sequence, already gathered
+            (or passed straight through when the buffer already holds exactly
+            this sequence -- see ``needs_gather`` at the call site).
+        k_rows/v_rows: [extent, num_kv_heads, head_size], likewise.
+        mask: [num_kv_heads, num_queries_per_kv, 1, extent] additive mask. The
             query axis is 1 because an encoder mask depends only on the KV
             column: every query row, real or padding, attends to exactly the
-            real keys. That is what makes the padding rows exact duplicates
-            of the last real row, which in turn makes the duplicate-index
-            store below harmless.
-        out: buffer to store into, or None to return the result instead.
+            real keys. That is what makes the padding rows exact duplicates of
+            the last real row, which in turn makes the duplicate-index store
+            downstream harmless.
 
-    Returns [padded_len, num_heads, head_size], or ``out`` when this kernel
-    stored the result itself.
+    Returns [extent, num_heads, head_size].
     """
     num_queries_per_kv = num_heads // num_kv_heads
-    padded_len = num_blocks * ENCODER_BLOCK_SIZE
-
-    # A compiled region reads a view from offset 0, ignoring storage_offset
-    # (torch-spyre#3770), so rows are gathered here rather than sliced
-    # outside. A gather selecting its whole source instead faults the device
-    # (RAS ComputeHardwareError 0x7b1b, torch-spyre#4033), hence needs_gather.
-    #
-    # One gather per tensor, then index the blocks at trace time: two
-    # multi-element index_selects on the *same* tensor exhaust torch-spyre's
-    # layout candidates (see the decoder's batched-decode kernel).
-    if needs_gather:
-        q_rows = query.index_select(0, row_index)
-        k_rows = key.index_select(0, row_index)
-        v_rows = value.index_select(0, row_index)
-    else:
-        q_rows, k_rows, v_rows = query, key, value
+    extent = q_rows.shape[0]
 
     q = (
-        q_rows.unsqueeze(0)
-        .transpose(1, 2)
-        .reshape(num_kv_heads, num_queries_per_kv, padded_len, head_size)
+        (q_rows.unsqueeze(0).transpose(1, 2) * scale)
+        .reshape(num_kv_heads, num_queries_per_kv, extent, head_size)
     )
+    k = k_rows.unsqueeze(0).transpose(1, 2).reshape(num_kv_heads, 1, extent, head_size)
+    v = v_rows.unsqueeze(0).transpose(1, 2).reshape(num_kv_heads, 1, extent, head_size)
 
-    tile_max = None
-    tile_sum = None
-    tile_output = None
-    block_index_dtype = torch.int32 if k_rows.device.type == "spyre" else torch.int64
+    scores = torch.matmul(q, k.transpose(-2, -1)) + mask
+    probs = torch.softmax(scores, dim=-1)
+    attn = torch.matmul(probs, v)
 
-    for i in range(num_blocks):
-        # index_select from k_rows/v_rows, not k_rows.reshape(...)[i]: a reshape
-        # view sliced at i>0 sits at a nonzero storage offset, which a compiled
-        # region reads from offset 0 regardless (torch-spyre#3770) -- this only
-        # surfaces under eager per-op compilation, as a "stick incompatibility"
-        # Inductor can't resolve, since STOCK_TORCH_COMPILE sees the whole
-        # function and never materializes the offset view.
-        block_rows = torch.arange(
-            i * ENCODER_BLOCK_SIZE,
-            (i + 1) * ENCODER_BLOCK_SIZE,
-            dtype=block_index_dtype,
-            device=k_rows.device,
-        )
-        # Token-major block to head-major for the matmuls; permutes on device.
-        k_block = k_rows.index_select(0, block_rows).permute(1, 0, 2).unsqueeze(1)
-        v_block = v_rows.index_select(0, block_rows).permute(1, 0, 2).unsqueeze(1)
-
-        scores = torch.matmul(q, k_block.transpose(-2, -1)) * scale
-        scores = scores + mask_tiles[i]
-        scores_max = torch.amax(scores, dim=-1, keepdim=True)
-
-        if i == 0:
-            tile_max = scores_max
-            tile_probs = torch.exp(scores - tile_max)
-            tile_output = torch.matmul(tile_probs, v_block)
-            tile_sum = tile_probs.sum(dim=-1, keepdim=True)
-        else:
-            # i > 0 only reachable after the i == 0 branch initialized these.
-            assert tile_max is not None
-            assert tile_sum is not None
-            assert tile_output is not None
-            new_max = torch.maximum(tile_max, scores_max)
-            rescale = torch.exp(tile_max - new_max)
-            tile_output = tile_output * rescale
-            tile_sum = tile_sum * rescale
-            tile_probs = torch.exp(scores - new_max)
-            tile_output += torch.matmul(tile_probs, v_block)
-            tile_sum = tile_sum + tile_probs.sum(dim=-1, keepdim=True)
-            tile_max = new_max
-
-    assert tile_output is not None and tile_sum is not None
-    attn = tile_output / tile_sum
-    attn = attn.reshape(1, num_heads, padded_len, head_size).transpose(1, 2)
-    attn = attn.reshape(padded_len, num_heads, head_size)
-    if out is not None:
-        # `out` and `query` are both indexed by absolute token row. Storing
-        # the full padded extent keeps query_len out of the arguments; the
-        # padding rows repeat the sequence's last row and, per the mask note
-        # above, carry the same value, so index_copy_'s undefined write
-        # order for duplicate indices is harmless.
-        out.index_copy_(0, row_index, attn)
-        return out
-    return attn
+    attn = attn.reshape(1, num_heads, extent, head_size).transpose(1, 2)
+    return attn.reshape(extent, num_heads, head_size)
 
 
-# Attention compiles separately from the model's fullgraph capture, which can't
-# hold the per-sequence Python loop around this.
-_encoder_block_compiled = torch.compile(_encoder_block_kernel, dynamic=False)
+_encoder_dense_attn_compiled = torch.compile(_encoder_dense_attn_kernel, dynamic=False)
 
 
-def _create_encoder_block_kernel(
-    num_blocks: int,
-    num_heads: int,
-    num_kv_heads: int,
-    head_size: int,
-    *,
-    needs_gather: bool = True,
-    store_mode: str = "none",
-):
-    """Test helper: bind non-tensor kernel args the way a forward call would."""
+def _encoder_store_kernel(out, row_index, attn):
+    """Scatter one sequence's attention output back into the step's output buffer.
 
-    def specialized_encoder_block_attn_kernel(
-        query,
-        key,
-        value,
-        row_index,
-        mask_tiles,
-        scale,
-        out=None,
-    ):
-        return _encoder_block_kernel(
-            query,
-            key,
-            value,
-            row_index,
-            mask_tiles,
-            scale,
-            num_blocks,
-            num_heads,
-            num_kv_heads,
-            head_size,
-            needs_gather,
-            out if store_mode == "index" else None,
+    Compiled alone -- mirrors the decoder's ``_index_copy_kernel``: a tiny
+    mutation, not fused with the attention math. Keyed on ``out.shape[0]``
+    (``buffer_rows``), which is fine because this graph is one op.
+    """
+    out.index_copy_(0, row_index, attn)
+    return out
+
+
+_encoder_store_compiled = torch.compile(_encoder_store_kernel, dynamic=False)
+
+
+def _create_dense_attn_kernel(num_heads: int, num_kv_heads: int, head_size: int):
+    """Test helper: bind the non-tensor args the way a forward call would."""
+
+    def specialized_dense_attn_kernel(q_rows, k_rows, v_rows, mask, scale):
+        return _encoder_dense_attn_kernel(
+            q_rows, k_rows, v_rows, mask, scale, num_heads, num_kv_heads, head_size
         )
 
-    return specialized_encoder_block_attn_kernel
+    return specialized_dense_attn_kernel
 
 
 @dataclass
 class EncoderSeqPlan:
-    """Everything the kernel needs for one request, built once per step."""
+    """Everything the kernels need for one request, built once per step."""
 
     start: int
     query_len: int
-    num_blocks: int
     needs_gather: bool
     row_table: torch.Tensor
-    mask_tiles: list[torch.Tensor]
+    mask: torch.Tensor
 
 
 def encoder_index_dtype(device: torch.device) -> torch.dtype:
@@ -274,7 +227,7 @@ def _const_tile(
     device: torch.device,
     cache: dict | None,
 ) -> torch.Tensor:
-    """Shared all-zero or all-masked tile. Read-only: every block aliases it."""
+    """Shared all-zero or all-masked 64-wide tile. Read-only: every mask aliases it."""
     cache_key = (masked, num_kv_heads, num_queries_per_kv, dtype, str(device))
     tile = None if cache is None else cache.get(cache_key)
     if tile is None:
@@ -288,21 +241,25 @@ def _const_tile(
     return tile
 
 
-def encoder_mask_tiles(
-    num_blocks: int,
+def encoder_mask(
+    extent: int,
     kv_len: int,
     num_kv_heads: int,
     num_queries_per_kv: int,
     dtype: torch.dtype,
     device: torch.device,
     cache: dict | None = None,
-) -> list[torch.Tensor]:
-    """One additive tile per KV block. Only the boundary block is per-sequence.
+) -> torch.Tensor:
+    """Dense additive mask [num_kv_heads, num_queries_per_kv, 1, extent].
 
-    This is where the mask's ``L``-squared growth disappears: interior blocks
-    are entirely real keys and beyond-the-end blocks entirely padding, so both
-    take a constant tile that ``cache`` hands out by reference.
+    Built by concatenating 64-wide tiles, not by materialising ``extent``
+    fresh elements: interior tiles (entirely real keys) and beyond-the-end
+    tiles (entirely padding) are shared constants that ``cache`` hands out by
+    reference, so only the one tile straddling ``kv_len`` -- if any -- is
+    request-specific. The concatenation itself is a cheap on-device op; this
+    is where the mask's ``L``-squared growth disappears.
     """
+    num_blocks = extent // ENCODER_BLOCK_SIZE
     tiles: list[torch.Tensor] = []
     for i in range(num_blocks):
         lo = i * ENCODER_BLOCK_SIZE
@@ -318,7 +275,7 @@ def encoder_mask_tiles(
             )
             host[..., : kv_len - lo] = 0
             tiles.append(convert(host, device))
-    return tiles
+    return tiles[0] if num_blocks == 1 else torch.cat(tiles, dim=-1)
 
 
 def dense_sdpa_reference(
@@ -352,50 +309,54 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
 
     The platform selects this impl for ENCODER/ENCODER_ONLY layers (see
     ``TorchSpyrePlatform.get_attn_backend_cls``). Forward stays inside the
-    opaque ``unified_attention`` op and dispatches the blocked kernel per
+    opaque ``unified_attention`` op and dispatches gather/attend/store per
     request, with no host-side slicing of activations.
     """
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        self._block_fn = _encoder_block_compiled if self._compile_attn else _encoder_block_kernel
-        # Interior and fully-masked tiles are shape-only, so one device copy
-        # each serves every sequence, layer and step.
+        if self._compile_attn:
+            self._gather_fn = _encoder_gather_compiled
+            self._attn_fn = _encoder_dense_attn_compiled
+            self._store_fn = _encoder_store_compiled
+        else:
+            self._gather_fn = _encoder_gather_kernel
+            self._attn_fn = _encoder_dense_attn_kernel
+            self._store_fn = _encoder_store_kernel
+        # Mask tiles are shape-only (depend only on kv_len's block boundary,
+        # not on which request/layer/step), so one device copy each serves
+        # every sequence, layer and step.
         self._const_tiles: dict[tuple, torch.Tensor] = {}
         self._warmed_buffers: set[int] = set()
+        # Distinct sequence lengths (extents) whose attention graph has been
+        # compiled, across *any* buffer_rows -- unlike _warmed_buffers, this
+        # is not reset per body bucket, since the attention kernel's cache key
+        # does not include buffer_rows. Warming it twice at the same extent
+        # would just be a wasted call, not a correctness issue, so this is an
+        # optimization, not a guard.
+        self._warmed_extents: set[int] = set()
 
-    def _run_block(
-        self,
-        query,
-        key,
-        value,
-        row_index,
-        mask_tiles,
-        num_blocks: int,
-        num_heads: int,
-        num_kv_heads: int,
-        head_size: int,
-        needs_gather: bool,
-        out=None,
-    ):
+    def _run_gather(self, query, key, value, row_index):
+        return _call_kernel("encoder_gather", self._gather_fn, query, key, value, row_index)
+
+    def _run_attn(self, q_rows, k_rows, v_rows, mask, num_heads, num_kv_heads, head_size):
         return _call_kernel(
-            "encoder_block_attn",
-            self._block_fn,
-            query,
-            key,
-            value,
-            row_index,
-            mask_tiles,
+            "encoder_dense_attn",
+            self._attn_fn,
+            q_rows,
+            k_rows,
+            v_rows,
+            mask,
             self.scale,
-            num_blocks,
             num_heads,
             num_kv_heads,
             head_size,
-            needs_gather,
-            out,
         )
 
-    def _warm_block_fns(
+    def _run_store(self, out, row_index, attn):
+        return _call_kernel("encoder_store", self._store_fn, out, row_index, attn)
+
+    def _warm_kernels(
         self,
         buffer_rows: int,
         num_heads: int,
@@ -406,11 +367,17 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
     ) -> None:
         """Compile every kernel a batch of this token count can ask for.
 
-        A request's block count follows its own length, not the body bucket, so
-        the warmup dummies do not span the ladder on their own -- one long
+        A request's padded length follows its own length, not the body bucket,
+        so the warmup dummies do not span the ladder on their own -- one long
         request mid-serve would otherwise stall the server compiling. Doing it
         here, on the first forward for each body size, keeps that cost inside
         warmup, where the dummy runs already visit every body size.
+
+        The attention kernel itself is only warmed once per distinct extent,
+        ever, regardless of how many buffer_rows values reach it: its cache
+        key does not include buffer_rows, so recompiling it per body bucket
+        would be pure waste. Gather/store are cheap and are rewarmed per
+        buffer_rows, matching what their own cache key actually depends on.
 
         Scratch contents are irrelevant; only the shapes reach the cache key.
         """
@@ -423,41 +390,25 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         key = convert(torch.zeros((buffer_rows, num_kv_heads, head_size), dtype=dtype), device)
         value = convert(torch.zeros((buffer_rows, num_kv_heads, head_size), dtype=dtype), device)
         out = convert(torch.zeros((buffer_rows, num_heads, head_size), dtype=dtype), device)
+        index_dtype = encoder_index_dtype(device)
 
-        num_blocks = 1
-        while num_blocks * ENCODER_BLOCK_SIZE <= buffer_rows:
-            extent = num_blocks * ENCODER_BLOCK_SIZE
-            rows = convert(
-                encoder_row_table(0, extent, extent, encoder_index_dtype(device)), device
-            )
-            tiles = encoder_mask_tiles(
-                num_blocks,
-                extent,
-                num_kv_heads,
-                num_queries_per_kv,
-                dtype,
-                device,
-                self._const_tiles,
-            )
-            # A sequence only skips the gather when it fills the buffer exactly,
-            # which pins the block count; every other case gathers.
-            for needs_gather in (True, False):
-                if not needs_gather and extent != buffer_rows:
-                    continue
-                self._run_block(
-                    query,
-                    key,
-                    value,
-                    rows,
-                    tiles,
-                    num_blocks,
-                    num_heads,
-                    num_kv_heads,
-                    head_size,
-                    needs_gather,
-                    out,
+        extent = ENCODER_BLOCK_SIZE
+        while extent <= buffer_rows:
+            rows = convert(encoder_row_table(0, extent, extent, index_dtype), device)
+            # Warms gather (keyed on buffer_rows and extent) plus attn/store
+            # (keyed on extent alone). The needs_gather=False path skips only
+            # the gather call at runtime -- attn and store don't know or care
+            # whether their inputs came from a gather, so nothing extra needs
+            # warming for that case.
+            q_rows, k_rows, v_rows = self._run_gather(query, key, value, rows)
+            if extent not in self._warmed_extents:
+                self._warmed_extents.add(extent)
+                mask = encoder_mask(
+                    extent, extent, num_kv_heads, num_queries_per_kv, dtype, device, self._const_tiles
                 )
-            num_blocks *= 2
+                attn = self._run_attn(q_rows, k_rows, v_rows, mask, num_heads, num_kv_heads, head_size)
+                self._run_store(out, rows, attn)
+            extent *= 2
 
     def _build_plans(
         self,
@@ -466,7 +417,7 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         num_kv_heads: int,
         num_queries_per_kv: int,
     ) -> list[EncoderSeqPlan]:
-        """Row tables and mask tiles for every request in the step."""
+        """Row tables and masks for every request in the step."""
         query_start_loc = attn_metadata.query_start_loc.cpu().tolist()
         seq_lens = attn_metadata.seq_lens.cpu().tolist()
         # The body may 1D-pad past num_actual_tokens; those rows are not a request.
@@ -484,19 +435,17 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
             query_len = min(query_len, num_tokens - start)
             kv_len = min(int(seq_lens[seq_idx]), query_len)
 
-            num_blocks = _blocks_for(max(query_len, kv_len))
-            extent = num_blocks * ENCODER_BLOCK_SIZE
+            extent = _blocks_for(max(query_len, kv_len)) * ENCODER_BLOCK_SIZE
             plans.append(
                 EncoderSeqPlan(
                     start=start,
                     query_len=query_len,
-                    num_blocks=num_blocks,
                     needs_gather=not (start == 0 and query_len == extent and buffer_rows == extent),
                     row_table=convert(
                         encoder_row_table(start, query_len, extent, index_dtype), device
                     ),
-                    mask_tiles=encoder_mask_tiles(
-                        num_blocks,
+                    mask=encoder_mask(
+                        extent,
                         kv_len,
                         num_kv_heads,
                         num_queries_per_kv,
@@ -547,7 +496,7 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         store_mode = "index" if fused_store_ok else "none"
 
         if store_mode == "index":
-            self._warm_block_fns(
+            self._warm_kernels(
                 query.shape[0], num_heads, num_kv_heads, head_size, query.dtype, query.device
             )
 
@@ -558,21 +507,17 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
             )
 
         for plan in attn_metadata.encoder_seq_plans:
-            result = self._run_block(
-                query,
-                key,
-                value,
-                plan.row_table,
-                plan.mask_tiles,
-                plan.num_blocks,
-                num_heads,
-                num_kv_heads,
-                head_size,
-                plan.needs_gather,
-                output if store_mode == "index" else None,
-            )
-            if store_mode == "none":
-                output[plan.start : plan.start + plan.query_len] = result[: plan.query_len]
+            if plan.needs_gather:
+                q_rows, k_rows, v_rows = self._run_gather(query, key, value, plan.row_table)
+            else:
+                q_rows, k_rows, v_rows = query, key, value
+
+            attn = self._run_attn(q_rows, k_rows, v_rows, plan.mask, num_heads, num_kv_heads, head_size)
+
+            if store_mode == "index":
+                self._run_store(output, plan.row_table, attn)
+            else:
+                output[plan.start : plan.start + plan.query_len] = attn[: plan.query_len]
 
         return output
 

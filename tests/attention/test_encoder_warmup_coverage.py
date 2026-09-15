@@ -12,14 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Encoder attention warmup coverage: ``_warm_block_fns`` compiles every block-kernel
+"""Encoder attention warmup coverage: ``_warm_kernels`` compiles every gather/attend
 variant a body bucket could reach, so nothing compiles mid-request.
 
-CPU-only, and not about numerics -- ``test_spyre_encoder_attn.py`` covers those. Under
-the flash design there is only one shape axis left (per-request block count), driven
-entirely by the body bucket a request lands on: ``_warm_block_fns`` is called once per
-distinct ``buffer_rows`` seen in ``forward()``, which happens automatically because
-warmup's own dummy runs pass ``force_attention=True`` and visit every body bucket.
+CPU-only, and not about numerics -- ``test_spyre_encoder_attn.py`` covers those.
+``_warm_kernels`` is called once per distinct ``buffer_rows`` seen in ``forward()``,
+which happens automatically because warmup's own dummy runs pass
+``force_attention=True`` and visit every body bucket. Gather is cheap and keyed on
+``(buffer_rows, extent)``, so it is rewarmed at every body bucket; attention/store are
+keyed only on ``extent`` (the sequence's own padded length) and are warmed exactly once
+per distinct extent, however many buffer_rows values reach it.
 """
 
 import torch
@@ -46,23 +48,23 @@ def _make_impl(num_heads=4, num_kv_heads=1, head_size=64):
     )
 
 
-class TestWarmBlockFnsCoversTheBucket:
-    """``_warm_block_fns`` must exercise every ``(num_blocks, needs_gather)`` a
-    request landing on this ``buffer_rows`` body bucket could actually reach."""
+class TestWarmKernelsCoversTheBucket:
+    """``_warm_kernels`` must exercise gather for every extent this ``buffer_rows``
+    body bucket can reach, and attention/store exactly once per distinct extent --
+    regardless of how many different buffer_rows values reach it."""
 
-    def test_warms_every_power_of_two_block_count_up_to_the_buffer(self, monkeypatch):
+    def test_gathers_every_power_of_two_extent_up_to_the_buffer(self, monkeypatch):
         buffer_rows = 256
-        seen: set[tuple[int, bool]] = set()
+        seen_gathers: set[int] = set()
         impl = _make_impl()
-        real_run_block = impl._run_block
+        real_run_gather = impl._run_gather
 
-        def counting_run_block(query, key, value, row_index, mask_tiles, num_blocks, *rest):
-            needs_gather = rest[3]
-            seen.add((num_blocks, needs_gather))
-            return real_run_block(query, key, value, row_index, mask_tiles, num_blocks, *rest)
+        def counting_run_gather(query, key, value, row_index):
+            seen_gathers.add(row_index.shape[0])
+            return real_run_gather(query, key, value, row_index)
 
-        monkeypatch.setattr(impl, "_run_block", counting_run_block)
-        impl._warm_block_fns(
+        monkeypatch.setattr(impl, "_run_gather", counting_run_gather)
+        impl._warm_kernels(
             buffer_rows,
             impl.num_heads,
             impl.num_kv_heads,
@@ -71,50 +73,72 @@ class TestWarmBlockFnsCoversTheBucket:
             torch.device("cpu"),
         )
 
-        expected_block_counts = set()
-        num_blocks = 1
-        while num_blocks * ENCODER_BLOCK_SIZE <= buffer_rows:
-            expected_block_counts.add(num_blocks)
-            num_blocks *= 2
-        # Every block count gathers; only the one that fills the buffer exactly
-        # additionally skips the gather (torch-spyre#4033).
-        assert seen == {(n, True) for n in expected_block_counts} | {
-            (buffer_rows // ENCODER_BLOCK_SIZE, False)
-        }
+        expected_extents = set()
+        extent = ENCODER_BLOCK_SIZE
+        while extent <= buffer_rows:
+            expected_extents.add(extent)
+            extent *= 2
+        assert seen_gathers == expected_extents
+
+    def test_attn_and_store_compile_once_per_extent_not_per_buffer(self, monkeypatch):
+        """The expensive kernel must not be rewarmed for an extent already seen at
+        a smaller buffer_rows -- that is the whole point of splitting gather/store
+        (cheap, keyed on buffer_rows) from attention (expensive, keyed only on the
+        sequence's own padded length).
+        """
+        impl = _make_impl()
+        calls = {"n": 0}
+        real_run_attn = impl._run_attn
+
+        def counting_run_attn(*args, **kwargs):
+            calls["n"] += 1
+            return real_run_attn(*args, **kwargs)
+
+        monkeypatch.setattr(impl, "_run_attn", counting_run_attn)
+        args = (impl.num_heads, impl.num_kv_heads, impl.head_size, impl.model_dtype, torch.device("cpu"))
+
+        impl._warm_kernels(64, *args)
+        first = calls["n"]
+        assert first == 1  # exactly one extent (64) reachable at buffer_rows=64
+
+        impl._warm_kernels(128, *args)
+        # Only the new extent (128) should trigger a fresh compile; extent 64
+        # was already warmed by the buffer_rows=64 call above.
+        assert calls["n"] == first + 1
 
     def test_is_idempotent_per_buffer_size(self, monkeypatch):
         """A second call at the same ``buffer_rows`` must not re-warm anything."""
         impl = _make_impl()
         calls = {"n": 0}
-        real_run_block = impl._run_block
+        real_run_gather = impl._run_gather
 
-        def counting_run_block(*args, **kwargs):
+        def counting_run_gather(*args, **kwargs):
             calls["n"] += 1
-            return real_run_block(*args, **kwargs)
+            return real_run_gather(*args, **kwargs)
 
-        monkeypatch.setattr(impl, "_run_block", counting_run_block)
+        monkeypatch.setattr(impl, "_run_gather", counting_run_gather)
         args = (impl.num_heads, impl.num_kv_heads, impl.head_size, impl.model_dtype, torch.device("cpu"))
 
-        impl._warm_block_fns(128, *args)
+        impl._warm_kernels(128, *args)
         first = calls["n"]
         assert first > 0
-        impl._warm_block_fns(128, *args)
+        impl._warm_kernels(128, *args)
         assert calls["n"] == first
 
-    def test_a_real_sequence_at_any_length_lands_on_a_warmed_variant(self):
-        """Every length a body bucket can hold maps onto a ``(num_blocks, needs_gather)``
-        pair ``_warm_block_fns`` visited -- checked against ``_blocks_for`` directly,
-        since that is what ``_build_plans`` uses to pick a request's variant."""
+    def test_a_real_sequence_at_any_length_lands_on_a_warmed_extent(self):
+        """Every length a body bucket can hold maps onto an extent ``_warm_kernels``
+        visited -- checked against ``_blocks_for`` directly, since that is what
+        ``_build_plans`` uses to pick a request's extent."""
         buffer_rows = 512
-        warmed_block_counts = set()
-        num_blocks = 1
-        while num_blocks * ENCODER_BLOCK_SIZE <= buffer_rows:
-            warmed_block_counts.add(num_blocks)
-            num_blocks *= 2
+        warmed_extents = set()
+        extent = ENCODER_BLOCK_SIZE
+        while extent <= buffer_rows:
+            warmed_extents.add(extent)
+            extent *= 2
 
         checked = 0
         for length in range(1, buffer_rows + 1, 7):
-            assert _blocks_for(length) in warmed_block_counts
+            assert _blocks_for(length) * ENCODER_BLOCK_SIZE in warmed_extents
             checked += 1
         assert checked > 20, "too few lengths checked -- test is near-vacuous"
 

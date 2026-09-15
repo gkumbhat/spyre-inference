@@ -29,10 +29,11 @@ from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
     ENCODER_BLOCK_SIZE,
     SpyreEncoderAttentionImpl,
     _blocks_for,
-    _create_encoder_block_kernel,
+    _create_dense_attn_kernel,
+    _encoder_gather_kernel,
     dense_sdpa_reference,
     encoder_index_dtype,
-    encoder_mask_tiles,
+    encoder_mask,
     encoder_row_table,
 )
 
@@ -253,21 +254,21 @@ def test_blocks_for_rounds_up_to_powers_of_two():
     assert [_blocks_for(n) for n in (1, 64, 65, 128, 129, 200, 512)] == [1, 1, 2, 2, 4, 4, 8]
 
 
-def test_mask_tiles_cut_at_the_boundary_block():
-    tiles = encoder_mask_tiles(3, 100, 2, 1, torch.float32, torch.device("cpu"), {})
+def test_encoder_mask_cuts_at_the_boundary_block():
+    mask = encoder_mask(3 * ENCODER_BLOCK_SIZE, 100, 2, 1, torch.float32, torch.device("cpu"), {})
     masked = torch.finfo(torch.float32).min
-    # Block 0 is all real keys, block 1 straddles kv_len=100, block 2 is all padding.
-    assert torch.equal(tiles[0], torch.zeros_like(tiles[0]))
-    assert torch.equal(tiles[1][..., :36], torch.zeros_like(tiles[1][..., :36]))
-    assert torch.equal(tiles[1][..., 36:], torch.full_like(tiles[1][..., 36:], masked))
-    assert torch.equal(tiles[2], torch.full_like(tiles[2], masked))
-    # Interior and beyond-the-end tiles come from the cache by reference.
-    assert encoder_mask_tiles(1, 64, 2, 1, torch.float32, torch.device("cpu"), {})[0].shape == (
-        2,
-        1,
-        1,
-        ENCODER_BLOCK_SIZE,
-    )
+    assert mask.shape == (2, 1, 1, 3 * ENCODER_BLOCK_SIZE)
+    # Block 0 (cols 0:64) is all real keys, block 1 (64:128) straddles
+    # kv_len=100, block 2 (128:192) is all padding.
+    assert torch.equal(mask[..., :64], torch.zeros_like(mask[..., :64]))
+    assert torch.equal(mask[..., 64:100], torch.zeros_like(mask[..., 64:100]))
+    assert torch.equal(mask[..., 100:128], torch.full_like(mask[..., 100:128], masked))
+    assert torch.equal(mask[..., 128:], torch.full_like(mask[..., 128:], masked))
+
+
+def test_encoder_mask_single_block_skips_the_cat():
+    mask = encoder_mask(ENCODER_BLOCK_SIZE, 64, 2, 1, torch.float32, torch.device("cpu"), {})
+    assert mask.shape == (2, 1, 1, ENCODER_BLOCK_SIZE)
 
 
 def test_row_table_clamps_padding_lanes_to_the_last_real_row():
@@ -277,49 +278,82 @@ def test_row_table_clamps_padding_lanes_to_the_last_real_row():
     assert rows[3:].unique().tolist() == [12]
 
 
-def _blocked_attn(
+def test_dense_attn_kernel_never_calls_arange(monkeypatch):
+    """Regression guard: the original bug was building block indices inside
+    the attention kernel, which falls back to CPU on real hardware (torch-spyre
+    has no on-device ``arange``). The kernel takes already-gathered,
+    fixed-shape tensors and a precomputed mask, and must not construct
+    anything itself.
+    """
+    length = 70
+    num_heads, num_kv_heads, head_size = 4, 4, 64
+    extent = _blocks_for(length) * ENCODER_BLOCK_SIZE
+    torch.manual_seed(0)
+    q_rows = torch.randn(extent, num_heads, head_size, dtype=torch.float32)
+    k_rows = torch.randn(extent, num_kv_heads, head_size, dtype=torch.float32)
+    v_rows = torch.randn(extent, num_kv_heads, head_size, dtype=torch.float32)
+    mask = encoder_mask(extent, length, num_kv_heads, 1, q_rows.dtype, q_rows.device, {})
+
+    real_arange = torch.arange
+    calls = {"n": 0}
+
+    def counting_arange(*args, **kwargs):
+        calls["n"] += 1
+        return real_arange(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "arange", counting_arange)
+    attn_fn = _create_dense_attn_kernel(num_heads, num_kv_heads, head_size)
+    attn_fn(q_rows, k_rows, v_rows, mask, head_size**-0.5)
+    assert calls["n"] == 0, "the attention kernel must not build any index tensor itself"
+
+
+def test_gather_kernel_never_calls_arange(monkeypatch):
+    length = 70
+    num_heads, num_kv_heads, head_size = 4, 4, 64
+    extent = _blocks_for(length) * ENCODER_BLOCK_SIZE
+    torch.manual_seed(0)
+    query = torch.randn(extent, num_heads, head_size, dtype=torch.float32)
+    key = torch.randn(extent, num_kv_heads, head_size, dtype=torch.float32)
+    value = torch.randn(extent, num_kv_heads, head_size, dtype=torch.float32)
+    row_index = encoder_row_table(0, length, extent, torch.int64)
+
+    real_arange = torch.arange
+    calls = {"n": 0}
+
+    def counting_arange(*args, **kwargs):
+        calls["n"] += 1
+        return real_arange(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "arange", counting_arange)
+    _encoder_gather_kernel(query, key, value, row_index)
+    assert calls["n"] == 0, "the gather kernel must not build any index tensor itself"
+
+
+def _dense_attn(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
     query_lens: list[int],
     scale: float,
 ) -> torch.Tensor:
-    """Drive the blocked kernel over a packed list the way ``forward`` does."""
+    """Drive gather + dense attention over a packed list the way ``forward`` does."""
     num_heads, head_size = query.shape[1], query.shape[2]
     num_kv_heads = key.shape[1]
     num_queries_per_kv = num_heads // num_kv_heads
     index_dtype = encoder_index_dtype(query.device)
     tile_cache: dict = {}
+    attn_fn = _create_dense_attn_kernel(num_heads, num_kv_heads, head_size)
     out = torch.zeros_like(query)
     start = 0
     for length in query_lens:
-        num_blocks = _blocks_for(length)
-        extent = num_blocks * ENCODER_BLOCK_SIZE
-        kernel = _create_encoder_block_kernel(
-            num_blocks,
-            num_heads,
-            num_kv_heads,
-            head_size,
-            needs_gather=True,
-            store_mode="index",
+        extent = _blocks_for(length) * ENCODER_BLOCK_SIZE
+        row_index = encoder_row_table(start, length, extent, index_dtype)
+        mask = encoder_mask(
+            extent, length, num_kv_heads, num_queries_per_kv, query.dtype, query.device, tile_cache
         )
-        kernel(
-            query,
-            key,
-            value,
-            encoder_row_table(start, length, extent, index_dtype),
-            encoder_mask_tiles(
-                num_blocks,
-                length,
-                num_kv_heads,
-                num_queries_per_kv,
-                query.dtype,
-                query.device,
-                tile_cache,
-            ),
-            scale,
-            out=out,
-        )
+        q_rows, k_rows, v_rows = _encoder_gather_kernel(query, key, value, row_index)
+        attn = attn_fn(q_rows, k_rows, v_rows, mask, scale)
+        out.index_copy_(0, row_index, attn)
         start += length
     return out
 
@@ -336,10 +370,10 @@ def _blocked_attn(
     "num_heads",
     [pytest.param((4, 1), id="GQA"), pytest.param((4, 4), id="MHA")],
 )
-def test_blocked_kernel_matches_dense_sdpa_reference(
+def test_dense_kernel_matches_dense_sdpa_reference(
     query_lens: list[int], num_heads: tuple[int, int]
 ) -> None:
-    """The blocked online-softmax loop must match a dense SDPA computation."""
+    """The gather + dense-attention path must match a dense SDPA computation."""
     num_query_heads, num_kv_heads = num_heads
     head_size = 64
     scale = head_size**-0.5
@@ -349,7 +383,7 @@ def test_blocked_kernel_matches_dense_sdpa_reference(
     key = torch.randn(total, num_kv_heads, head_size, dtype=torch.float32)
     value = torch.randn(total, num_kv_heads, head_size, dtype=torch.float32)
 
-    got = _blocked_attn(query, key, value, query_lens, scale)
+    got = _dense_attn(query, key, value, query_lens, scale)
     ref = dense_sdpa_reference(query, key, value, query_lens, scale)
     torch.testing.assert_close(got, ref, atol=1e-4, rtol=1e-4)
 
