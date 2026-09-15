@@ -134,17 +134,28 @@ def _encoder_block_kernel(
         .transpose(1, 2)
         .reshape(num_kv_heads, num_queries_per_kv, padded_len, head_size)
     )
-    k_blocks = k_rows.reshape(num_blocks, ENCODER_BLOCK_SIZE, num_kv_heads, head_size)
-    v_blocks = v_rows.reshape(num_blocks, ENCODER_BLOCK_SIZE, num_kv_heads, head_size)
 
     tile_max = None
     tile_sum = None
     tile_output = None
+    block_index_dtype = torch.int32 if k_rows.device.type == "spyre" else torch.int64
 
     for i in range(num_blocks):
+        # index_select from k_rows/v_rows, not k_rows.reshape(...)[i]: a reshape
+        # view sliced at i>0 sits at a nonzero storage offset, which a compiled
+        # region reads from offset 0 regardless (torch-spyre#3770) -- this only
+        # surfaces under eager per-op compilation, as a "stick incompatibility"
+        # Inductor can't resolve, since STOCK_TORCH_COMPILE sees the whole
+        # function and never materializes the offset view.
+        block_rows = torch.arange(
+            i * ENCODER_BLOCK_SIZE,
+            (i + 1) * ENCODER_BLOCK_SIZE,
+            dtype=block_index_dtype,
+            device=k_rows.device,
+        )
         # Token-major block to head-major for the matmuls; permutes on device.
-        k_block = k_blocks[i].permute(1, 0, 2).unsqueeze(1)
-        v_block = v_blocks[i].permute(1, 0, 2).unsqueeze(1)
+        k_block = k_rows.index_select(0, block_rows).permute(1, 0, 2).unsqueeze(1)
+        v_block = v_rows.index_select(0, block_rows).permute(1, 0, 2).unsqueeze(1)
 
         scores = torch.matmul(q, k_block.transpose(-2, -1)) * scale
         scores = scores + mask_tiles[i]
