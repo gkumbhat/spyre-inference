@@ -37,6 +37,7 @@ _ADAPTED_MODULES = ("bert", "roberta")
 
 # Architectures adapted individually, for reasons that reach no further.
 _ADAPTED_ARCHS: dict[str, str] = {
+    "CLIPModel": "spyre_inference.models.clip:SpyreCLIPEmbeddingModel",
     # A Gemma4ForConditionalGeneration checkpoint needs no entry of its own:
     # apply_prelaunch_overrides rewrites it to this text-only backbone first.
     "Gemma4ForCausalLM": "spyre_inference.models.gemma4:SpyreGemma4ForCausalLM",
