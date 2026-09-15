@@ -543,6 +543,80 @@ def test_spyre_encoder_attn(
     )
 
 
+@pytest.mark.parametrize(
+    "configure_device",
+    [
+        pytest.param("cpu", id="device_cpu"),
+        pytest.param("spyre", id="device_spyre"),
+    ],
+    indirect=True,
+)
+@torch.inference_mode()
+def test_single_sequence_exactly_filling_the_buffer_handles_a_fused_qkv_view(
+    default_vllm_config, configure_device: str
+) -> None:
+    """Regression test: a single request whose length exactly equals the padded
+    extent takes the ``needs_gather=False`` path, which used to hand the raw
+    query/key/value straight to the attention math with no normalization. A
+    model with a fused QKV projection (``qkv.split(...)``) hands out *strided*
+    views there, not contiguous tensors -- on real Spyre hardware this crashed
+    with "no mechanism to resolve stick incompatibility" the first time a
+    request landed on this exact shape (a single sequence, no batching, exactly
+    filling its body bucket). Build query/key/value the same way: slice them out
+    of one fused buffer instead of allocating them independently.
+    """
+    num_heads, num_kv_heads, head_size, block_size = 4, 4, 64, 64
+    total_tokens = 64  # == extent, so this is the single-sequence exact-fill case
+    dtype = torch.float16
+    torch.set_default_device("cpu")
+    set_random_seed(0)
+
+    fused = torch.randn(total_tokens, 3 * num_heads * head_size, dtype=dtype)
+    query, key, value = fused.split([num_heads * head_size] * 3, dim=-1)
+    query = query.view(total_tokens, num_heads, head_size)
+    key = key.view(total_tokens, num_kv_heads, head_size)
+    value = value.view(total_tokens, num_kv_heads, head_size)
+    assert not query.is_contiguous(), "the fused-QKV slice must stay a strided view"
+
+    attn_metadata = _build_metadata(
+        num_query_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        block_size=block_size,
+        seq_lens=torch.tensor([total_tokens], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, total_tokens], dtype=torch.int32),
+        block_table=torch.zeros(1, 1, dtype=torch.int32),
+        slot_mapping=torch.arange(total_tokens, dtype=torch.int64),
+    )
+    impl = SpyreEncoderAttentionImpl(
+        num_heads=num_heads,
+        head_size=head_size,
+        scale=head_size**-0.5,
+        num_kv_heads=num_kv_heads,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="auto",
+        logits_soft_cap=None,
+    )
+    kv_cache = SpyrePagedKVCache(k_pages=torch.empty(0), v_pages=torch.empty(0))
+    device = torch.device(configure_device)
+    output = torch.empty_like(query).to(device)
+    impl.forward(
+        layer=None,
+        query=query,
+        key=key,
+        value=value,
+        kv_cache=kv_cache,
+        attn_metadata=attn_metadata,
+        output=output,
+    )
+
+    ref = dense_sdpa_reference(
+        query.contiguous(), key.contiguous(), value.contiguous(), [total_tokens], head_size**-0.5
+    )
+    torch.testing.assert_close(output.to("cpu"), ref, atol=0.2, rtol=0.2)
+
+
 @torch.inference_mode()
 def test_encoder_seq_plans_built_once_and_reused_across_layers(default_vllm_config) -> None:
     """Second layer's forward() must reuse the first layer's plans, not rebuild them."""

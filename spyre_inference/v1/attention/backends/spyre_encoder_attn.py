@@ -510,7 +510,15 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
             if plan.needs_gather:
                 q_rows, k_rows, v_rows = self._run_gather(query, key, value, plan.row_table)
             else:
-                q_rows, k_rows, v_rows = query, key, value
+                # index_select always returns a fresh contiguous tensor, so the
+                # gather path never hits this -- but a fused QKV projection
+                # (qkv.split(...)) hands out strided views, and a compiled
+                # region can't resolve that layout for the matmul/reduction
+                # that follows. .contiguous() is a no-op when it's already
+                # contiguous, so this only ever costs a real copy for fused
+                # QKV models. Same fix the old pack path applied for the same
+                # reason ("Fused QKV views are strided").
+                q_rows, k_rows, v_rows = query.contiguous(), key.contiguous(), value.contiguous()
 
             attn = self._run_attn(q_rows, k_rows, v_rows, plan.mask, num_heads, num_kv_heads, head_size)
 
