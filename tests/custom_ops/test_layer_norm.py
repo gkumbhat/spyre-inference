@@ -28,17 +28,8 @@ def reference_layer_norm(
     bias: torch.Tensor | None,
     eps: float,
 ) -> torch.Tensor:
-    """Population-variance LayerNorm reference (matches torch.nn.LayerNorm's
-    semantics): an oracle for _layer_norm_kernel's decomposition-free formula,
-    not for fp16-vs-fp32 precision the op does not promise."""
-    mean = x.mean(dim=-1, keepdim=True)
-    var = (x - mean).pow(2).mean(dim=-1, keepdim=True)
-    x_norm = (x - mean) * torch.rsqrt(var + eps)
-    if weight is not None:
-        x_norm = x_norm * weight
-    if bias is not None:
-        x_norm = x_norm + bias
-    return x_norm
+    """The actual LayerNorm semantics every SpyreLayerNorm path must match."""
+    return torch.nn.functional.layer_norm(x, x.shape[-1:], weight, bias, eps)
 
 
 @pytest.mark.layer_norm
