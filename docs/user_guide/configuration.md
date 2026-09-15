@@ -43,20 +43,21 @@ Spyre compile is on by default (`STOCK_TORCH_COMPILE`, `dynamic=False`). Pass
 
 - **Body** (Linear / LN): pad the packed token count to the next 1D
   `compile_sizes` bucket `T` (same dispatch as the decoder).
-- **Attention** (flash): blocked online-softmax over the packed list, gathering
-  each request's own rows in-graph. There is no dense `(B, L)` grid and no
-  rewrite of body `T`; the only compile axis is a request's KV block count
-  (a power of two, `ENCODER_BLOCK_SIZE = 64` tokens per block).
+- **Attention**: dense per-sequence `QKᵀ -> mask -> softmax -> ·V`, gathering
+  each request's own rows via a separately compiled kernel first. There is no
+  dense `(B, L)` grid and no rewrite of body `T`; the only compile axis is a
+  request's own padded length (a power of two, `ENCODER_BLOCK_SIZE = 64`
+  tokens per step).
 
 `compile_sizes` for pooling is the body `T` buckets (`64, 128, …` up to the
 token cap).
 
 A 3-seq × 30-token request with `--max-num-seqs 4` pads the body to `T=128`;
-attention still sees the real per-sequence lengths (1 block each here).
+attention still sees the real per-sequence lengths (one 64-token step each here).
 
 Compiled pooling warmup dummies each 1D body size; that alone traces every
-block-count variant reachable at that size (`force_attention=True`, so the
-dummy run actually reaches the attention kernel). Eager pooling uses one
+sequence-length variant reachable at that size (`force_attention=True`, so
+the dummy run actually reaches the attention kernel). Eager pooling uses one
 short dummy, then runtime still 1D-pads the body.
 
 Example:

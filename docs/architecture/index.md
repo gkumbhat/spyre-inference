@@ -260,34 +260,43 @@ Encoder-only (embedding) models take a separate path. For `ENCODER`/`ENCODER_ONL
 layers, `TorchSpyrePlatform.get_attn_backend_cls` selects `SpyreEncoderAttentionBackend`
 → `SpyreEncoderAttentionImpl` (both subclass the decoder backend/impl in
 `spyre_encoder_attn.py`). This path has **no KV cache** — attention is bidirectional over
-the full sequence — so it skips the paged-cache machinery. The packed `[T, H, D]` list
-goes to a blocked flash kernel whole; request boundaries ride in int32 row-index tables
+the full sequence — so it skips the paged-cache machinery. The packed `[T, H, D]` list is
+processed one sequence at a time, dense; request boundaries ride in int32 row-index tables
 (offsets are data, not shapes):
 
 1. First encoder layer of the step builds one `EncoderSeqPlan` per request (row table +
-   64-token mask tiles) and stashes it on `attn_metadata.encoder_seq_plans` for the rest
-   of the stack.
-2. The kernel gathers that sequence in-graph (`index_select`), walks KV in
-   `ENCODER_BLOCK_SIZE = 64` blocks with a running softmax max/sum, and writes back with
-   `index_copy_`. There is no host slice (torch-spyre#3770) and no identity gather
-   (torch-spyre#4033).
-3. The only compile axis is the per-request block count (power of two). Body `T` stays a
-   1D `compile_sizes` bucket; there is no dense `(B, L)` grid or `[B, 1, L, L]` mask.
+   additive mask) and stashes it on `attn_metadata.encoder_seq_plans` for the rest of the
+   stack.
+2. Three separately compiled functions, not one: `_encoder_gather_kernel` pulls one
+   sequence's rows out of the step's body buffer via `index_select`; the dense
+   `QKᵀ -> +mask -> softmax -> ·V` attention kernel runs on those already-gathered,
+   sequence-sized tensors; `_encoder_store_kernel` scatters the result back with
+   `index_copy_`. There is no online-softmax loop — a sequence's whole K/V already fits in
+   one gathered tensor, so there is no paged cache forcing a block-wise walk the way the
+   decoder needs.
+3. The split matters for compilation, not just structure: under `dynamic=False` Dynamo
+   guards on every argument's shape, including the step's body buffer size. Keeping gather
+   and store (cheap, keyed on that buffer size) separate from the attention math
+   (expensive, keyed only on the sequence's own padded length) means the expensive graph
+   compiles once per distinct sequence length, not once per `(buffer size, length)` pair.
+4. There is no host slice (torch-spyre#3770) and no identity gather (torch-spyre#4033).
+   The only compile axis is the per-request padded length (a power of two, in
+   `ENCODER_BLOCK_SIZE = 64` steps). Body `T` stays a 1D `compile_sizes` bucket; there is no
+   dense `(B, L)` grid or `[B, 1, L, L]` mask.
 
 ## Encoder / embedding models: compile shape axes
 
 The model body is compiled once per token bucket. Attention is shape-managed separately
-behind the opaque custom-op boundary; its axis is the per-request flash block count, not
-a dense `(S, L)` grid.
+behind the opaque custom-op boundary; its axis is the per-request padded sequence length,
+not a dense `(S, L)` grid.
 
 <figure markdown="span">
   ![Encoder target state](encoder-ideal-state.svg){: style="width: 140%; max-width: 1400px; margin-left: -20%" }
   <figcaption>
     Architecture for encoder / embedding models under
     <code>STOCK_TORCH_COMPILE</code>. The body is bucketed on packed token count
-    <code>T</code>. Attention is blocked flash over that packed list (the flash-style
-    variant at the foot of the diagram), so the second axis is a per-request block
-    count rather than a dense <code>(S, L)</code> grid.
+    <code>T</code>. Attention runs dense per-sequence over that packed list, so the second
+    axis is a per-request padded length rather than a dense <code>(S, L)</code> grid.
   </figcaption>
 </figure>
 
