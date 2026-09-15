@@ -84,7 +84,7 @@ def parse_args():
         default="auto",
         help=(
             "Leave as auto: the platform picks float16, or bfloat16 for checkpoints "
-            "that overflow it"
+            "that overflow it. An explicit float16 is overridden for those, with a warning."
         ),
     )
     return parser.parse_args()
@@ -216,10 +216,16 @@ def run_multimodal(args):
         print("-----------------------------------")
 
     if args.compare_with_cpu:
-        compare_multimodal_with_cpu(args, prepared, outputs, sampling_params.max_tokens)
+        compare_multimodal_with_cpu(
+            args,
+            prepared,
+            outputs,
+            sampling_params.max_tokens,
+            llm.llm_engine.model_config.dtype,
+        )
 
 
-def compare_multimodal_with_cpu(args, prepared, outputs, max_tokens):
+def compare_multimodal_with_cpu(args, prepared, outputs, max_tokens, model_dtype):
     """Re-run the same image+question pairs through HuggingFace on CPU.
 
     Both texts are printed rather than compared: free-form answers rarely match
@@ -231,14 +237,14 @@ def compare_multimodal_with_cpu(args, prepared, outputs, max_tokens):
     print("Comparing multimodal results with HF on cpu")
     print("===============")
 
-    import torch
     from PIL import Image
     from transformers import AutoModelForImageTextToText, AutoProcessor
 
     try:
         processor = AutoProcessor.from_pretrained(args.model)
-        # Match the Spyre run's float16 weights, as the text path does.
-        model = AutoModelForImageTextToText.from_pretrained(args.model, dtype=torch.float16)
+        # Whatever the platform settled on: float16 for a bfloat16 checkpoint would
+        # put the NaNs on the oracle's side.
+        model = AutoModelForImageTextToText.from_pretrained(args.model, dtype=model_dtype)
     except Exception as exc:  # noqa: BLE001 - a missing HF-format config is not fatal
         # mistral-format repos may carry no HF processor config, leaving no CPU oracle.
         print(f"Cannot load {args.model} with transformers ({exc}); skipping CPU comparison.")

@@ -306,7 +306,8 @@ class _SpyreModelWrapper:
         keep_outputs_on_device: bool = False,
         logits_row_buckets: list[int] | None = None,
         shape_bucketer: SpyreShapeBucketer | None = None,
-        model_dtype: torch.dtype = torch.float16,
+        *,
+        model_dtype: torch.dtype,
     ):
         # Use object.__setattr__ to avoid triggering __setattr__ override
         object.__setattr__(self, "_model", model)
@@ -471,7 +472,12 @@ class _SpyreModelWrapper:
         return getattr(self._model, name)
 
     def __setattr__(self, name, value):
-        setattr(self._model, name, value)
+        # `__init__` fills our `__dict__` via `object.__setattr__`, so a name in it is
+        # ours, not the model's.
+        if name in self.__dict__:
+            object.__setattr__(self, name, value)
+        else:
+            setattr(self._model, name, value)
 
 
 class TorchSpyreModelRunner(GPUModelRunner):

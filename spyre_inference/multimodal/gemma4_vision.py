@@ -180,10 +180,10 @@ def _pad_norm_weight(norm, orig_head_dim: int, padded_head_dim: int) -> nn.Param
 
 
 def _padded_rms_norm(
-    hidden_states: torch.Tensor, weight, eps: float, orig_head_dim: int
+    hidden_states: torch.Tensor, weight, eps: float, orig_head_dim: int | None
 ) -> torch.Tensor:
-    """RMSNorm with the denominator scaled back to the unpadded head_dim, so the zero
-    padding lanes do not deflate the variance.
+    """RMSNorm with the denominator scaled back to ``orig_head_dim``, so the zero padding
+    lanes do not deflate the variance. ``None`` means the input is not padded.
 
     No fp32 promotion, unlike the hf-adapters reference: torch-spyre does not support it
     (``custom_ops/rms_norm.py``), and an on-device round trip through fp32 leaves a
@@ -191,7 +191,8 @@ def _padded_rms_norm(
     """
     dtype = hidden_states.dtype
     variance = (hidden_states * hidden_states).mean(-1, keepdim=True)
-    variance = variance * (hidden_states.shape[-1] / orig_head_dim)
+    if orig_head_dim is not None and orig_head_dim != hidden_states.shape[-1]:
+        variance = variance * (hidden_states.shape[-1] / orig_head_dim)
     hidden_states = hidden_states * torch.rsqrt(variance + eps)
     if weight is not None:
         # fp32 weights (transformers builds them at the default dtype), so an unguarded
@@ -485,7 +486,7 @@ def patch_rms_norm() -> None:
     promotion, and ``rsqrt`` instead of ``pow(x, -0.5)``, which has no lowering here.
 
     ``forward`` is the patch point, not ``_norm``: stock casts to fp32 in both, and both
-    casts have to go (see ``_padded_rms_norm``).
+    casts have to go.
     """
     try:
         from transformers.models.gemma4 import modeling_gemma4
@@ -497,14 +498,8 @@ def patch_rms_norm() -> None:
         return
 
     def forward(self, hidden_states):
-        # `.to(dtype)` on the weight is stock's trailing `.type_as`, and load-bearing
-        # here: see `_padded_rms_norm`.
-        dtype = hidden_states.dtype
-        mean_squared = (hidden_states * hidden_states).mean(-1, keepdim=True) + self.eps
-        normed_output = hidden_states * torch.rsqrt(mean_squared)
-        if self.with_scale:
-            normed_output = normed_output * self.weight.to(dtype)
-        return normed_output.to(dtype)
+        weight = self.weight if self.with_scale else None
+        return _padded_rms_norm(hidden_states, weight, self.eps, orig_head_dim=None)
 
     forward._spyre_patched = True
     cls.forward = forward

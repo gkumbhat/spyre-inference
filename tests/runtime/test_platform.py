@@ -416,6 +416,18 @@ def test_bfloat16_is_rejected_under_tensor_parallelism():
         TorchSpyrePlatform.check_and_update_config(vllm_config)
 
 
+def test_quantization_is_rejected_with_bfloat16():
+    """``SpyreFp8LinearKernel`` emits float16 only, so FP8 + bf16 must fail at startup."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = _defaults_config(enforce_eager=True, mode=None)
+    vllm_config.model_config.dtype = torch.bfloat16
+    vllm_config.model_config.quantization = "fp8"
+
+    with pytest.raises(ValueError, match="does not support quantization"):
+        TorchSpyrePlatform.check_and_update_config(vllm_config)
+
+
 def test_bfloat16_is_accepted_at_tp1():
     """The guard above must not reject the single-card bf16 path."""
     from spyre_inference.platform import TorchSpyrePlatform
@@ -620,6 +632,35 @@ def test_default_dtype_selects_bfloat16_for_a_multimodal_gemma4_config():
     assert TorchSpyrePlatform._default_dtype(_config(text_cfg)) is torch.float16
     # No hf_config at all (bare VllmConfig) must not crash.
     assert TorchSpyrePlatform._default_dtype(_config(None)) is torch.float16
+
+
+def test_default_dtype_says_so_when_it_overrides_a_requested_float16(caplog):
+    """vLLM resolves ``--dtype`` before this hook, so an explicit float16 is replaced
+    rather than rejected -- which has to be visible."""
+    import logging
+
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vision_cfg = SimpleNamespace(model_type="gemma4", vision_config=object(), audio_config=None)
+
+    def _config(dtype):
+        return SimpleNamespace(
+            model_config=SimpleNamespace(
+                hf_config=vision_cfg,
+                architecture="Gemma4ForConditionalGeneration",
+                dtype=dtype,
+            )
+        )
+
+    with caplog.at_level(logging.WARNING):
+        assert TorchSpyrePlatform._default_dtype(_config(torch.float16)) is torch.bfloat16
+    assert "Overriding the resolved dtype" in caplog.text
+
+    # `--dtype auto` already resolves to the checkpoint's bf16, so no warning there.
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        assert TorchSpyrePlatform._default_dtype(_config(torch.bfloat16)) is torch.bfloat16
+    assert caplog.text == ""
 
 
 def test_default_dtype_stays_float16_when_the_text_backbone_is_pinned():

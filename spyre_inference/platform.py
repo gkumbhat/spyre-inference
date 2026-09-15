@@ -340,7 +340,15 @@ class TorchSpyrePlatform(CpuPlatform):
         )
         if already_chosen or builds_vision_tower:
             if not already_chosen:
-                logger.info("Selecting torch.bfloat16: this checkpoint overflows float16.")
+                resolved = getattr(model_config, "dtype", None)
+                if resolved == torch.bfloat16:
+                    logger.info("Selecting torch.bfloat16: this checkpoint overflows float16.")
+                else:
+                    logger.warning(
+                        "Overriding the resolved dtype %s with torch.bfloat16: this "
+                        "checkpoint overflows float16.",
+                        resolved,
+                    )
             model_config._spyre_requires_bfloat16 = True
             return torch.bfloat16
         return torch.float16
@@ -541,6 +549,16 @@ class TorchSpyrePlatform(CpuPlatform):
                 raise ValueError(
                     f"The model dtype needs to be one of {supported} for spyre, but "
                     f"was specified to be {vllm_config.model_config.dtype}"
+                )
+
+            # SpyreFp8LinearKernel is float16 end to end, its scales and dequantized
+            # weights included.
+            quantization = getattr(vllm_config.model_config, "quantization", None)
+            if quantization is not None and vllm_config.model_config.dtype == torch.bfloat16:
+                raise ValueError(
+                    f"Spyre does not support quantization ({quantization}) with "
+                    f"{torch.bfloat16}: the FP8 linear kernel produces float16 only, and "
+                    "this model requires bfloat16. Run the unquantized checkpoint."
                 )
 
             # Pad attention head_dim up to a stick-aligned size on the native path.
