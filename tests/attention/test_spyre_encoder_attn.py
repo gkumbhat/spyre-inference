@@ -742,8 +742,8 @@ def _assert_pad_mask(meta, real_len: int) -> None:
     assert key_pad is not None
     key_cpu = key_pad.cpu() if key_pad.device.type != "cpu" else key_pad
     # Query axis stays 1: the same key-pad row applies to every query row and the
-    # compiled add in _packed_pv broadcasts it. A dense [.., L, L] here would be
-    # 6.3 MB fp16 at Hkv=12, L=512 (~7 ms H2D per step).
+    # compiled add in _packed_masked_attention_fused broadcasts it. A dense
+    # [.., L, L] here would be 6.3 MB fp16 at Hkv=12, L=512 (~7 ms H2D per step).
     assert key_cpu.shape[-2] == 1
     assert key_cpu.shape[-1] == meta.encoder_pack_len
     assert key_cpu[0, 0, 0, 0].item() == 0.0
@@ -851,8 +851,8 @@ def test_packed_masked_qk_matches_softmax_reference():
     torch.testing.assert_close(got, ref, atol=1e-4, rtol=1e-4)
 
 
-def test_packed_attention_compiles_matmul_without_mask(monkeypatch) -> None:
-    """Serve must not compile ``matmul + mask`` (Inductor → SDPA drops pad)."""
+def test_packed_attention_compiles_a_single_fused_kernel(monkeypatch) -> None:
+    """QKᵀ, mask-add, softmax, P·V compile as one graph (torch-spyre#4526 fixed; issue #887)."""
     seen: list[str] = []
     real = encoder_attn._compile_if_spyre
 
@@ -869,7 +869,40 @@ def test_packed_attention_compiles_matmul_without_mask(monkeypatch) -> None:
     mask = build_attention_mask(batch, length, [5, 12], [5, 12], dtype=query.dtype)
     key_pad = encoder_attn.host_key_pad_mask(mask, heads)
     encoder_attn._packed_masked_attention(query, key, value, key_pad, dim**-0.5)
-    assert seen == ["_packed_qk_matmul", "_packed_pv"]
+    assert seen == ["_packed_masked_attention_fused"]
+
+
+def test_packed_masked_attention_honours_mask_at_4526_boundary_shape():
+    """Regression for torch-spyre#4526: a masked, non-full-bucket prompt (BGE-style ``T != L``).
+
+    Pad rows carry large-magnitude garbage so a dropped mask pollutes the real rows visibly;
+    checked by cosine similarity (not just tolerance) so a future Inductor rewrite regression
+    fails loudly instead of as a tolerance flake.
+    """
+    torch.manual_seed(0)
+    batch, heads, length, dim = 1, 12, 512, 64
+    real_len = 345
+    query = torch.randn(batch, heads, length, dim)
+    key = torch.randn(batch, heads, length, dim)
+    value = torch.randn(batch, heads, length, dim)
+    query[:, :, real_len:] = 8.0
+    key[:, :, real_len:] = 8.0
+    value[:, :, real_len:] = -8.0
+    mask = build_attention_mask(1, length, [real_len], [real_len], dtype=query.dtype)
+    key_pad = encoder_attn.host_key_pad_mask(mask, heads)
+    got = encoder_attn._packed_masked_attention(query, key, value, key_pad, dim**-0.5)
+
+    ref = torch.matmul(
+        torch.softmax(
+            torch.matmul(query, key.transpose(-2, -1)) * (dim**-0.5) + mask[:, :, :1, :],
+            dim=-1,
+        ),
+        value,
+    )
+    cos = torch.nn.functional.cosine_similarity(
+        got[:, :, :real_len].reshape(-1), ref[:, :, :real_len].reshape(-1), dim=0
+    )
+    assert cos.item() > 0.99
 
 
 def _assert_scatter_matches_gather(

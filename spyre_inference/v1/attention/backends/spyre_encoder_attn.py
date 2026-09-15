@@ -23,9 +23,10 @@ is address-order-preserving. Default-layout ``view`` after ``index_copy_``
 scrambles B>1 (real-slot cosine ~0.07). Body-pad dests write an extra
 dummy row (not slot 0 — that is CLS). Unpack is ``index_select``. ``B=1``
 with ``T == L`` and a full prompt compiles permute+SDPA (no ``attn_mask``).
-Any live pad uses packed QK: compile matmul only, eager pad add, compile P·V
-(Inductor ``matmul + mask`` → ``F.sdpa`` drops the mask; BGE cosine
-~0.46). Dest/mask use ``min(qsl, seq_lens, num_actual_tokens)``.
+Any live pad uses packed attention: QKᵀ, mask-add, softmax, and P·V compiled
+as one graph (torch-spyre#4526, the Inductor rewrite that silently dropped
+``attn_mask``, is fixed upstream; see issue #887). Dest/mask use
+``min(qsl, seq_lens, num_actual_tokens)``.
 Dest/unpack stay on host when ``T == L``. Pack tensors are built once
 per step.
 """
@@ -270,8 +271,8 @@ def host_key_pad_mask(mask: torch.Tensor, num_kv_heads: int) -> torch.Tensor:
     materialising. This shape was previously rejected because an *eager* Spyre
     add cannot broadcast ``1 → L`` on the query axis (no stick-scatter), which
     forced a dense ``[B*KV, 1, L, L]``. The add now happens inside the compiled
-    ``_packed_pv``, where Inductor broadcasts it, so the dense form is no longer
-    needed and it was expensive.
+    ``_packed_masked_attention_fused``, where Inductor broadcasts it, so the
+    dense form is no longer needed and it was expensive.
 
     Broadcasting also covers the GQA head axis (``G``), so the caller no longer
     needs an eager ``expand_as(...).contiguous()`` either.
@@ -285,34 +286,27 @@ def host_key_pad_mask(mask: torch.Tensor, num_kv_heads: int) -> torch.Tensor:
     )
 
 
-def _packed_qk_matmul(query: torch.Tensor, key: torch.Tensor, scale: float) -> torch.Tensor:
-    """``[B, H, L, D]`` → scores ``[B*Hkv, G, L, L]``. Mask stays out of this graph."""
+def _packed_masked_attention_fused(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    mask: torch.Tensor,
+    scale: float,
+) -> torch.Tensor:
+    """``[B, H, L, D]`` → QKᵀ, mask-add, softmax, P·V -- one compiled graph.
+
+    torch-spyre#4526 (Inductor rewrites ``matmul + mask + softmax + matmul``
+    into an internal SDPA-equivalent that silently drops ``attn_mask``) is
+    fixed upstream, so QK and P·V no longer need separate graph boundaries;
+    see issue #887.
+    """
     batch, hq, length, dim = query.shape
     hkv = key.shape[1]
     g = hq // hkv
     q = query.reshape(batch, hkv, g, length, dim).reshape(batch * hkv, g, length, dim)
     k = key.reshape(batch * hkv, 1, length, dim)
-    return torch.matmul(q, k.transpose(-2, -1)) * scale
-
-
-def _packed_pv(scores: torch.Tensor, mask: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
-    """Add the pad mask, softmax, then P·V -- all in one compiled graph.
-
-    The mask add belongs here rather than in the caller: eager, it is one op on
-    a ``[B*Hkv, G, L, L]`` tensor per layer per request,
-    and every prompt that does not exactly fill its bucket takes this path
-    (``_is_b1_fused_sdpa`` needs ``real_len == aligned_len``), so short prompts
-    paid it on all layers.
-
-    Safe against the rewrite ``_packed_qk_matmul`` guards: Inductor turns
-    ``matmul + mask`` into ``F.sdpa`` -- which drops ``attn_mask`` on Spyre --
-    only when it can see Q·Kᵀ *and* P·V in one graph. This graph has just P·V,
-    and QK stays compiled separately with the mask still out of it.
-    """
-    batch, hkv, length, dim = value.shape
-    g = scores.shape[1]
     v = value.reshape(batch * hkv, 1, length, dim)
-    scores = scores + mask
+    scores = torch.matmul(q, k.transpose(-2, -1)) * scale + mask
     scores_max = torch.amax(scores, dim=-1, keepdim=True)
     # Dummy seqs (batch_bucket > num_seqs) have all-inf key_pad, so
     # scores - scores_max is NaN. Decoder documents the same hazard where an
@@ -330,20 +324,11 @@ def _packed_masked_attention(
     mask: torch.Tensor,
     scale: float,
 ) -> torch.Tensor:
-    """Scatter-path attention. Compile QK separately from mask + softmax + P·V.
-
-    Compiling ``matmul + mask`` lets Inductor rewrite to ``F.sdpa``, which drops
-    ``attn_mask`` on Spyre -- so the mask must stay out of
-    the Q·Kᵀ graph. It does live in the P·V graph, which cannot form that
-    pattern; see ``_packed_pv``.
-    """
-    device_type = query.device.type
-    qk = _compile_if_spyre(_packed_qk_matmul, device_type)
-    pv = _compile_if_spyre(_packed_pv, device_type)
-    # No eager expand: the mask is ``[B*KV, 1, 1, L]`` and the compiled add in
-    # ``pv`` broadcasts both the GQA head axis and the query axis.
-    scores = _call_kernel("packed encoder QK", qk, query, key, scale)
-    return _call_kernel("packed encoder P.V", pv, scores, mask, value)
+    """Scatter-path attention: QKᵀ, mask-add, softmax, P·V in one compiled graph."""
+    kernel = _compile_if_spyre(_packed_masked_attention_fused, query.device.type)
+    # No eager expand: the mask is ``[B*KV, 1, 1, L]`` and the compiled add
+    # broadcasts both the GQA head axis and the query axis.
+    return _call_kernel("packed encoder attention", kernel, query, key, value, mask, scale)
 
 
 def _b1_dense_attention(
@@ -761,8 +746,7 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
     packs Q/K/V with scatter into a slot-major workspace (decoder KV
     layout; extra dummy row for body-pad), then attention and gather-unpack.
     ``B=1`` ``T == L`` with a full prompt compiles permute+SDPA; live pad
-    uses packed QK (matmul and P·V compiled apart so Inductor cannot fuse
-    to ``F.sdpa``).
+    uses packed attention (QKᵀ, mask-add, softmax, P·V compiled as one graph).
     """
 
     def __init__(self, *args, **kwargs) -> None:
