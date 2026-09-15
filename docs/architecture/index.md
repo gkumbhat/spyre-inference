@@ -260,42 +260,34 @@ Encoder-only (embedding) models take a separate path. For `ENCODER`/`ENCODER_ONL
 layers, `TorchSpyrePlatform.get_attn_backend_cls` selects `SpyreEncoderAttentionBackend`
 → `SpyreEncoderAttentionImpl` (both subclass the decoder backend/impl in
 `spyre_encoder_attn.py`). This path has **no KV cache** — attention is bidirectional over
-the full sequence — so it skips the paged-cache machinery entirely and instead:
+the full sequence — so it skips the paged-cache machinery. The packed `[T, H, D]` list
+goes to a blocked flash kernel whole; request boundaries ride in int32 row-index tables
+(offsets are data, not shapes):
 
-1. Builds the pack **indices** and the additive mask on CPU (Spyre can't produce the bool
-   mask or broadcast the `where`), then scatters ragged Q/K/V into the dense
-   `[num_seqs, H, L, Dp]` batch **on Spyre** with a compiled `index_copy_`. Sequence length
-   `L` padding to the `ENCODER_SEQ_ALIGNMENT = 64` stick is structural (the zero rows of
-   the on-device workspace); head dim `D` is padded to the stick only when it isn't already
-   aligned — a host `F.pad` round-trip for MiniLM's `head_size=32`, a no-op for `D=64`.
-2. Runs the attention **on Spyre**: a fused `F.scaled_dot_product_attention` on the B=1,
-   no-live-pad path, or — on the additive-mask path — a compiled QK matmul, an on-device
-   (eager) mask add, and a compiled P·V. The matmuls are kept separate so Inductor can't
-   fuse them into `F.sdpa`, which drops the additive mask on Spyre.
-3. Unpacks with an on-Spyre `index_select` and writes back with `output.copy_` on Spyre. A
-   CPU round-trip remains only for non-stick-aligned head dims (MiniLM `D=32`), which slice
-   `D` back on the host.
+1. First encoder layer of the step builds one `EncoderSeqPlan` per request (row table +
+   64-token mask tiles) and stashes it on `attn_metadata.encoder_seq_plans` for the rest
+   of the stack.
+2. The kernel gathers that sequence in-graph (`index_select`), walks KV in
+   `ENCODER_BLOCK_SIZE = 64` blocks with a running softmax max/sum, and writes back with
+   `index_copy_`. There is no host slice (torch-spyre#3770) and no identity gather
+   (torch-spyre#4033).
+3. The only compile axis is the per-request block count (power of two). Body `T` stays a
+   1D `compile_sizes` bucket; there is no dense `(B, L)` grid or `[B, 1, L, L]` mask.
 
-## Encoder / embedding models: target state
+## Encoder / embedding models: compile shape axes
 
-Everything above describes what is implemented today. The diagram below is a **target
-state** — where the encoder path is heading once the compile-mode work lands, and not a
-description of current behaviour.
-
-The shape of that target: the model body compiled once per token bucket, attention
-shape-managed separately behind the opaque custom-op boundary, and a warmup that walks
-both sets of shape buckets so nothing compiles on the first request.
+The model body is compiled once per token bucket. Attention is shape-managed separately
+behind the opaque custom-op boundary; its axis is the per-request flash block count, not
+a dense `(S, L)` grid.
 
 <figure markdown="span">
   ![Encoder target state](encoder-ideal-state.svg){: style="width: 140%; max-width: 1400px; margin-left: -20%" }
   <figcaption>
-    Target architecture for encoder / embedding models under
-    <code>STOCK_TORCH_COMPILE</code>. Two shape axes are bucketed independently: the
-    token count <code>T</code> for the model body, and <code>(S, L)</code> for
-    attention's dense grid — they are decoupled because attention builds its grid by
-    gathering rows rather than by being handed a reshaped tensor. The foot of the
-    diagram contrasts today's dense-grid strategy with the planned flash-style variant,
-    which would collapse the second axis and converge on the upstream design.
+    Architecture for encoder / embedding models under
+    <code>STOCK_TORCH_COMPILE</code>. The body is bucketed on packed token count
+    <code>T</code>. Attention is blocked flash over that packed list (the flash-style
+    variant at the foot of the diagram), so the second axis is a per-request block
+    count rather than a dense <code>(S, L)</code> grid.
   </figcaption>
 </figure>
 

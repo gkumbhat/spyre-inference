@@ -43,20 +43,21 @@ Spyre compile is on by default (`STOCK_TORCH_COMPILE`, `dynamic=False`). Pass
 
 - **Body** (Linear / LN): pad the packed token count to the next 1D
   `compile_sizes` bucket `T` (same dispatch as the decoder).
-- **Attention** (SDPA): gather into a dense `(B, L)` grid. This is the Spyre
-  workaround until flash-style attention lands; the body is not rewritten to
-  `T = B × L`.
+- **Attention** (flash): blocked online-softmax over the packed list, gathering
+  each request's own rows in-graph. There is no dense `(B, L)` grid and no
+  rewrite of body `T`; the only compile axis is a request's KV block count
+  (a power of two, `ENCODER_BLOCK_SIZE = 64` tokens per block).
 
 `compile_sizes` for pooling is the body `T` buckets (`64, 128, …` up to the
-token cap). Attention `L` comes from `--max-model-len` (`64, 128, …`).
-Attention `B` is powers of two up to `--max-num-seqs` (same as decoder).
+token cap).
 
-A 3-seq × 30-token request with `--max-num-seqs 4` pads the body to `T=128`
-and attention to `(B=4, L=64)`. Masks and pooling still use the real lengths.
+A 3-seq × 30-token request with `--max-num-seqs 4` pads the body to `T=128`;
+attention still sees the real per-sequence lengths (1 block each here).
 
-Compiled pooling warmup dummies 1D body sizes, then each attention `(B, L)`
-at full size. Eager pooling uses one short dummy, then runtime still
-1D-pads the body.
+Compiled pooling warmup dummies each 1D body size; that alone traces every
+block-count variant reachable at that size (`force_attention=True`, so the
+dummy run actually reaches the attention kernel). Eager pooling uses one
+short dummy, then runtime still 1D-pads the body.
 
 Example:
 

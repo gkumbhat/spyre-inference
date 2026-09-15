@@ -270,14 +270,14 @@ class TorchSpyrePlatform(CpuPlatform):
             if all(s not in vllm_config.compilation_config.custom_ops for s in ("all", "none")):
                 vllm_config.compilation_config.custom_ops.append("all")
 
-            # Body: 1D compile_sizes (packed token counts). Attention (B, L)
-            # is independent — see SpyreEncoderAttentionImpl gather-pack.
+            # Body: 1D compile_sizes (packed token counts). Encoder flash is
+            # varlen on that list — see SpyreEncoderAttentionImpl.
             # Honor a user-set list (#638); otherwise generate defaults.
             if vllm_config.compilation_config.compile_sizes:
                 compile_sizes = vllm_config.compilation_config.compile_sizes
             else:
                 # Largest default bucket: scheduler limit and 512 (Spyre max).
-                # Pooling has no 512 limit -- encoder attention compiles (B, L) cells,
+                # Pooling has no 512 limit -- encoder flash reads the packed list,
                 # not a 512-token body. 2048 is the measured throughput argmax across
                 # pooling models; they regress above it.
                 is_pooling = vllm_config.model_config.runner_type == "pooling"
@@ -347,8 +347,8 @@ class TorchSpyrePlatform(CpuPlatform):
 
     @classmethod
     def get_attn_backend_cls(cls, selected_backend, *args, **kwargs) -> str:
-        # Encoder (pooling) layers have no KV cache and run bidirectional SDPA;
-        # decoders use the paged backend. vLLM passes attn_type via the selector
+        # Encoder (pooling) layers have no KV cache and run bidirectional flash
+        # attention; decoders use the paged backend. vLLM passes attn_type via the selector
         # config, so the choice lives here rather than as a branch in the impl.
         from vllm.v1.attention.backend import AttentionType
 
