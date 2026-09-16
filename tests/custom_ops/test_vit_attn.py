@@ -12,8 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for `spyre_inference/custom_ops/vit_attn.py`. CPU-only: correctness of
-the padding/masking math, checked against plain unpadded SDPA."""
+"""Tests for `spyre_inference/custom_ops/vit_attn.py`. CPU-only.
+
+The padding/masking math itself is `multimodal.utils.padded_sdpa`, already covered
+by `tests/multimodal/test_pixtral.py`; these tests cover this module's own surface:
+the `[B,S,H,D]` rearrange wrapper, the full-attend mask cache, and registration.
+"""
 
 from __future__ import annotations
 
@@ -21,7 +25,7 @@ import einops
 import torch
 import torch.nn.functional as F
 
-from spyre_inference.custom_ops.vit_attn import _padded_apply_sdpa, register
+from spyre_inference.custom_ops.vit_attn import _full_attend_mask, _padded_apply_sdpa, register
 
 
 def _reference_apply_sdpa(q, k, v, scale=None, enable_gqa=False):
@@ -34,36 +38,24 @@ def _reference_apply_sdpa(q, k, v, scale=None, enable_gqa=False):
     return einops.rearrange(out, "b h s d -> b s h d")
 
 
-def _random_qkv(batch, seq_q, seq_kv, heads, head_size, seed=0):
+def _random_qkv(batch, seq, heads, head_size, seed=0):
     g = torch.Generator().manual_seed(seed)
-    q = torch.randn(batch, seq_q, heads, head_size, generator=g)
-    k = torch.randn(batch, seq_kv, heads, head_size, generator=g)
-    v = torch.randn(batch, seq_kv, heads, head_size, generator=g)
+    q = torch.randn(batch, seq, heads, head_size, generator=g)
+    k = torch.randn(batch, seq, heads, head_size, generator=g)
+    v = torch.randn(batch, seq, heads, head_size, generator=g)
     return q, k, v
 
 
 class TestPaddedApplySdpaMatchesReference:
     def test_clip_vit_b32_shape(self):
         # B=1, H=12, seq=50 (7x7 patches + CLS), D=64 -- the shape that crashed.
-        q, k, v = _random_qkv(batch=1, seq_q=50, seq_kv=50, heads=12, head_size=64)
-        expected = _reference_apply_sdpa(q, k, v)
-        actual = _padded_apply_sdpa(q, k, v)
-        torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
-
-    def test_head_dim_also_needs_padding(self):
-        q, k, v = _random_qkv(batch=2, seq_q=37, seq_kv=37, heads=4, head_size=48)
+        q, k, v = _random_qkv(batch=1, seq=50, heads=12, head_size=64)
         expected = _reference_apply_sdpa(q, k, v)
         actual = _padded_apply_sdpa(q, k, v)
         torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
 
     def test_already_aligned_shape_takes_the_no_pad_branch(self):
-        q, k, v = _random_qkv(batch=1, seq_q=64, seq_kv=64, heads=8, head_size=64)
-        expected = _reference_apply_sdpa(q, k, v)
-        actual = _padded_apply_sdpa(q, k, v)
-        torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
-
-    def test_cross_attention_shape_with_different_seq_q_and_seq_kv(self):
-        q, k, v = _random_qkv(batch=1, seq_q=17, seq_kv=50, heads=4, head_size=32)
+        q, k, v = _random_qkv(batch=1, seq=64, heads=8, head_size=64)
         expected = _reference_apply_sdpa(q, k, v)
         actual = _padded_apply_sdpa(q, k, v)
         torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
@@ -76,6 +68,19 @@ class TestPaddedApplySdpaMatchesReference:
         expected = _reference_apply_sdpa(q, k, v, enable_gqa=True)
         actual = _padded_apply_sdpa(q, k, v, enable_gqa=True)
         torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+class TestFullAttendMaskCache:
+    def test_same_length_returns_the_same_object(self):
+        # padded_sdpa's own mask cache is keyed on this tensor's identity, so a
+        # stable object per length is what makes it actually hit across layers.
+        assert _full_attend_mask(50) is _full_attend_mask(50)
+
+    def test_different_lengths_return_different_objects(self):
+        assert _full_attend_mask(50) is not _full_attend_mask(64)
+
+    def test_attends_everywhere(self):
+        assert _full_attend_mask(17).all()
 
 
 class TestRegister:
