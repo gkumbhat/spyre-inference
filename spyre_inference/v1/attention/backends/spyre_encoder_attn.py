@@ -59,23 +59,25 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     note_unattributed_compiles,
 )
 
-# KV block width, in tokens. One Spyre stick of fp16. The only remaining use
-# is as the length-bucket granularity -- there is no per-block loop anymore.
-ENCODER_BLOCK_SIZE = 64
+# One Spyre stick of fp16, in tokens. A padded length that is a multiple of this
+# keeps the row-index table stick-aligned and the matmul's contraction dimension
+# aligned, and it is the width of a shared mask tile. Encoder attention has no KV
+# cache and so no block walk -- this is alignment, not a block size.
+ENCODER_LEN_ALIGNMENT = 64
 
 
-def _blocks_for(length: int) -> int:
-    """Block count covering ``length`` tokens, rounded up to a power of two.
+def _alignment_units_for(length: int) -> int:
+    """Stick-aligned units covering ``length``, rounded up to a power of two.
 
-    Encoder self-attention has ``q_len == kv_len``, so this single number fixes
-    the sequence's padded extent (``num_blocks * ENCODER_BLOCK_SIZE``) -- the
-    attention kernel's cache has one shape axis, not two. Rounding to a power
-    of two keeps that axis to a handful of buckets, matching the ladder
-    ``_powers_of_two_up_to`` gives decoder attention.
+    Encoder self-attention has ``q_len == kv_len``, so this fixes the sequence's
+    padded extent (``units * ENCODER_LEN_ALIGNMENT``) -- the attention kernel's
+    cache has one shape axis, not two. Rounding to a power of two keeps that axis
+    to a handful of buckets, at the cost of padding a request up to the next one:
+    a 260-token request attends over 512, not 320.
     """
-    blocks = max(1, (length + ENCODER_BLOCK_SIZE - 1) // ENCODER_BLOCK_SIZE)
+    units = max(1, (length + ENCODER_LEN_ALIGNMENT - 1) // ENCODER_LEN_ALIGNMENT)
     bucket = 1
-    while bucket < blocks:
+    while bucket < units:
         bucket *= 2
     return bucket
 
@@ -203,7 +205,7 @@ def encoder_index_dtype(device: torch.device) -> torch.dtype:
 def encoder_row_table(start: int, query_len: int, extent: int, dtype: torch.dtype) -> torch.Tensor:
     """One sequence's absolute rows, pad lanes clamped to its last real row.
 
-    ``extent`` is a multiple of ``ENCODER_BLOCK_SIZE`` and therefore of
+    ``extent`` is a multiple of ``ENCODER_LEN_ALIGNMENT`` and therefore of
     ``INT32_ELEMS_PER_STICK``, so the table is stick-aligned with no extra pad.
     """
     return torch.arange(extent, dtype=dtype).clamp(max=query_len - 1) + start
@@ -220,7 +222,7 @@ def _const_tile(
     tile = None if cache is None else cache.get(cache_key)
     if tile is None:
         fill = torch.finfo(dtype).min if masked else 0.0
-        host = torch.full((1, 1, 1, ENCODER_BLOCK_SIZE), fill, dtype=dtype)
+        host = torch.full((1, 1, 1, ENCODER_LEN_ALIGNMENT), fill, dtype=dtype)
         tile = convert(host, device)
         if cache is not None:
             cache[cache_key] = tile
@@ -246,19 +248,19 @@ def encoder_mask(
     padding) are shared constants handed out by reference from ``cache``, so only
     the one tile straddling ``kv_len`` -- if any -- is request-specific.
     """
-    num_blocks = extent // ENCODER_BLOCK_SIZE
+    num_tiles = extent // ENCODER_LEN_ALIGNMENT
     tiles: list[torch.Tensor] = []
-    for i in range(num_blocks):
-        lo = i * ENCODER_BLOCK_SIZE
-        if lo + ENCODER_BLOCK_SIZE <= kv_len:
+    for i in range(num_tiles):
+        lo = i * ENCODER_LEN_ALIGNMENT
+        if lo + ENCODER_LEN_ALIGNMENT <= kv_len:
             tiles.append(_const_tile(False, dtype, device, cache))
         elif lo >= kv_len:
             tiles.append(_const_tile(True, dtype, device, cache))
         else:
-            host = torch.full((1, 1, 1, ENCODER_BLOCK_SIZE), torch.finfo(dtype).min, dtype=dtype)
+            host = torch.full((1, 1, 1, ENCODER_LEN_ALIGNMENT), torch.finfo(dtype).min, dtype=dtype)
             host[..., : kv_len - lo] = 0
             tiles.append(convert(host, device))
-    return tiles[0] if num_blocks == 1 else torch.cat(tiles, dim=-1)
+    return tiles[0] if num_tiles == 1 else torch.cat(tiles, dim=-1)
 
 
 def dense_sdpa_reference(
@@ -309,7 +311,7 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         # Grouping only pays off through the compiled kernels; in eager mode the
         # per-request loop has no launch overhead to amortise.
         self._batched_attn = self._compile_attn and envs.SPYRE_ENCODER_BATCHED_ATTN
-        # Mask tiles are shape-only (depend only on kv_len's block boundary,
+        # Mask tiles are shape-only (depend only on kv_len's tile boundary,
         # not on which request/layer/step), so one device copy each serves
         # every sequence, layer and step.
         self._const_tiles: dict[tuple, torch.Tensor] = {}
@@ -320,7 +322,8 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         from vllm.config import get_current_vllm_config
 
         self._max_extent = (
-            _blocks_for(get_current_vllm_config().model_config.max_model_len) * ENCODER_BLOCK_SIZE
+            _alignment_units_for(get_current_vllm_config().model_config.max_model_len)
+            * ENCODER_LEN_ALIGNMENT
         )
 
     def _run_gather(self, query, key, value, row_index):
@@ -377,7 +380,7 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         dtype, device = query.dtype, query.device
         index_dtype = encoder_index_dtype(device)
 
-        extent = ENCODER_BLOCK_SIZE
+        extent = ENCODER_LEN_ALIGNMENT
         max_extent = min(buffer_rows, self._max_extent)
         while extent <= max_extent:
             rows = convert(encoder_row_table(0, extent, extent, index_dtype), device)
@@ -430,7 +433,7 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
                 continue
             query_len = min(query_len, num_tokens - start)
             kv_len = min(int(seq_lens[seq_idx]), query_len)
-            extent = _blocks_for(max(query_len, kv_len)) * ENCODER_BLOCK_SIZE
+            extent = _alignment_units_for(max(query_len, kv_len)) * ENCODER_LEN_ALIGNMENT
             by_extent.setdefault(extent, []).append((start, query_len, kv_len))
 
         def plan(members: list[tuple[int, int, int]], extent: int) -> EncoderSeqPlan:

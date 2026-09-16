@@ -281,7 +281,7 @@ processed one sequence at a time, dense; request boundaries ride in int32 row-in
    compiles once per distinct sequence length, not once per `(buffer size, length)` pair.
 4. There is no host slice (torch-spyre#3770) and no identity gather (torch-spyre#4033).
    The only compile axis is the per-request padded length (a power of two, in
-   `ENCODER_BLOCK_SIZE = 64` steps). Body `T` stays a 1D `compile_sizes` bucket; there is no
+   `ENCODER_LEN_ALIGNMENT = 64` steps). Body `T` stays a 1D `compile_sizes` bucket; there is no
    dense `(B, L)` grid or `[B, 1, L, L]` mask.
 
 ## Encoder / embedding models: compile shape axes

@@ -43,11 +43,14 @@ Spyre compile is on by default (`STOCK_TORCH_COMPILE`, `dynamic=False`). Pass
 
 - **Body** (Linear / LN): pad the packed token count to the next 1D
   `compile_sizes` bucket `T` (same dispatch as the decoder).
-- **Attention**: dense per-sequence `QKᵀ -> mask -> softmax -> ·V`, gathering
-  each request's own rows via a separately compiled kernel first. There is no
-  dense `(B, L)` grid and no rewrite of body `T`; the only compile axis is a
-  request's own padded length (a power of two, `ENCODER_BLOCK_SIZE = 64`
-  tokens per step).
+- **Attention**: `F.scaled_dot_product_attention` per group of equal-length
+  requests, gathering their rows via a separately compiled kernel first. There is
+  no dense `(B, L)` grid and no rewrite of body `T`; the compile axes are a
+  request's own padded length (a power of two, `ENCODER_LEN_ALIGNMENT = 64` tokens)
+  and the group size. Requests sharing a padded length are served by one
+  gather/attend/store, since these kernels are dispatch-bound rather than
+  compute-bound. Set `SPYRE_ENCODER_BATCHED_ATTN=0` to serve them one at a time,
+  which shortens warmup at a throughput cost.
 
 `compile_sizes` for pooling is the body `T` buckets (`64, 128, …` up to the
 token cap).

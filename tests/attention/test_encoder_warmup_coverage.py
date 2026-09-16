@@ -30,9 +30,9 @@ from torch._dynamo.utils import counters
 
 from spyre_inference.v1.attention.backends import spyre_attn
 from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
-    ENCODER_BLOCK_SIZE,
+    ENCODER_LEN_ALIGNMENT,
     SpyreEncoderAttentionImpl,
-    _blocks_for,
+    _alignment_units_for,
 )
 
 
@@ -92,7 +92,7 @@ class TestWarmKernelsCoversTheBucket:
         )
 
         expected_extents = set()
-        extent = ENCODER_BLOCK_SIZE
+        extent = ENCODER_LEN_ALIGNMENT
         while extent <= buffer_rows:
             expected_extents.add(extent)
             extent *= 2
@@ -270,18 +270,18 @@ class TestWarmKernelsCoversTheBucket:
 
     def test_a_real_sequence_at_any_length_lands_on_a_warmed_extent(self):
         """Every length a body bucket can hold maps onto an extent ``_warm_kernels``
-        visited -- checked against ``_blocks_for`` directly, since that is what
+        visited -- checked against ``_alignment_units_for`` directly, since that is what
         ``_build_plans`` uses to pick a request's extent."""
         buffer_rows = 512
         warmed_extents = set()
-        extent = ENCODER_BLOCK_SIZE
+        extent = ENCODER_LEN_ALIGNMENT
         while extent <= buffer_rows:
             warmed_extents.add(extent)
             extent *= 2
 
         checked = 0
         for length in range(1, buffer_rows + 1, 7):
-            assert _blocks_for(length) * ENCODER_BLOCK_SIZE in warmed_extents
+            assert _alignment_units_for(length) * ENCODER_LEN_ALIGNMENT in warmed_extents
             checked += 1
         assert checked > 20, "too few lengths checked -- test is near-vacuous"
 
@@ -341,6 +341,9 @@ def test_warmup_stops_at_the_longest_reachable_extent(monkeypatch):
     """
     impl = _make_impl()
     monkeypatch.setattr(impl, "_max_extent", 128)
+    # Grouping gathers group*extent rows, which legitimately exceeds the extent;
+    # this test is about the extent axis, so measure it on its own.
+    monkeypatch.setattr(impl, "_batched_attn", False)
     seen: set[int] = set()
     real_run_gather = impl._run_gather
 

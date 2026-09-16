@@ -26,9 +26,9 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyrePagedKVCache,
 )
 from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
-    ENCODER_BLOCK_SIZE,
+    ENCODER_LEN_ALIGNMENT,
     SpyreEncoderAttentionImpl,
-    _blocks_for,
+    _alignment_units_for,
     _create_dense_attn_kernel,
     _encoder_gather_kernel,
     dense_sdpa_reference,
@@ -250,16 +250,24 @@ def ref_encoder_attn(
     return torch.cat(outputs, dim=0)
 
 
-def test_blocks_for_rounds_up_to_powers_of_two():
-    assert [_blocks_for(n) for n in (1, 64, 65, 128, 129, 200, 512)] == [1, 1, 2, 2, 4, 4, 8]
+def test_alignment_units_for_rounds_up_to_powers_of_two():
+    assert [_alignment_units_for(n) for n in (1, 64, 65, 128, 129, 200, 512)] == [
+        1,
+        1,
+        2,
+        2,
+        4,
+        4,
+        8,
+    ]
 
 
 def test_encoder_mask_cuts_at_the_boundary_block():
-    mask = encoder_mask(3 * ENCODER_BLOCK_SIZE, 100, torch.float32, torch.device("cpu"), {})
+    mask = encoder_mask(3 * ENCODER_LEN_ALIGNMENT, 100, torch.float32, torch.device("cpu"), {})
     masked = torch.finfo(torch.float32).min
     # Head and query axes stay 1 and broadcast: an encoder mask depends only on
     # the KV column, so it need not be materialised per head.
-    assert mask.shape == (1, 1, 1, 3 * ENCODER_BLOCK_SIZE)
+    assert mask.shape == (1, 1, 1, 3 * ENCODER_LEN_ALIGNMENT)
     # Block 0 (cols 0:64) is all real keys, block 1 (64:128) straddles
     # kv_len=100, block 2 (128:192) is all padding.
     assert torch.equal(mask[..., :64], torch.zeros_like(mask[..., :64]))
@@ -269,12 +277,12 @@ def test_encoder_mask_cuts_at_the_boundary_block():
 
 
 def test_encoder_mask_single_block_skips_the_cat():
-    mask = encoder_mask(ENCODER_BLOCK_SIZE, 64, torch.float32, torch.device("cpu"), {})
-    assert mask.shape == (1, 1, 1, ENCODER_BLOCK_SIZE)
+    mask = encoder_mask(ENCODER_LEN_ALIGNMENT, 64, torch.float32, torch.device("cpu"), {})
+    assert mask.shape == (1, 1, 1, ENCODER_LEN_ALIGNMENT)
 
 
 def test_row_table_clamps_padding_lanes_to_the_last_real_row():
-    rows = encoder_row_table(10, 3, ENCODER_BLOCK_SIZE, torch.int64)
+    rows = encoder_row_table(10, 3, ENCODER_LEN_ALIGNMENT, torch.int64)
     assert rows[:3].tolist() == [10, 11, 12]
     # Padding lanes repeat row 12 so the gather never reads the next request.
     assert rows[3:].unique().tolist() == [12]
@@ -289,7 +297,7 @@ def test_dense_attn_kernel_never_calls_arange(monkeypatch):
     """
     length = 70
     num_heads, num_kv_heads, head_size = 4, 4, 64
-    extent = _blocks_for(length) * ENCODER_BLOCK_SIZE
+    extent = _alignment_units_for(length) * ENCODER_LEN_ALIGNMENT
     torch.manual_seed(0)
     q_rows = torch.randn(extent, num_heads, head_size, dtype=torch.float32)
     k_rows = torch.randn(extent, num_kv_heads, head_size, dtype=torch.float32)
@@ -312,7 +320,7 @@ def test_dense_attn_kernel_never_calls_arange(monkeypatch):
 def test_gather_kernel_never_calls_arange(monkeypatch):
     length = 70
     num_heads, num_kv_heads, head_size = 4, 4, 64
-    extent = _blocks_for(length) * ENCODER_BLOCK_SIZE
+    extent = _alignment_units_for(length) * ENCODER_LEN_ALIGNMENT
     torch.manual_seed(0)
     query = torch.randn(extent, num_heads, head_size, dtype=torch.float32)
     key = torch.randn(extent, num_kv_heads, head_size, dtype=torch.float32)
@@ -347,7 +355,7 @@ def _dense_attn(
     out = torch.zeros_like(query)
     start = 0
     for length in query_lens:
-        extent = _blocks_for(length) * ENCODER_BLOCK_SIZE
+        extent = _alignment_units_for(length) * ENCODER_LEN_ALIGNMENT
         row_index = encoder_row_table(start, length, extent, index_dtype)
         mask = encoder_mask(extent, length, query.dtype, query.device, tile_cache)
         q_rows, k_rows, v_rows = _encoder_gather_kernel(query, key, value, row_index)
@@ -423,8 +431,11 @@ def test_dense_kernel_matches_dense_sdpa_reference(
 @pytest.mark.parametrize(
     "head_size",
     [
-        # Product encoder models (Granite/E5/RoBERTa) use D=64; MiniLM uses 32.
+        # Product encoder models (Granite/E5/RoBERTa) use D=64; MiniLM uses 32,
+        # which is half a Spyre stick -- a reshape/transpose there can produce a
+        # sub-stick interleaved index the backend rejects.
         pytest.param(64, id="head_size(64)"),
+        pytest.param(32, id="head_size(32)"),
     ],
 )
 @pytest.mark.parametrize(
