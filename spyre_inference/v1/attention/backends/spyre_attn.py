@@ -191,6 +191,41 @@ def is_warmup_complete() -> bool:
     return _warmup_complete
 
 
+# Graph count as of the last time some code path accounted for it. Every compile
+# after warmup is attributed either to a kernel label or, via
+# ``note_unattributed_compiles``, to whatever ran between two kernel calls.
+_last_graph_count = 0
+_late_compiles: dict[str, int] = {}
+
+
+def late_compile_counts() -> dict[str, int]:
+    """Graphs compiled after warmup, by label. Empty means genuinely none."""
+    return dict(_late_compiles)
+
+
+def note_unattributed_compiles(where: str) -> None:
+    """Report graphs compiled since the last accounted point, outside our kernels.
+
+    ``_call_kernel`` only sees its own call, so a compile in the model body or the
+    pooler is invisible to it -- which made "no warning" look like "no compiles".
+    Calling this at a known point in the step closes that gap: anything the kernels
+    did not account for is reported here instead.
+    """
+    global _last_graph_count
+    now = counters["stats"]["unique_graphs"]
+    if _warmup_complete and now > _last_graph_count:
+        delta = now - _last_graph_count
+        _late_compiles[where] = _late_compiles.get(where, 0) + delta
+        logger.warning(
+            "%d graph(s) compiled outside warmup and outside an attention kernel "
+            "(observed at %s; %d total there)",
+            delta,
+            where,
+            _late_compiles[where],
+        )
+    _last_graph_count = now
+
+
 def _call_kernel(label: str, fn, *args):
     """Dispatch a kernel, warning if it compiles once warmup has claimed coverage.
 
@@ -199,16 +234,31 @@ def _call_kernel(label: str, fn, *args):
     That assumes nothing else compiles concurrently on another thread, which holds for
     a single-tenant serving process; if it ever stops holding, the cost is a spurious
     warning, not a wrong result.
+
+    Every late compile is logged, not just the first: these are not one-off events
+    (a fresh shape compiles whenever traffic first reaches it), and ``warning_once``
+    deduplicates on the message, so it reported "at least one" as though it were
+    exactly one.
     """
+    global _last_graph_count
     if not _warmup_complete:
         return fn(*args)
     before = counters["stats"]["unique_graphs"]
     result = fn(*args)
-    if counters["stats"]["unique_graphs"] != before:
-        logger.warning_once(
-            "%s compiled outside warmup, which costs a full Inductor compile mid-request. "
-            "Re-run with TORCH_LOGS=recompiles to see which guard failed.",
+    after = counters["stats"]["unique_graphs"]
+    _last_graph_count = after
+    if after != before:
+        _late_compiles[label] = _late_compiles.get(label, 0) + (after - before)
+        logger.warning(
+            "%s compiled outside warmup (+%d graph(s), %d total for this label) on %s. "
+            "Each costs a full Inductor compile mid-request.",
             label,
+            after - before,
+            _late_compiles[label],
+            ", ".join(
+                "x".join(str(d) for d in a.shape) if isinstance(a, torch.Tensor) else repr(a)
+                for a in args
+            ),
         )
     return result
 

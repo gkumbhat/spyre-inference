@@ -77,7 +77,10 @@ class TestWarmKernelsCoversTheBucket:
             buffer_rows, impl.num_heads, impl.num_kv_heads, impl.head_size,
             impl.model_dtype, torch.device("cpu"),
         )
-        impl._warm_kernels(query, key, value, impl.num_heads, impl.num_kv_heads, impl.head_size)
+        impl._warm_kernels(
+            query, key, value, torch.zeros_like(query),
+            impl.num_heads, impl.num_kv_heads, impl.head_size,
+        )
 
         expected_extents = set()
         extent = ENCODER_BLOCK_SIZE
@@ -112,9 +115,52 @@ class TestWarmKernelsCoversTheBucket:
                 buffer_rows, impl.num_heads, impl.num_kv_heads, impl.head_size,
                 impl.model_dtype, torch.device("cpu"),
             )
-            impl._warm_kernels(query, key, value, impl.num_heads, impl.num_kv_heads, impl.head_size)
+            impl._warm_kernels(
+                query, key, value, torch.zeros_like(query),
+                impl.num_heads, impl.num_kv_heads, impl.head_size,
+            )
 
         assert seen_out_rows == {64, 128, 256}
+
+    def test_store_is_warmed_against_the_caller_s_own_output_tensor(self, monkeypatch):
+        """Regression: the store's destination layout is part of its cache key too.
+
+        vLLM hands ``forward`` an output built as ``torch.empty(rows, H*D).view(
+        -1, H, D)``; warmup used to build its own ``torch.zeros((rows, H, D))``
+        destination instead. Same shape, different Spyre device layout, so the
+        graph warmup compiled was not the one real traffic could reuse and the
+        store recompiled on first use -- observed on hardware for three
+        (buffer_rows, extent) pairs warmup demonstrably did sweep. Warm against
+        the caller's real output tensor, exactly as gather does for query.
+        """
+        impl = _make_impl()
+        buffer_rows = 128
+        query, key, value = _dummy_qkv(
+            buffer_rows, impl.num_heads, impl.num_kv_heads, impl.head_size,
+            impl.model_dtype, torch.device("cpu"),
+        )
+        # Built the way vLLM builds it: a view of a 2-D allocation.
+        output = torch.zeros(
+            (buffer_rows, impl.num_heads * impl.head_size), dtype=impl.model_dtype
+        ).view(-1, impl.num_heads, impl.head_size)
+
+        seen_out = []
+        real_run_store = impl._run_store
+
+        def recording_run_store(out, row_index, attn):
+            seen_out.append(out)
+            return real_run_store(out, row_index, attn)
+
+        monkeypatch.setattr(impl, "_run_store", recording_run_store)
+        impl._warm_kernels(
+            query, key, value, output,
+            impl.num_heads, impl.num_kv_heads, impl.head_size,
+        )
+
+        assert seen_out, "warmup must exercise the store"
+        assert all(o is output for o in seen_out), (
+            "store must be warmed against the caller's output, not a substitute"
+        )
 
     def test_gather_is_warmed_against_the_caller_s_own_query_layout(self, monkeypatch):
         """Regression: a fused-QKV projection (``qkv.split(...)``) hands out a
@@ -141,7 +187,10 @@ class TestWarmKernelsCoversTheBucket:
             return real_run_gather(q, k, v, row_index)
 
         monkeypatch.setattr(impl, "_run_gather", recording_run_gather)
-        impl._warm_kernels(query, key, value, impl.num_heads, impl.num_kv_heads, impl.head_size)
+        impl._warm_kernels(
+            query, key, value, torch.zeros_like(query),
+            impl.num_heads, impl.num_kv_heads, impl.head_size,
+        )
 
         assert seen_strides and all(s == query.stride() for s in seen_strides)
 
@@ -161,10 +210,16 @@ class TestWarmKernelsCoversTheBucket:
             impl.model_dtype, torch.device("cpu"),
         )
 
-        impl._warm_kernels(query, key, value, impl.num_heads, impl.num_kv_heads, impl.head_size)
+        impl._warm_kernels(
+            query, key, value, torch.zeros_like(query),
+            impl.num_heads, impl.num_kv_heads, impl.head_size,
+        )
         first = calls["n"]
         assert first > 0
-        impl._warm_kernels(query, key, value, impl.num_heads, impl.num_kv_heads, impl.head_size)
+        impl._warm_kernels(
+            query, key, value, torch.zeros_like(query),
+            impl.num_heads, impl.num_kv_heads, impl.head_size,
+        )
         assert calls["n"] == first
 
     def test_a_real_sequence_at_any_length_lands_on_a_warmed_extent(self):

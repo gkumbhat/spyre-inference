@@ -74,6 +74,7 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionMetadata,
     SpyrePagedKVCache,
     _call_kernel,
+    note_unattributed_compiles,
 )
 
 # KV block width, in tokens. One Spyre stick of fp16. The only remaining use
@@ -354,6 +355,7 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
+        output: torch.Tensor,
         num_heads: int,
         num_kv_heads: int,
         head_size: int,
@@ -366,16 +368,23 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         here, on the first forward for each body size, keeps that cost inside
         warmup, where the dummy runs already visit every body size.
 
-        Gather is warmed against the step's own query/key/value, not a fresh
-        contiguous scratch tensor: a fused-QKV projection (``qkv.split(...)``)
-        hands out a strided view, and under ``dynamic=False`` that stride is
-        part of the compiled function's cache key. A contiguous dummy would
-        warm a *different* specialization than what a real request's gather
-        call actually presents, recompiling the first time one arrives.
-        Reusing the real tensors makes the layout match by construction,
-        whatever it is. Their values don't matter -- this call's output is
-        discarded (or, for store, overwritten by the real per-plan loop right
-        after) -- only the shape/stride/dtype reach the cache key.
+        Every kernel is warmed against the step's own real tensors, never a
+        freshly built stand-in, because a Spyre tensor's *device layout* is part
+        of the compiled function's cache key and a stand-in does not reproduce
+        it. Two ways that bites, both observed on hardware:
+
+        - a fused-QKV projection (``qkv.split(...)``) hands ``query`` out as a
+          strided view, so a contiguous dummy warms a different specialization
+          than a real gather presents;
+        - ``output`` reaches us as ``torch.empty(rows, H*D).view(-1, H, D)``,
+          whose layout differs from a same-shaped ``torch.zeros``, so a scratch
+          destination warmed a store the real one could not reuse.
+
+        Warming the store therefore writes into the caller's ``output``. That is
+        safe: the per-plan loop immediately after this call overwrites every row
+        belonging to a real request, and rows outside those requests are padding
+        the pooler never reads. Values are irrelevant either way -- only
+        shape/stride/dtype/layout reach the cache key.
 
         Both gather and store are keyed on ``buffer_rows`` (as well as
         ``extent``, for gather), so both are rewarmed every time a new
@@ -390,7 +399,6 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
 
         dtype, device = query.dtype, query.device
         num_queries_per_kv = num_heads // num_kv_heads
-        out = convert(torch.zeros((buffer_rows, num_heads, head_size), dtype=dtype), device)
         index_dtype = encoder_index_dtype(device)
 
         extent = ENCODER_BLOCK_SIZE
@@ -401,7 +409,7 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
                 extent, extent, num_kv_heads, num_queries_per_kv, dtype, device, self._const_tiles
             )
             attn = self._run_attn(q_rows, k_rows, v_rows, mask, num_heads, num_kv_heads, head_size)
-            self._run_store(out, rows, attn)
+            self._run_store(output, rows, attn)
             extent *= 2
 
     def _build_plans(
@@ -467,6 +475,11 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         if attn_metadata is None:
             return output
 
+        # Anything compiled since the previous kernel call happened in the body
+        # (or the pooler, for the first layer of a step) -- attribute it here so
+        # it is not silently missed.
+        note_unattributed_compiles("model body / pooler")
+
         num_heads = query.shape[1]
         num_kv_heads = key.shape[1]
         head_size = query.shape[2]
@@ -490,7 +503,7 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         store_mode = "index" if fused_store_ok else "none"
 
         if store_mode == "index":
-            self._warm_kernels(query, key, value, num_heads, num_kv_heads, head_size)
+            self._warm_kernels(query, key, value, output, num_heads, num_kv_heads, head_size)
 
         # Built once per step; the whole encoder stack shares one build.
         if attn_metadata.encoder_seq_plans is None:
