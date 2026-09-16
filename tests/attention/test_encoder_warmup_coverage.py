@@ -150,9 +150,9 @@ class TestPoolingWarmupCoversBothSides:
             scheduler_config=SimpleNamespace(
                 max_num_seqs=MAX_NUM_SEQS, max_num_batched_tokens=budget
             ),
-            # No decoder-type attention layers here -- this suite is encoder-only
-            # pooling coverage, so force_attention must stay True for every cell.
-            _has_decoder_type_attention=lambda: False,
+            # Empty: no decoder-type attention layer, so force_attention stays
+            # True for every cell (this suite is encoder-only pooling coverage).
+            _spyre_kv_caches={},
             _dummy_run=dummy_run,
             _dummy_pooler_run=lambda hidden: None,
         )
@@ -228,12 +228,10 @@ class TestPoolingWarmupCoversBothSides:
 
 
 class TestPoolingWarmupSkipsDecoderAttnBugForMultiRequestCells:
-    """A ``batch_size > 1`` exact cell hits upstream's ``_dummy_run`` seq_lens
-    broadcast bug (aggregate token count applied to every request) only when a
-    genuine decoder-type attention layer cares about per-request ``num_blocks``.
-    Those variants are recorded directly by ``_record_attention_graphs`` instead
-    (see ``warming_up_model``), so this cell skips ``force_attention`` here.
-    ``batch_size == 1`` and skewed cells are unaffected either way.
+    """A ``batch_size > 1`` exact cell skips ``force_attention`` when the model has
+    a decoder-type attention layer (KV cache present) -- sidesteps upstream's
+    ``_dummy_run`` seq_lens broadcast bug, which overestimates ``num_blocks`` for
+    such a layer. ``batch_size == 1`` and skewed cells are unaffected either way.
     """
 
     @staticmethod
@@ -254,7 +252,7 @@ class TestPoolingWarmupSkipsDecoderAttnBugForMultiRequestCells:
             scheduler_config=SimpleNamespace(
                 max_num_seqs=MAX_NUM_SEQS, max_num_batched_tokens=budget
             ),
-            _has_decoder_type_attention=lambda: has_decoder_attn,
+            _spyre_kv_caches=({"layer0": object()} if has_decoder_attn else {}),
             _dummy_run=dummy_run,
             _dummy_pooler_run=lambda hidden: None,
         )

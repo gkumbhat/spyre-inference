@@ -12,12 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for `spyre_inference/models/clip.py`.
-
-No Spyre hardware, no real HF config fetch: `get_config` is monkeypatched to
-a stub, mirroring how `models.gemma4.force_text_backbone` is meant to be
-tested (same pattern, no existing test file for it to copy from directly).
-"""
+"""Tests for `spyre_inference/models/clip.py`. `get_config` is monkeypatched
+to a stub -- no Spyre hardware, no real HF config fetch."""
 
 from __future__ import annotations
 
