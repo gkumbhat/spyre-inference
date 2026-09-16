@@ -118,15 +118,10 @@ class TestBuckets:
 
 
 class TestPoolingQueryBucketCap:
-    """A pooling model never does incremental decode: a request's query_len is
-    its own context_len, so it can never exceed max_model_len even when
-    max_num_batched_tokens is larger -- unlike a real decoder's chunked-prefill
-    step, which can legitimately query up to max_num_batched_tokens against a
-    separately-tracked KV context. Without this cap, warmup records a query
-    bucket the num_blocks buckets (derived from max_model_len alone) were never
-    sized to cover, and a real request hits ``num_blocks=N exceeds the largest
-    recorded bucket`` (e.g. CLIP's text tower: max_model_len=77 but
-    max_num_batched_tokens defaults much larger)."""
+    """Pooling's query_len can't exceed max_model_len; without this cap, warmup
+    could record a query bucket with no matching num_blocks bucket, crashing
+    with "num_blocks=N exceeds the largest recorded bucket" (CLIP's text tower:
+    max_model_len=77, max_num_batched_tokens much larger)."""
 
     def test_pooling_caps_query_buckets_at_max_model_len(self):
         b = SpyreAttnBucketer(
@@ -135,15 +130,12 @@ class TestPoolingQueryBucketCap:
             )
         )
         assert b.query_buckets[-1] == 77
-        # The invariant that actually matters: a query at the largest recorded
-        # bucket must round onto a real num_blocks bucket (this is what
-        # crashed for CLIP -- num_blocks=16 exceeding a bucket sized for 77).
+        # The largest recorded query bucket must round onto a real num_blocks
+        # bucket -- this is what crashed for CLIP.
         largest_query_blocks = -(-b.query_buckets[-1] // b.block_size)
         assert b.find_blocks_bucket(largest_query_blocks) is not None
 
     def test_generate_is_unaffected(self):
-        """Same shapes, runner_type=generate: query buckets keep going up to
-        max_num_batched_tokens, matching chunked-prefill's real needs."""
         b = SpyreAttnBucketer(
             make_config(
                 max_model_len=77, max_num_batched_tokens=2048, runner_type="generate"

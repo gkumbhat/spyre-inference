@@ -14,11 +14,8 @@
 
 """CLIP EngineArgs overrides that must land before ModelConfig is built.
 
-The LayerNorm boundary-norm swap lives in ``multimodal/clip.py`` (an
-instance-level, post-load patch, applied via ``apply_multimodal_patches``).
-This module is the pre-``ModelConfig`` counterpart, following the same
-pattern as ``models.gemma4.force_text_backbone``.
-"""
+The LayerNorm boundary-norm swap lives in ``multimodal/clip.py`` instead
+(an instance-level, post-load patch)."""
 
 from __future__ import annotations
 
@@ -31,24 +28,12 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-_CLIP_MODEL_TYPES = {"clip"}
-
 
 def force_disable_chunked_prefill(engine_args: EngineArgs) -> None:
-    """CLIP supports vLLM's ``token_embed`` task (``tok_pooling_type="ALL"``),
-    which ``spyre_inference.v1.pool.spyre_pooler.SpyreAllPool`` refuses to run
-    under chunked prefill (raises ``NotImplementedError`` at construction, so
-    it fails even for requests that only ever use the plain ``embed`` task).
-
-    ``ModelConfig.is_chunked_prefill_supported`` should already disable
-    chunked prefill for a causal pooling model here -- it excludes MEAN/CLS
-    seq-pooling and STEP tok-pooling, but not ALL tok-pooling, which is what
-    CLIP (and anything else using ``SpyreAllPool``) actually needs excluded
-    too. Rather than patch that vLLM heuristic globally (touching every
-    pooling model, not just the ones that hit this), force it off here,
-    narrowly, for CLIP specifically -- mirrors
-    ``models.gemma4.force_text_backbone``'s early ``get_config()`` probe.
-    Skipped when the user explicitly set ``--enable-chunked-prefill``.
+    """SpyreAllPool (CLIP's token-level pooler) rejects chunked prefill outright,
+    but ModelConfig.is_chunked_prefill_supported doesn't exclude ALL-type token
+    pooling, so it isn't disabled automatically. Mirrors
+    models.gemma4.force_text_backbone's early get_config() probe.
     """
     if engine_args.enable_chunked_prefill is not None:
         return
@@ -65,7 +50,7 @@ def force_disable_chunked_prefill(engine_args: EngineArgs) -> None:
         )
     except Exception:
         return
-    if getattr(hf_config, "model_type", None) not in _CLIP_MODEL_TYPES:
+    if getattr(hf_config, "model_type", None) != "clip":
         return
     engine_args.enable_chunked_prefill = False
     logger.info("CLIP: disabling chunked prefill (unsupported with token-level pooling).")
