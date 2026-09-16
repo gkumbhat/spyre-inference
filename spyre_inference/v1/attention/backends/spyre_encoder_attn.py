@@ -263,6 +263,23 @@ def encoder_mask(
     return tiles[0] if num_tiles == 1 else torch.cat(tiles, dim=-1)
 
 
+def _host_pad_head_dim(x: torch.Tensor, padded: int) -> torch.Tensor:
+    """Widen the head dim to a whole stick, via the host.
+
+    Below one stick several heads share a stick, and no device op -- compiled or
+    eager -- can touch the per-head view that implies ("Unexpected stick
+    expression d2 + 32*(Mod(d1, 2))"). ``convert`` is opaque, so the round trip
+    is what escapes it; ``F.pad`` and a device ``cat``/``contiguous`` cannot.
+    Zeros leave ``QK^T`` unchanged and zero the extra output columns.
+    """
+    if x.shape[-1] == padded:
+        return x
+    device = x.device
+    on_host = convert(x, "cpu") if device.type == "spyre" else x
+    on_host = F.pad(on_host.contiguous(), (0, padded - x.shape[-1]))
+    return convert(on_host, device) if device.type == "spyre" else on_host
+
+
 def dense_sdpa_reference(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -512,6 +529,26 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
             key = convert(key, output.device)
             value = convert(value, output.device)
 
+        # Sub-stick head sizes: run the whole attention at a stick-aligned head
+        # dim on our own buffers, then narrow on the host and write back through
+        # the flattened output view, whose rows are a whole number of sticks.
+        head_pad = -head_size % ENCODER_LEN_ALIGNMENT
+        narrow_into = None
+        if head_pad:
+            query = _host_pad_head_dim(query, head_size + head_pad)
+            key = _host_pad_head_dim(key, head_size + head_pad)
+            value = _host_pad_head_dim(value, head_size + head_pad)
+            narrow_into, output = (
+                output,
+                convert(
+                    torch.zeros(
+                        (output.shape[0], num_heads, head_size + head_pad), dtype=output.dtype
+                    ),
+                    output.device,
+                ),
+            )
+            head_size += head_pad
+
         # Folds the per-layer eager store into the attention jobplan. Re-checked
         # per call: vLLM hands out a fresh buffer per layer.
         fused_store_ok = (
@@ -557,6 +594,13 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
                     base = i * plan.extent
                     output[start : start + query_len] = attn[base : base + query_len]
 
+        if narrow_into is not None:
+            rows = narrow_into.shape[0]
+            on_host = convert(output, "cpu")[..., : narrow_into.shape[-1]].contiguous()
+            narrow_into.reshape(rows, -1).copy_(
+                convert(on_host.reshape(rows, -1), narrow_into.device)
+            )
+            return narrow_into
         return output
 
 

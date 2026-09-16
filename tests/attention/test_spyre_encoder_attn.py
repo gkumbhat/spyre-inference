@@ -88,6 +88,20 @@ def configure_compilation(request, monkeypatch):
     torch._dynamo.reset()
 
 
+def _vllm_style_output(query: torch.Tensor, device) -> torch.Tensor:
+    """Allocate the attention output the way vLLM does.
+
+    ``Attention.forward`` allocates ``[num_tokens, num_heads * head_size]`` and
+    views it as 3-D, so its device layout is a flat one. A plain
+    ``empty_like(query)`` allocates 3-D instead, and for a head size below one
+    stick that layout differs in a way this backend is sensitive to -- a shape
+    real traffic never produces.
+    """
+    tokens, heads, head_size = query.shape
+    flat = torch.empty((tokens, heads * head_size), dtype=query.dtype)
+    return flat.to(device).view(-1, heads, head_size)
+
+
 def _build_metadata(
     num_query_heads: int,
     num_kv_heads: int,
@@ -515,7 +529,7 @@ def test_spyre_encoder_attn(
     )
 
     cache_device = torch.device(configure_device)
-    output = torch.empty_like(query).to(cache_device)
+    output = _vllm_style_output(query, cache_device)
     kv_cache = SpyrePagedKVCache(k_pages=torch.empty(0), v_pages=torch.empty(0))
     attn_impl.forward(
         layer=None,
@@ -610,7 +624,7 @@ def test_single_sequence_exactly_filling_the_buffer_handles_a_fused_qkv_view(
     )
     kv_cache = SpyrePagedKVCache(k_pages=torch.empty(0), v_pages=torch.empty(0))
     device = torch.device(configure_device)
-    output = torch.empty_like(query).to(device)
+    output = _vllm_style_output(query, device)
     impl.forward(
         layer=None,
         query=query,
@@ -818,7 +832,7 @@ def test_grouped_attention_matches_the_per_sequence_reference(
     )
     assert impl._batched_attn == batched, "the opt-in flag must reach the impl"
 
-    output = torch.empty_like(query).to(torch.device(configure_device))
+    output = _vllm_style_output(query, torch.device(configure_device))
     impl.forward(
         layer=None,
         query=query,
