@@ -173,6 +173,20 @@ class SpyreAttnBucketer:
         max_model_len = vllm_config.model_config.max_model_len
         max_batched = vllm_config.scheduler_config.max_num_batched_tokens
 
+        # A pooling model never does incremental decode: every request is one
+        # whole-sequence forward pass, so a single query (query_len == its own
+        # context_len) can never exceed max_model_len, regardless of how large
+        # max_num_batched_tokens is. A real decoder's chunked-prefill step can
+        # legitimately query up to max_num_batched_tokens against a
+        # *separately* KV-cached context, so this narrowing is pooling-only:
+        # widening it for decoders would just record unreachable buckets, but
+        # for pooling it avoids warming a query bucket whose matching
+        # num_blocks (derived below from kv/max_model_len buckets alone) was
+        # never sized to cover it -- the crash this works around is
+        # `num_blocks=N exceeds the largest recorded bucket`.
+        if vllm_config.model_config.runner_type == "pooling":
+            max_batched = min(max_batched, max_model_len)
+
         if block_size & (block_size - 1):
             # Not fatal: _powers_of_two_up_to rounds the start up to a power of
             # two, just coarser at the bottom. Reachable because the platform
