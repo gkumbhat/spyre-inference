@@ -39,9 +39,7 @@ from spyre_inference.custom_ops.layer_norm import SpyreLayerNorm
 logger = init_logger(__name__)
 
 
-def _to_spyre_layer_norm(
-    ln: torch.nn.LayerNorm, device: torch.device
-) -> torch.nn.LayerNorm:
+def _to_spyre_layer_norm(ln: torch.nn.LayerNorm, device: torch.device) -> torch.nn.LayerNorm:
     new_ln = SpyreLayerNorm(
         list(ln.normalized_shape),
         eps=ln.eps,
@@ -60,18 +58,14 @@ def apply(model: torch.nn.Module, device: torch.device) -> None:
     """Swap CLIP's three boundary LayerNorms for ``SpyreLayerNorm``, in place."""
     text_model = getattr(model, "text_model", None)
     if text_model is not None and hasattr(text_model, "final_layer_norm"):
-        text_model.final_layer_norm = _to_spyre_layer_norm(
-            text_model.final_layer_norm, device
-        )
+        text_model.final_layer_norm = _to_spyre_layer_norm(text_model.final_layer_norm, device)
 
     vision_model = getattr(model, "vision_model", None)
     if vision_model is not None:
         if hasattr(vision_model, "pre_layrnorm"):
             vision_model.pre_layrnorm = _to_spyre_layer_norm(vision_model.pre_layrnorm, device)
         if getattr(vision_model, "post_layernorm", None) is not None:
-            vision_model.post_layernorm = _to_spyre_layer_norm(
-                vision_model.post_layernorm, device
-            )
+            vision_model.post_layernorm = _to_spyre_layer_norm(vision_model.post_layernorm, device)
 
     logger.info_once(
         "Spyre: CLIP's boundary LayerNorms (pre_layrnorm/post_layernorm/"

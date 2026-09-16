@@ -79,14 +79,10 @@ def test_respects_an_explicit_user_choice(monkeypatch):
 
 
 def test_tolerates_config_load_failure(monkeypatch):
-    import spyre_inference.models.clip as clip_mod
-
     def _raise(*args, **kwargs):
         raise RuntimeError("no network")
 
-    monkeypatch.setattr(
-        "vllm.transformers_utils.config.get_config", _raise, raising=False
-    )
+    monkeypatch.setattr("vllm.transformers_utils.config.get_config", _raise, raising=False)
     args = _fake_engine_args(None)
 
     force_disable_chunked_prefill(args)  # must not raise

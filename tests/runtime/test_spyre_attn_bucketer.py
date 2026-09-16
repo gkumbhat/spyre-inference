@@ -125,9 +125,7 @@ class TestPoolingQueryBucketCap:
 
     def test_pooling_caps_query_buckets_at_max_model_len(self):
         b = SpyreAttnBucketer(
-            make_config(
-                max_model_len=77, max_num_batched_tokens=2048, runner_type="pooling"
-            )
+            make_config(max_model_len=77, max_num_batched_tokens=2048, runner_type="pooling")
         )
         assert b.query_buckets[-1] == 77
         # The largest recorded query bucket must round onto a real num_blocks
@@ -137,17 +135,13 @@ class TestPoolingQueryBucketCap:
 
     def test_generate_is_unaffected(self):
         b = SpyreAttnBucketer(
-            make_config(
-                max_model_len=77, max_num_batched_tokens=2048, runner_type="generate"
-            )
+            make_config(max_model_len=77, max_num_batched_tokens=2048, runner_type="generate")
         )
         assert b.query_buckets[-1] == 2048
 
     def test_pooling_is_a_noop_when_max_batched_is_already_smaller(self):
         b = SpyreAttnBucketer(
-            make_config(
-                max_model_len=2048, max_num_batched_tokens=512, runner_type="pooling"
-            )
+            make_config(max_model_len=2048, max_num_batched_tokens=512, runner_type="pooling")
         )
         assert b.query_buckets[-1] == 512
 

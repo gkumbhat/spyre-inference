@@ -32,9 +32,7 @@ def _reference_apply_sdpa(q, k, v, scale=None, enable_gqa=False):
     """Upstream's unpadded `apply_sdpa`, reproduced so this test has no vLLM
     version dependency."""
     q, k, v = (einops.rearrange(x, "b s h d -> b h s d") for x in (q, k, v))
-    out = F.scaled_dot_product_attention(
-        q, k, v, dropout_p=0.0, scale=scale, enable_gqa=enable_gqa
-    )
+    out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, scale=scale, enable_gqa=enable_gqa)
     return einops.rearrange(out, "b h s d -> b s h d")
 
 
