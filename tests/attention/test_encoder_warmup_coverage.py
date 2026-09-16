@@ -18,10 +18,11 @@ variant a body bucket could reach, so nothing compiles mid-request.
 CPU-only, and not about numerics -- ``test_spyre_encoder_attn.py`` covers those.
 ``_warm_kernels`` is called once per distinct ``buffer_rows`` seen in ``forward()``,
 which happens automatically because warmup's own dummy runs pass
-``force_attention=True`` and visit every body bucket. Gather is cheap and keyed on
-``(buffer_rows, extent)``, so it is rewarmed at every body bucket; attention/store are
-keyed only on ``extent`` (the sequence's own padded length) and are warmed exactly once
-per distinct extent, however many buffer_rows values reach it.
+``force_attention=True`` and visit every body bucket. Gather and store are cheap and
+keyed on ``buffer_rows`` (gather also on ``extent``), so both are rewarmed at every
+body bucket; attention is keyed only on ``extent`` (the sequence's own padded length)
+and is warmed exactly once per distinct extent, however many buffer_rows values reach
+it -- calling it again on an already-seen extent is just a cache hit.
 """
 
 import torch
@@ -33,6 +34,13 @@ from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
     SpyreEncoderAttentionImpl,
     _blocks_for,
 )
+
+
+def _dummy_qkv(buffer_rows, num_heads, num_kv_heads, head_size, dtype, device):
+    query = torch.zeros((buffer_rows, num_heads, head_size), dtype=dtype, device=device)
+    key = torch.zeros((buffer_rows, num_kv_heads, head_size), dtype=dtype, device=device)
+    value = torch.zeros((buffer_rows, num_kv_heads, head_size), dtype=dtype, device=device)
+    return query, key, value
 
 
 def _make_impl(num_heads=4, num_kv_heads=1, head_size=64):
@@ -49,9 +57,10 @@ def _make_impl(num_heads=4, num_kv_heads=1, head_size=64):
 
 
 class TestWarmKernelsCoversTheBucket:
-    """``_warm_kernels`` must exercise gather for every extent this ``buffer_rows``
-    body bucket can reach, and attention/store exactly once per distinct extent --
-    regardless of how many different buffer_rows values reach it."""
+    """``_warm_kernels`` must exercise gather and store for every ``(buffer_rows,
+    extent)`` pair this body bucket can reach, using the caller's own query/key/
+    value layout -- not a substitute dummy that could warm a different Dynamo
+    specialization than what a real request actually presents."""
 
     def test_gathers_every_power_of_two_extent_up_to_the_buffer(self, monkeypatch):
         buffer_rows = 256
@@ -64,14 +73,11 @@ class TestWarmKernelsCoversTheBucket:
             return real_run_gather(query, key, value, row_index)
 
         monkeypatch.setattr(impl, "_run_gather", counting_run_gather)
-        impl._warm_kernels(
-            buffer_rows,
-            impl.num_heads,
-            impl.num_kv_heads,
-            impl.head_size,
-            impl.model_dtype,
-            torch.device("cpu"),
+        query, key, value = _dummy_qkv(
+            buffer_rows, impl.num_heads, impl.num_kv_heads, impl.head_size,
+            impl.model_dtype, torch.device("cpu"),
         )
+        impl._warm_kernels(query, key, value, impl.num_heads, impl.num_kv_heads, impl.head_size)
 
         expected_extents = set()
         extent = ENCODER_BLOCK_SIZE
@@ -80,31 +86,64 @@ class TestWarmKernelsCoversTheBucket:
             extent *= 2
         assert seen_gathers == expected_extents
 
-    def test_attn_and_store_compile_once_per_extent_not_per_buffer(self, monkeypatch):
-        """The expensive kernel must not be rewarmed for an extent already seen at
-        a smaller buffer_rows -- that is the whole point of splitting gather/store
-        (cheap, keyed on buffer_rows) from attention (expensive, keyed only on the
-        sequence's own padded length).
+    def test_store_rewarms_every_buffer_size_not_just_the_first_to_reach_an_extent(
+        self, monkeypatch
+    ):
+        """Regression: store's own cache key includes ``buffer_rows`` (unlike
+        attention's, which is keyed only on ``extent``), so it must be called for
+        every ``(buffer_rows, extent)`` pair -- not skipped just because some
+        *other*, larger buffer_rows already reached that extent. Warmup sweeps
+        largest-first, so a bug that gated store on "extent already seen" would
+        only ever warm the largest bucket's variant, leaving every smaller
+        bucket's store uncompiled until a real request hit it.
         """
         impl = _make_impl()
-        calls = {"n": 0}
-        real_run_attn = impl._run_attn
+        seen_out_rows: set[int] = set()
+        real_run_store = impl._run_store
 
-        def counting_run_attn(*args, **kwargs):
-            calls["n"] += 1
-            return real_run_attn(*args, **kwargs)
+        def counting_run_store(out, row_index, attn):
+            seen_out_rows.add(out.shape[0])
+            return real_run_store(out, row_index, attn)
 
-        monkeypatch.setattr(impl, "_run_attn", counting_run_attn)
-        args = (impl.num_heads, impl.num_kv_heads, impl.head_size, impl.model_dtype, torch.device("cpu"))
+        monkeypatch.setattr(impl, "_run_store", counting_run_store)
 
-        impl._warm_kernels(64, *args)
-        first = calls["n"]
-        assert first == 1  # exactly one extent (64) reachable at buffer_rows=64
+        for buffer_rows in (256, 128, 64):  # largest first, like real warmup
+            query, key, value = _dummy_qkv(
+                buffer_rows, impl.num_heads, impl.num_kv_heads, impl.head_size,
+                impl.model_dtype, torch.device("cpu"),
+            )
+            impl._warm_kernels(query, key, value, impl.num_heads, impl.num_kv_heads, impl.head_size)
 
-        impl._warm_kernels(128, *args)
-        # Only the new extent (128) should trigger a fresh compile; extent 64
-        # was already warmed by the buffer_rows=64 call above.
-        assert calls["n"] == first + 1
+        assert seen_out_rows == {64, 128, 256}
+
+    def test_gather_is_warmed_against_the_caller_s_own_query_layout(self, monkeypatch):
+        """Regression: a fused-QKV projection (``qkv.split(...)``) hands out a
+        strided view, and that stride is part of the compiled gather function's
+        cache key under ``dynamic=False``. ``_warm_kernels`` must gather from the
+        exact tensors it was called with, not a freshly built contiguous dummy --
+        otherwise it warms a different specialization than a real strided
+        request needs, recompiling on that request's first arrival.
+        """
+        impl = _make_impl(num_heads=4, num_kv_heads=1, head_size=64)
+        buffer_rows = 64
+        fused = torch.zeros((buffer_rows, 4 * 64 + 64 + 64), dtype=impl.model_dtype)
+        q_flat, k_flat, v_flat = fused.split([4 * 64, 64, 64], dim=-1)
+        query = q_flat.view(buffer_rows, 4, 64)
+        key = k_flat.view(buffer_rows, 1, 64)
+        value = v_flat.view(buffer_rows, 1, 64)
+        assert not query.is_contiguous(), "test setup must exercise a genuinely strided view"
+
+        seen_strides: list[tuple] = []
+        real_run_gather = impl._run_gather
+
+        def recording_run_gather(q, k, v, row_index):
+            seen_strides.append(q.stride())
+            return real_run_gather(q, k, v, row_index)
+
+        monkeypatch.setattr(impl, "_run_gather", recording_run_gather)
+        impl._warm_kernels(query, key, value, impl.num_heads, impl.num_kv_heads, impl.head_size)
+
+        assert seen_strides and all(s == query.stride() for s in seen_strides)
 
     def test_is_idempotent_per_buffer_size(self, monkeypatch):
         """A second call at the same ``buffer_rows`` must not re-warm anything."""
@@ -117,12 +156,15 @@ class TestWarmKernelsCoversTheBucket:
             return real_run_gather(*args, **kwargs)
 
         monkeypatch.setattr(impl, "_run_gather", counting_run_gather)
-        args = (impl.num_heads, impl.num_kv_heads, impl.head_size, impl.model_dtype, torch.device("cpu"))
+        query, key, value = _dummy_qkv(
+            128, impl.num_heads, impl.num_kv_heads, impl.head_size,
+            impl.model_dtype, torch.device("cpu"),
+        )
 
-        impl._warm_kernels(128, *args)
+        impl._warm_kernels(query, key, value, impl.num_heads, impl.num_kv_heads, impl.head_size)
         first = calls["n"]
         assert first > 0
-        impl._warm_kernels(128, *args)
+        impl._warm_kernels(query, key, value, impl.num_heads, impl.num_kv_heads, impl.head_size)
         assert calls["n"] == first
 
     def test_a_real_sequence_at_any_length_lands_on_a_warmed_extent(self):

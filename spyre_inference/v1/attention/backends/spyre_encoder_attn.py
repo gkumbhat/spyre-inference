@@ -328,13 +328,6 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         # every sequence, layer and step.
         self._const_tiles: dict[tuple, torch.Tensor] = {}
         self._warmed_buffers: set[int] = set()
-        # Distinct sequence lengths (extents) whose attention graph has been
-        # compiled, across *any* buffer_rows -- unlike _warmed_buffers, this
-        # is not reset per body bucket, since the attention kernel's cache key
-        # does not include buffer_rows. Warming it twice at the same extent
-        # would just be a wasted call, not a correctness issue, so this is an
-        # optimization, not a guard.
-        self._warmed_extents: set[int] = set()
 
     def _run_gather(self, query, key, value, row_index):
         return _call_kernel("encoder_gather", self._gather_fn, query, key, value, row_index)
@@ -358,12 +351,12 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
 
     def _warm_kernels(
         self,
-        buffer_rows: int,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
         num_heads: int,
         num_kv_heads: int,
         head_size: int,
-        dtype: torch.dtype,
-        device: torch.device,
     ) -> None:
         """Compile every kernel a batch of this token count can ask for.
 
@@ -373,41 +366,42 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         here, on the first forward for each body size, keeps that cost inside
         warmup, where the dummy runs already visit every body size.
 
-        The attention kernel itself is only warmed once per distinct extent,
-        ever, regardless of how many buffer_rows values reach it: its cache
-        key does not include buffer_rows, so recompiling it per body bucket
-        would be pure waste. Gather/store are cheap and are rewarmed per
-        buffer_rows, matching what their own cache key actually depends on.
+        Gather is warmed against the step's own query/key/value, not a fresh
+        contiguous scratch tensor: a fused-QKV projection (``qkv.split(...)``)
+        hands out a strided view, and under ``dynamic=False`` that stride is
+        part of the compiled function's cache key. A contiguous dummy would
+        warm a *different* specialization than what a real request's gather
+        call actually presents, recompiling the first time one arrives.
+        Reusing the real tensors makes the layout match by construction,
+        whatever it is. Their values don't matter -- this call's output is
+        discarded (or, for store, overwritten by the real per-plan loop right
+        after) -- only the shape/stride/dtype reach the cache key.
 
-        Scratch contents are irrelevant; only the shapes reach the cache key.
+        Both gather and store are keyed on ``buffer_rows`` (as well as
+        ``extent``, for gather), so both are rewarmed every time a new
+        ``buffer_rows`` is seen -- unlike attention, whose cache key is
+        ``extent`` alone, so calling it again on an already-seen extent is
+        just a cache hit, not a second compile.
         """
+        buffer_rows = query.shape[0]
         if buffer_rows in self._warmed_buffers:
             return
         self._warmed_buffers.add(buffer_rows)
 
+        dtype, device = query.dtype, query.device
         num_queries_per_kv = num_heads // num_kv_heads
-        query = convert(torch.zeros((buffer_rows, num_heads, head_size), dtype=dtype), device)
-        key = convert(torch.zeros((buffer_rows, num_kv_heads, head_size), dtype=dtype), device)
-        value = convert(torch.zeros((buffer_rows, num_kv_heads, head_size), dtype=dtype), device)
         out = convert(torch.zeros((buffer_rows, num_heads, head_size), dtype=dtype), device)
         index_dtype = encoder_index_dtype(device)
 
         extent = ENCODER_BLOCK_SIZE
         while extent <= buffer_rows:
             rows = convert(encoder_row_table(0, extent, extent, index_dtype), device)
-            # Warms gather (keyed on buffer_rows and extent) plus attn/store
-            # (keyed on extent alone). The needs_gather=False path skips only
-            # the gather call at runtime -- attn and store don't know or care
-            # whether their inputs came from a gather, so nothing extra needs
-            # warming for that case.
             q_rows, k_rows, v_rows = self._run_gather(query, key, value, rows)
-            if extent not in self._warmed_extents:
-                self._warmed_extents.add(extent)
-                mask = encoder_mask(
-                    extent, extent, num_kv_heads, num_queries_per_kv, dtype, device, self._const_tiles
-                )
-                attn = self._run_attn(q_rows, k_rows, v_rows, mask, num_heads, num_kv_heads, head_size)
-                self._run_store(out, rows, attn)
+            mask = encoder_mask(
+                extent, extent, num_kv_heads, num_queries_per_kv, dtype, device, self._const_tiles
+            )
+            attn = self._run_attn(q_rows, k_rows, v_rows, mask, num_heads, num_kv_heads, head_size)
+            self._run_store(out, rows, attn)
             extent *= 2
 
     def _build_plans(
@@ -496,9 +490,7 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         store_mode = "index" if fused_store_ok else "none"
 
         if store_mode == "index":
-            self._warm_kernels(
-                query.shape[0], num_heads, num_kv_heads, head_size, query.dtype, query.device
-            )
+            self._warm_kernels(query, key, value, num_heads, num_kv_heads, head_size)
 
         # Built once per step; the whole encoder stack shares one build.
         if attn_metadata.encoder_seq_plans is None:
