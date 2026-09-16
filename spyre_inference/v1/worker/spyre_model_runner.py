@@ -781,16 +781,41 @@ class TorchSpyreModelRunner(GPUModelRunner):
             t0 = time.time()
             with _set_spyre_compilation_settings(self.vllm_config):
                 if self.spyre_shape_bucketer is not None:
+                    max_model_len = self.model_config.max_model_len
                     for size in sorted(self.spyre_shape_bucketer.bucket_sizes, reverse=True):
-                        self._dummy_run(size)
+                        # This body-only pass forces attention by default (see
+                        # _dummy_run), but a pooling request's query_len can
+                        # never exceed max_model_len (no incremental decode --
+                        # every request is one whole-sequence forward). A
+                        # generic body bucket above that (e.g. a decoder-type
+                        # attention layer's kv/num_blocks buckets, sized from
+                        # max_model_len alone -- see SpyreAttnBucketer) was
+                        # never warmed to cover it, so exercising attention
+                        # here would hit "no query bucket for query_len=N".
+                        # _warmup_pooling_bucket_shapes below still warms
+                        # attention correctly, at shapes that do respect
+                        # max_model_len; this pass only needs the body graph.
+                        self._dummy_run(size, force_attention=size <= max_model_len)
                     self.spyre_shape_bucketer.mark_warmed_up()
                 self._warmup_pooling_bucket_shapes()
                 self._record_encoder_pack_graphs()
+                if self._spyre_kv_caches:
+                    # A pooling model with a genuine decoder-type attention layer
+                    # (paged KV, causal -- e.g. CLIP's text tower) has a real KV
+                    # cache and needs its (num_blocks, query_len) variants recorded
+                    # directly here, the same way decoder warmup does below --
+                    # sidestepping the batch_size>1 dummy-run seq_lens bug that
+                    # _warmup_pooling_bucket_shapes works around for its own,
+                    # pooler-shape-only calls. Encoder-only pooling models
+                    # (BERT/RoBERTa) never get a KV cache, so this stays a no-op
+                    # for them.
+                    self._record_attention_graphs()
             if self.spyre_shape_bucketer is not None:
                 self.spyre_shape_bucketer.mark_warmed_up()
-            # Pooling never reaches _record_attention_graphs (encoder layers have
-            # no KV cache to record against), so claim coverage here instead --
-            # otherwise _call_kernel stays silent for the encoder kernels.
+            # Pooling models without a decoder-type attention layer never reach
+            # _record_attention_graphs above (no KV cache to record against), so
+            # claim coverage here regardless -- otherwise _call_kernel stays
+            # silent for the encoder-only kernels.
             mark_warmup_complete()
             logger.info("Warmup done in %.3fs.", time.time() - t0)
             return
@@ -1043,6 +1068,16 @@ class TorchSpyreModelRunner(GPUModelRunner):
             return None
         return BatchDescriptor(num_tokens=desc.padded_num_tokens)
 
+    def _has_decoder_type_attention(self) -> bool:
+        """True if any layer's impl is genuinely decoder-type (paged KV, causal),
+        as opposed to only ``SpyreEncoderAttentionImpl``'s bidirectional pack/SDPA."""
+        static_ctx = self.compilation_config.static_forward_context
+        return any(
+            isinstance(getattr(layer, "impl", None), SpyreAttentionImpl)
+            and not isinstance(getattr(layer, "impl", None), SpyreEncoderAttentionImpl)
+            for layer in static_ctx.values()
+        )
+
     def _warmup_pooling_bucket_shapes(self) -> None:
         """Dummy each attention ``(B, L)``. Body already 1D-pads after warmup."""
         if self.spyre_shape_bucketer is not None:
@@ -1063,6 +1098,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         budget = self.scheduler_config.max_num_batched_tokens
         saved_max_num_seqs = self.scheduler_config.max_num_seqs
+        has_decoder_attn = self._has_decoder_type_attention()
         try:
             for batch_size, prompt_len in shapes:
                 self.scheduler_config.max_num_seqs = batch_size
@@ -1095,6 +1131,16 @@ class TorchSpyreModelRunner(GPUModelRunner):
                             prompt_len,
                         )
                         continue
+                # Upstream's dummy-run seq_lens for a uniform multi-request batch is
+                # the aggregate token count broadcast to every request (gpu_model_
+                # runner._dummy_run), not each request's own length. Harmless for
+                # SpyreEncoderAttentionImpl (ignores seq_lens/num_blocks), but wrong
+                # for a genuine decoder-type layer's paged num_blocks bucket -- those
+                # variants are recorded directly by _record_attention_graphs instead
+                # (see warming_up_model), so skip forcing attention here and only
+                # warm the pooler-shape body. create_mixed_batch batches (skewed)
+                # compute seq_lens correctly per-sequence and are unaffected.
+                force_attention = not (batch_size > 1 and not skewed and has_decoder_attn)
                 logger.info(
                     "Pooling attention warmup: %s bucket batch_size=%d prompt_len=%d (%d tokens)",
                     "skewed" if skewed else "exact",
@@ -1103,7 +1149,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
                     num_tokens,
                 )
                 hidden_states, _ = self._dummy_run(
-                    num_tokens, force_attention=True, create_mixed_batch=skewed
+                    num_tokens, force_attention=force_attention, create_mixed_batch=skewed
                 )
                 self._dummy_pooler_run(hidden_states)
                 if batch_size == 1:
