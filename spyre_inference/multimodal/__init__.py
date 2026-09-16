@@ -21,7 +21,7 @@ implementations by layer class.
 
 import torch
 
-from . import pixtral
+from . import clip, pixtral
 
 
 def apply_multimodal_patches(model: torch.nn.Module, device: torch.device) -> None:
@@ -32,7 +32,9 @@ def apply_multimodal_patches(model: torch.nn.Module, device: torch.device) -> No
     """
     # Both spellings: mistral-format Pixtral names the tower `vision_encoder`, HF-format
     # Mistral3 `vision_tower`. Ungated, the patches rewrite vLLM's shared module.
-    if not any(hasattr(model, attr) for attr in ("vision_encoder", "vision_tower")):
-        return
+    if any(hasattr(model, attr) for attr in ("vision_encoder", "vision_tower")):
+        pixtral.apply(model, device)
 
-    pixtral.apply(model, device)
+    # CLIPEmbeddingModel: text_model/vision_model, not vision_encoder/vision_tower.
+    if hasattr(model, "text_model") or hasattr(model, "vision_model"):
+        clip.apply(model, device)

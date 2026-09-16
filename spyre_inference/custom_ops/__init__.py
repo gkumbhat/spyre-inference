@@ -21,6 +21,7 @@ from vllm.logger import init_logger
 from spyre_inference import moe  # noqa: F401
 
 from . import (
+    clip_attn_type,
     conv,  # noqa: F401
     gate_linear,  # noqa: F401
     gemma_rms_norm,  # noqa: F401
@@ -43,4 +44,5 @@ def register_all():
     logger.info("Registering custom ops for spyre_inference")
     register_spyre_fp8_linear_kernel()
     utils.register()
+    clip_attn_type.register()
     multimodal_embeddings.register()
