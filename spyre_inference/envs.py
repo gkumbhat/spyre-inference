@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     SPYRE_ATTN_NUM_SEQS_BUCKETS: str | None = None
     SPYRE_ATTN_KV_LAYOUT: str = "token_major"
     SPYRE_BATCHED_DECODE: bool = False
+    SPYRE_ENCODER_BATCHED_ATTN: bool = False
     SPYRE_KERNEL_CACHE: bool = False
     SPYRE_NUM_CPUS: int = 0
     SPYRE_UPDATE_THREAD_CONFIG: bool = True
@@ -78,6 +79,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # pending performance characterisation at small batch sizes (num_seqs <= 4).
     # Re-enable to measure the path or to restore it after calibration.
     "SPYRE_BATCHED_DECODE": lambda: bool(int(os.getenv("SPYRE_BATCHED_DECODE", "0"))),
+    # Batch encoder attention over requests that share a padded length, instead of
+    # one gather/attend/store per request. Off by default: grouping trades kernel
+    # launches for extra warmup graphs, and the balance is workload-dependent.
+    "SPYRE_ENCODER_BATCHED_ATTN": lambda: bool(
+        int(os.getenv("SPYRE_ENCODER_BATCHED_ATTN", "0"))
+    ),
     # When "1", reuse compiled Spyre kernels across processes by caching them on
     # disk. Off by default. TORCHINDUCTOR_FORCE_DISABLE_CACHES=1 disables the cache
     # even when this flag is enabled.

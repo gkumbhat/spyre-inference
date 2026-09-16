@@ -723,3 +723,115 @@ def test_encoder_build_survives_a_body_bucket_past_max_model_len(default_vllm_co
     # encoder case work, not a widened ladder.
     with pytest.raises(AssertionError, match="exceeds the largest recorded bucket"):
         _profile_metadata(AttentionSpec, max_model_len=256, prompt_len=512, num_seqs=1)
+
+
+@pytest.mark.parametrize(
+    "configure_compilation", [pytest.param("STOCK_TORCH_COMPILE", id="compilation_STOCK")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
+)
+@pytest.mark.parametrize("batched", [False, True], ids=["grouping_off", "grouping_on"])
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        # All one extent: one group, no remainder.
+        pytest.param([(64, 64)] * 4, id="4seqs_same_extent"),
+        # Five members at one extent must split 4 + 1, not pad up to 8.
+        pytest.param([(64, 64)] * 5, id="5seqs_splits_4plus1"),
+        # Different extents must not be grouped together, and members sharing an
+        # extent may still have different real kv_len.
+        pytest.param([(40, 40), (50, 50), (300, 300), (310, 310), (20, 20)], id="mixed_extents"),
+    ],
+)
+@torch.inference_mode()
+def test_grouped_attention_matches_the_per_sequence_reference(
+    default_vllm_config,
+    monkeypatch,
+    batched: bool,
+    seq_lens: list[tuple[int, int]],
+    configure_compilation: str,
+    configure_device: str,
+) -> None:
+    """Batching equal-extent requests into one kernel call must not change results.
+
+    Runs the same batch with grouping off and on: both are checked against the
+    bidirectional reference, so a grouping bug cannot hide behind a shared
+    implementation. ``mixed_extents`` also covers members that share an extent
+    while having different real ``kv_len`` -- only their masks differ, and those
+    are concatenated in member order to match the kernel's folded batch dim.
+    """
+    from spyre_inference import envs
+
+    monkeypatch.setattr(envs, "SPYRE_ENCODER_BATCHED_ATTN", batched, raising=False)
+
+    num_heads, num_kv_heads, head_size, block_size = 12, 12, 64, 64
+    dtype = torch.float16
+    torch.set_default_device("cpu")
+    set_random_seed(0)
+
+    query_lens = [q for q, _ in seq_lens]
+    kv_lens = [k for _, k in seq_lens]
+    total_tokens = sum(query_lens)
+    scale = head_size**-0.5
+
+    query = torch.randn(total_tokens, num_heads, head_size, dtype=dtype)
+    key = torch.randn(total_tokens, num_kv_heads, head_size, dtype=dtype)
+    value = torch.randn(total_tokens, num_kv_heads, head_size, dtype=dtype)
+    cu_query_lens = torch.tensor([0] + query_lens, dtype=torch.int32).cumsum(
+        dim=0, dtype=torch.int32
+    )
+
+    attn_metadata = _build_metadata(
+        num_query_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        block_size=block_size,
+        seq_lens=torch.tensor(kv_lens, dtype=torch.int32),
+        query_start_loc=cu_query_lens,
+        block_table=torch.zeros(
+            len(seq_lens), (max(query_lens) + block_size - 1) // block_size, dtype=torch.int32
+        ),
+        slot_mapping=torch.arange(total_tokens, dtype=torch.int64),
+    )
+    impl = SpyreEncoderAttentionImpl(
+        num_heads=num_heads,
+        head_size=head_size,
+        scale=scale,
+        num_kv_heads=num_kv_heads,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="auto",
+        logits_soft_cap=None,
+    )
+    assert impl._batched_attn == batched, "the opt-in flag must reach the impl"
+
+    output = torch.empty_like(query).to(torch.device(configure_device))
+    impl.forward(
+        layer=None,
+        query=query,
+        key=key,
+        value=value,
+        kv_cache=SpyrePagedKVCache(k_pages=torch.empty(0), v_pages=torch.empty(0)),
+        attn_metadata=attn_metadata,
+        output=output,
+    )
+
+    if batched:
+        assert any(getattr(p, "group", 1) > 1 for p in attn_metadata.encoder_seq_plans), (
+            "grouping was enabled but every plan stayed a single sequence"
+        )
+
+    ref_output = ref_encoder_attn(
+        query=query, key=key, value=value, query_lens=query_lens, scale=scale
+    )
+    assert_close_outliers(
+        output.to("cpu"),
+        ref_output,
+        max_outliers=8,
+        atol=0.3,
+        rtol=0.2,
+        outlier_atol=0.6,
+        outlier_rtol=0.4,
+    )

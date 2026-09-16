@@ -67,6 +67,7 @@ import torch
 import torch.nn.functional as F
 from vllm.v1.attention.backend import AttentionLayer
 
+from spyre_inference import envs
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionBackend,
@@ -168,6 +169,72 @@ def _encoder_dense_attn_kernel(
 _encoder_dense_attn_compiled = torch.compile(_encoder_dense_attn_kernel, dynamic=False)
 
 
+def _encoder_grouped_attn_kernel(
+    q_rows,
+    k_rows,
+    v_rows,
+    mask,
+    scale,
+    group,
+    num_heads,
+    num_kv_heads,
+    head_size,
+):
+    """Dense masked self-attention over ``group`` sequences of equal padded length.
+
+    Same math as ``_encoder_dense_attn_kernel``, one call for the whole group.
+    Worth it because these kernels are dispatch-bound, not compute-bound: at
+    extent 64 the attention matmuls cost the same as the pure-copy store, so
+    collapsing ``group`` dispatches into one is nearly free.
+
+    ``group`` is folded into the *leading* batch dim, giving 4-D operands. The
+    apparently natural 5-D form ``[group, num_kv_heads, num_queries_per_kv,
+    extent, head_size]`` does not lower: torch-spyre's
+    ``insert_restickify_padding`` rejects the interleaved index it produces
+    ("host dim 0 ... carries multiple free symbols"). Keeping the rank at 4 --
+    the same rank the per-sequence kernel already uses -- avoids that.
+
+    Expected shapes:
+        q_rows: [group * extent, num_heads, head_size], members back to back.
+        k_rows/v_rows: [group * extent, num_kv_heads, head_size], likewise.
+        mask: [group * num_kv_heads, num_queries_per_kv, 1, extent] -- each
+            member's own mask, concatenated on dim 0 in member order, which is
+            the order the folded batch dim indexes (``g * num_kv_heads + h``).
+            Members may have different real ``kv_len``; only the mask differs.
+
+    Returns [group * extent, num_heads, head_size], members back to back.
+    """
+    num_queries_per_kv = num_heads // num_kv_heads
+    extent = q_rows.shape[0] // group
+
+    q = (
+        q_rows.reshape(group, extent, num_heads, head_size).transpose(1, 2) * scale
+    ).reshape(group * num_kv_heads, num_queries_per_kv, extent, head_size)
+    k = (
+        k_rows.reshape(group, extent, num_kv_heads, head_size)
+        .transpose(1, 2)
+        .reshape(group * num_kv_heads, 1, extent, head_size)
+    )
+    v = (
+        v_rows.reshape(group, extent, num_kv_heads, head_size)
+        .transpose(1, 2)
+        .reshape(group * num_kv_heads, 1, extent, head_size)
+    )
+
+    scores = torch.matmul(q, k.transpose(-2, -1)) + mask
+    probs = torch.softmax(scores, dim=-1)
+    attn = torch.matmul(probs, v)
+
+    return (
+        attn.reshape(group, num_heads, extent, head_size)
+        .transpose(1, 2)
+        .reshape(group * extent, num_heads, head_size)
+    )
+
+
+_encoder_grouped_attn_compiled = torch.compile(_encoder_grouped_attn_kernel, dynamic=False)
+
+
 def _encoder_store_kernel(out, row_index, attn):
     """Scatter one sequence's attention output back into the step's output buffer.
 
@@ -202,6 +269,43 @@ class EncoderSeqPlan:
     needs_gather: bool
     row_table: torch.Tensor
     mask: torch.Tensor
+
+
+@dataclass
+class EncoderGroupPlan:
+    """Several equal-extent requests served by one gather/attend/store each.
+
+    ``group`` is always a power of two, and a step's requests at a given extent
+    are split into power-of-two chunks rather than padded up to one: padding a
+    group of 5 up to 8 would gather and attend 3 phantom sequences, while
+    splitting into 4 + 1 wastes nothing and keeps every shape on the same short
+    bucket ladder the ungrouped path already warms.
+    """
+
+    starts: list[int]
+    query_lens: list[int]
+    extent: int
+    group: int
+    row_table: torch.Tensor
+    mask: torch.Tensor
+
+
+def _power_of_two_chunks(count: int, limit: int) -> list[int]:
+    """Split ``count`` members into descending power-of-two chunks, each <= ``limit``.
+
+    ``limit`` caps a chunk so its gathered row count stays within the row-count
+    ladder warmup already covers, which is what lets grouping reuse the existing
+    gather/store graphs instead of adding a shape axis to them.
+    """
+    chunks: list[int] = []
+    remaining = count
+    while remaining:
+        chunk = 1
+        while chunk * 2 <= remaining and chunk * 2 <= limit:
+            chunk *= 2
+        chunks.append(chunk)
+        remaining -= chunk
+    return chunks
 
 
 def encoder_index_dtype(device: torch.device) -> torch.dtype:
@@ -320,10 +424,15 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
             self._gather_fn = _encoder_gather_compiled
             self._attn_fn = _encoder_dense_attn_compiled
             self._store_fn = _encoder_store_compiled
+            self._grouped_attn_fn = _encoder_grouped_attn_compiled
         else:
             self._gather_fn = _encoder_gather_kernel
             self._attn_fn = _encoder_dense_attn_kernel
             self._store_fn = _encoder_store_kernel
+            self._grouped_attn_fn = _encoder_grouped_attn_kernel
+        # Grouping only pays off through the compiled kernels; in eager mode the
+        # per-request loop has no launch overhead to amortise.
+        self._batched_attn = self._compile_attn and envs.SPYRE_ENCODER_BATCHED_ATTN
         # Mask tiles are shape-only (depend only on kv_len's block boundary,
         # not on which request/layer/step), so one device copy each serves
         # every sequence, layer and step.
@@ -342,6 +451,23 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
             v_rows,
             mask,
             self.scale,
+            num_heads,
+            num_kv_heads,
+            head_size,
+        )
+
+    def _run_grouped_attn(
+        self, q_rows, k_rows, v_rows, mask, group, num_heads, num_kv_heads, head_size
+    ):
+        return _call_kernel(
+            "encoder_grouped_attn",
+            self._grouped_attn_fn,
+            q_rows,
+            k_rows,
+            v_rows,
+            mask,
+            self.scale,
+            group,
             num_heads,
             num_kv_heads,
             head_size,
@@ -410,6 +536,27 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
             )
             attn = self._run_attn(q_rows, k_rows, v_rows, mask, num_heads, num_kv_heads, head_size)
             self._run_store(output, rows, attn)
+
+            if self._batched_attn:
+                # Grouped attention is keyed on (group, extent). Gather and store
+                # are keyed on the *total* row count, which for a power-of-two
+                # group of a power-of-two extent is another entry on the same
+                # ladder this loop already walks -- so they need nothing extra.
+                group = 2
+                while group * extent <= buffer_rows:
+                    g_rows = convert(
+                        torch.cat(
+                            [encoder_row_table(0, extent, extent, index_dtype)] * group
+                        ),
+                        device,
+                    )
+                    gq, gk, gv = self._run_gather(query, key, value, g_rows)
+                    g_mask = torch.cat([mask] * group, dim=0)
+                    g_attn = self._run_grouped_attn(
+                        gq, gk, gv, g_mask, group, num_heads, num_kv_heads, head_size
+                    )
+                    self._run_store(output, g_rows, g_attn)
+                    group *= 2
             extent *= 2
 
     def _build_plans(
@@ -428,7 +575,8 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         device = query.device
         index_dtype = encoder_index_dtype(device)
 
-        plans: list[EncoderSeqPlan] = []
+        # (start, query_len, kv_len, extent) per real request, in arrival order.
+        requests: list[tuple[int, int, int, int]] = []
         for seq_idx in range(attn_metadata.num_seqs):
             start = int(query_start_loc[seq_idx])
             query_len = int(query_start_loc[seq_idx + 1]) - start
@@ -436,27 +584,81 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
                 continue
             query_len = min(query_len, num_tokens - start)
             kv_len = min(int(seq_lens[seq_idx]), query_len)
-
             extent = _blocks_for(max(query_len, kv_len)) * ENCODER_BLOCK_SIZE
-            plans.append(
-                EncoderSeqPlan(
-                    start=start,
-                    query_len=query_len,
-                    needs_gather=not (start == 0 and query_len == extent and buffer_rows == extent),
-                    row_table=convert(
-                        encoder_row_table(start, query_len, extent, index_dtype), device
-                    ),
-                    mask=encoder_mask(
-                        extent,
-                        kv_len,
-                        num_kv_heads,
-                        num_queries_per_kv,
-                        query.dtype,
-                        device,
-                        self._const_tiles,
-                    ),
-                )
+            requests.append((start, query_len, kv_len, extent))
+
+        def single(start: int, query_len: int, kv_len: int, extent: int) -> EncoderSeqPlan:
+            return EncoderSeqPlan(
+                start=start,
+                query_len=query_len,
+                needs_gather=not (start == 0 and query_len == extent and buffer_rows == extent),
+                row_table=convert(
+                    encoder_row_table(start, query_len, extent, index_dtype), device
+                ),
+                mask=encoder_mask(
+                    extent,
+                    kv_len,
+                    num_kv_heads,
+                    num_queries_per_kv,
+                    query.dtype,
+                    device,
+                    self._const_tiles,
+                ),
             )
+
+        if not self._batched_attn:
+            return [single(*r) for r in requests]
+
+        by_extent: dict[int, list[tuple[int, int, int, int]]] = {}
+        for req in requests:
+            by_extent.setdefault(req[3], []).append(req)
+
+        plans: list[EncoderSeqPlan | EncoderGroupPlan] = []
+        for extent, members in sorted(by_extent.items()):
+            # Cap a chunk's gathered rows at buffer_rows so the gather and store
+            # keep reusing the row-count graphs warmup already built for them.
+            limit = max(1, buffer_rows // extent)
+            offset = 0
+            for chunk in _power_of_two_chunks(len(members), limit):
+                part = members[offset : offset + chunk]
+                offset += chunk
+                if chunk == 1:
+                    plans.append(single(*part[0]))
+                    continue
+                plans.append(
+                    EncoderGroupPlan(
+                        starts=[m[0] for m in part],
+                        query_lens=[m[1] for m in part],
+                        extent=extent,
+                        group=chunk,
+                        row_table=convert(
+                            torch.cat(
+                                [
+                                    encoder_row_table(m[0], m[1], extent, index_dtype)
+                                    for m in part
+                                ]
+                            ),
+                            device,
+                        ),
+                        # Member order along dim 0 is what the kernel's folded
+                        # batch dim indexes, so concatenate, do not stack.
+                        mask=torch.cat(
+                            [
+                                encoder_mask(
+                                    extent,
+                                    m[2],
+                                    num_kv_heads,
+                                    num_queries_per_kv,
+                                    query.dtype,
+                                    device,
+                                    self._const_tiles,
+                                )
+                                for m in part
+                            ],
+                            dim=0,
+                        ),
+                    )
+                )
         return plans
 
     def forward(  # ty: ignore[invalid-method-override]
@@ -512,6 +714,20 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
             )
 
         for plan in attn_metadata.encoder_seq_plans:
+            if isinstance(plan, EncoderGroupPlan):
+                q_rows, k_rows, v_rows = self._run_gather(query, key, value, plan.row_table)
+                attn = self._run_grouped_attn(
+                    q_rows, k_rows, v_rows, plan.mask, plan.group,
+                    num_heads, num_kv_heads, head_size,
+                )
+                if store_mode == "index":
+                    self._run_store(output, plan.row_table, attn)
+                else:
+                    for i, (start, query_len) in enumerate(zip(plan.starts, plan.query_lens)):
+                        base = i * plan.extent
+                        output[start : start + query_len] = attn[base : base + query_len]
+                continue
+
             if plan.needs_gather:
                 q_rows, k_rows, v_rows = self._run_gather(query, key, value, plan.row_table)
             else:
