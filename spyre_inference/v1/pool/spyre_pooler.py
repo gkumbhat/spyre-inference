@@ -106,6 +106,29 @@ def cursor_row_indices_cpu(pooling_cursor, *, last: bool) -> torch.Tensor:
     return ends - 1 if last else ends - counts
 
 
+def pad_row_count_to_bucket(row_indices: torch.Tensor) -> tuple[torch.Tensor, int]:
+    """Pad a per-request row index up to a power-of-two length.
+
+    ``select_rows``' ``index_select`` specializes on the *exact* index length,
+    and serving pools one row per request -- any count from 1 to
+    ``max_num_seqs``. Left alone that is up to 64 graphs per body bucket, each
+    compiling the first time its request count appears mid-serve. Rounding the
+    count to a power of two caps it at a handful of widths that warmup can
+    afford to sweep (see ``_warm_pooler_row_widths``).
+
+    Padding lanes repeat the last real row, so the extra rows are duplicates
+    the caller drops; they never introduce a row that was not already pooled.
+    Returns the padded index and the real row count to trim back to.
+    """
+    n = int(row_indices.numel())
+    if n <= 1:
+        return row_indices, n
+    target = 1 << (n - 1).bit_length()
+    if target == n:
+        return row_indices, n
+    return torch.cat([row_indices, row_indices[-1:].expand(target - n)]), n
+
+
 def select_rows(hidden_states: torch.Tensor, row_indices: torch.Tensor) -> torch.Tensor:
     """Row gather via ``index_select`` (no Spyre ``aten::index.Tensor``).
 
@@ -136,9 +159,10 @@ class SpyreCLSPool(CLSPool):
         cursor = pooling_metadata.get_pooling_cursor()
         if cursor.is_partial_prefill():
             raise RuntimeError("partial prefill is not supported with CLS pooling")
-        pooled = select_rows(hidden_states, cursor_row_indices_cpu(cursor, last=False))
+        idx, n_rows = pad_row_count_to_bucket(cursor_row_indices_cpu(cursor, last=False))
+        pooled = select_rows(hidden_states, idx)
         note_unattributed_compiles("pooler")
-        return pooled
+        return pooled[:n_rows] if pooled.shape[0] != n_rows else pooled
 
 
 class SpyreLastPool(LastPool):
@@ -146,7 +170,9 @@ class SpyreLastPool(LastPool):
 
     def forward(self, hidden_states, pooling_metadata):
         cursor = pooling_metadata.get_pooling_cursor()
-        return select_rows(hidden_states, cursor_row_indices_cpu(cursor, last=True))
+        idx, n_rows = pad_row_count_to_bucket(cursor_row_indices_cpu(cursor, last=True))
+        pooled = select_rows(hidden_states, idx)
+        return pooled[:n_rows] if pooled.shape[0] != n_rows else pooled
 
 
 class SpyreMeanPool(MeanPool):

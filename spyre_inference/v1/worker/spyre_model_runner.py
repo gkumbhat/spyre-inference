@@ -767,6 +767,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
                     for size in sorted(self.spyre_shape_bucketer.bucket_sizes, reverse=True):
                         hidden_states, _ = self._dummy_run(size)
                         self._dummy_pooler_run(hidden_states)
+                        self._warm_pooler_row_widths(hidden_states)
                     self.spyre_shape_bucketer.mark_warmed_up()
             # Pooling never reaches _record_attention_graphs (encoder layers have
             # no KV cache to record against), so claim coverage here instead --
@@ -1036,6 +1037,26 @@ class TorchSpyreModelRunner(GPUModelRunner):
         ):
             hidden_states = convert(hidden_states, self._spyre_device)
         return hidden_states, last_hidden_states
+
+    @torch.inference_mode()
+    def _warm_pooler_row_widths(self, hidden_states: torch.Tensor) -> None:
+        """Compile the pooler's row gather at every row count serving can present.
+
+        ``_dummy_pooler_run`` only ever pools ``min(num_tokens, max_num_seqs)``
+        rows, but serving pools one row per *request* -- any count from 1 up. That
+        gather specializes on the exact index length, so every unseen count paid a
+        full Inductor compile mid-request; it was the whole residual warm-up gap
+        once the attention kernels were covered. The poolers round their row count
+        to a power of two (``pad_row_count_to_bucket``), so this sweep is short.
+        """
+        if not self._pooling_on_spyre:
+            return
+        rows = hidden_states.shape[0]
+        width = 1
+        while width <= self.scheduler_config.max_num_seqs:
+            if width <= rows:
+                select_rows(hidden_states, torch.zeros(width, dtype=torch.int64))
+            width *= 2
 
     def _unpad_encoder_hidden(
         self, hidden_states: torch.Tensor, num_scheduled_tokens: int
