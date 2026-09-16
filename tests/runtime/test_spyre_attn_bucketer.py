@@ -32,11 +32,16 @@ BLOCK_SIZE = 64
 
 
 def make_config(
-    max_model_len=2048, max_num_batched_tokens=512, block_size=BLOCK_SIZE, max_num_seqs=8
+    max_model_len=2048,
+    max_num_batched_tokens=512,
+    block_size=BLOCK_SIZE,
+    max_num_seqs=8,
+    runner_type="generate",
 ):
     config = MagicMock()
     config.cache_config.block_size = block_size
     config.model_config.max_model_len = max_model_len
+    config.model_config.runner_type = runner_type
     config.scheduler_config.max_num_batched_tokens = max_num_batched_tokens
     config.scheduler_config.max_num_seqs = max_num_seqs
     return config
@@ -110,6 +115,49 @@ class TestBuckets:
             b = SpyreAttnBucketer(make_config(max_model_len=limit, max_num_batched_tokens=limit))
             assert b.kv_buckets == sorted(set(b.kv_buckets))
             assert b.query_buckets == sorted(set(b.query_buckets))
+
+
+class TestPoolingQueryBucketCap:
+    """A pooling model never does incremental decode: a request's query_len is
+    its own context_len, so it can never exceed max_model_len even when
+    max_num_batched_tokens is larger -- unlike a real decoder's chunked-prefill
+    step, which can legitimately query up to max_num_batched_tokens against a
+    separately-tracked KV context. Without this cap, warmup records a query
+    bucket the num_blocks buckets (derived from max_model_len alone) were never
+    sized to cover, and a real request hits ``num_blocks=N exceeds the largest
+    recorded bucket`` (e.g. CLIP's text tower: max_model_len=77 but
+    max_num_batched_tokens defaults much larger)."""
+
+    def test_pooling_caps_query_buckets_at_max_model_len(self):
+        b = SpyreAttnBucketer(
+            make_config(
+                max_model_len=77, max_num_batched_tokens=2048, runner_type="pooling"
+            )
+        )
+        assert b.query_buckets[-1] == 77
+        # The invariant that actually matters: a query at the largest recorded
+        # bucket must round onto a real num_blocks bucket (this is what
+        # crashed for CLIP -- num_blocks=16 exceeding a bucket sized for 77).
+        largest_query_blocks = -(-b.query_buckets[-1] // b.block_size)
+        assert b.find_blocks_bucket(largest_query_blocks) is not None
+
+    def test_generate_is_unaffected(self):
+        """Same shapes, runner_type=generate: query buckets keep going up to
+        max_num_batched_tokens, matching chunked-prefill's real needs."""
+        b = SpyreAttnBucketer(
+            make_config(
+                max_model_len=77, max_num_batched_tokens=2048, runner_type="generate"
+            )
+        )
+        assert b.query_buckets[-1] == 2048
+
+    def test_pooling_is_a_noop_when_max_batched_is_already_smaller(self):
+        b = SpyreAttnBucketer(
+            make_config(
+                max_model_len=2048, max_num_batched_tokens=512, runner_type="pooling"
+            )
+        )
+        assert b.query_buckets[-1] == 512
 
 
 class TestFindBucket:
