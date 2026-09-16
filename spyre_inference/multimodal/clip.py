@@ -23,11 +23,10 @@ what triggers the crash ``SpyreLayerNorm`` works around (see
 already and never hit that crashing path, so they're left as plain
 ``nn.LayerNorm`` -- swapping them too would be unnecessary.
 
-Applied to the already-loaded model instance (weights included), unlike
-``custom_ops/clip_attn_type.py``'s attention-type patch, which has to run
-before construction. So the replacement ``SpyreLayerNorm`` here copies the
-original's already-loaded weight/bias explicitly, rather than relying on a
-later ``load_weights()`` pass to populate them.
+Applied to the already-loaded model instance (weights included), so the
+replacement ``SpyreLayerNorm`` here copies the original's already-loaded
+weight/bias explicitly, rather than relying on a later ``load_weights()``
+pass to populate them.
 """
 
 from __future__ import annotations
