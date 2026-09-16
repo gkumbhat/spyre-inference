@@ -314,6 +314,14 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         # every sequence, layer and step.
         self._const_tiles: dict[tuple, torch.Tensor] = {}
         self._warmed_buffers: set[int] = set()
+        # A request's extent cannot exceed its own length, so warming past the
+        # model length compiles the most expensive graphs for shapes no request
+        # can reach.
+        from vllm.config import get_current_vllm_config
+
+        self._max_extent = (
+            _blocks_for(get_current_vllm_config().model_config.max_model_len) * ENCODER_BLOCK_SIZE
+        )
 
     def _run_gather(self, query, key, value, row_index):
         return _call_kernel("encoder_gather", self._gather_fn, query, key, value, row_index)
@@ -370,7 +378,8 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         index_dtype = encoder_index_dtype(device)
 
         extent = ENCODER_BLOCK_SIZE
-        while extent <= buffer_rows:
+        max_extent = min(buffer_rows, self._max_extent)
+        while extent <= max_extent:
             rows = convert(encoder_row_table(0, extent, extent, index_dtype), device)
             q_rows, k_rows, v_rows = self._run_gather(query, key, value, rows)
             mask = encoder_mask(extent, extent, dtype, device, self._const_tiles)

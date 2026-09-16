@@ -329,3 +329,43 @@ def test_call_kernel_warns_only_after_warmup_is_marked_complete(monkeypatch, cap
         assert "compiled outside warmup" in caplog.text
     finally:
         spyre_attn._warmup_complete = saved
+
+
+def test_warmup_stops_at_the_longest_reachable_extent(monkeypatch):
+    """A request's extent cannot exceed its own length, so warming past the model
+    length compiles the most expensive graphs for shapes nothing can reach.
+
+    With max_model_len=512 and a 2048-row body bucket, the sweep used to build
+    extents 1024 and 2048 too -- on hardware that was most of the grouping
+    warmup cost (680s -> 224s once capped).
+    """
+    impl = _make_impl()
+    monkeypatch.setattr(impl, "_max_extent", 128)
+    seen: set[int] = set()
+    real_run_gather = impl._run_gather
+
+    def counting_run_gather(query, key, value, row_index):
+        seen.add(row_index.shape[0])
+        return real_run_gather(query, key, value, row_index)
+
+    monkeypatch.setattr(impl, "_run_gather", counting_run_gather)
+    query, key, value = _dummy_qkv(
+        512,
+        impl.num_heads,
+        impl.num_kv_heads,
+        impl.head_size,
+        impl.model_dtype,
+        torch.device("cpu"),
+    )
+    impl._warm_kernels(
+        query,
+        key,
+        value,
+        torch.zeros_like(query),
+        impl.num_heads,
+        impl.num_kv_heads,
+        impl.head_size,
+    )
+
+    assert seen, "warmup must still exercise the reachable extents"
+    assert max(seen) <= 128, f"warmed unreachable extents: {sorted(seen)}"
