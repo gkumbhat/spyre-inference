@@ -22,12 +22,17 @@ The patches are `getattr`-guarded, so a transformers rename would silently no-op
 -- hence the staleness tripwires. All host-side math; no card needed.
 """
 
+import copy
+
 import pytest
 import torch
 from spyre_testing_plugin.pytest_plugin import spyre_available
 
 modeling_gemma4 = pytest.importorskip("transformers.models.gemma4.modeling_gemma4")
 configuration_gemma4 = pytest.importorskip("transformers.models.gemma4.configuration_gemma4")
+
+# The patch replaces the class attribute process-wide, so capture the stock forward here.
+STOCK_ENCODER_FORWARD = modeling_gemma4.Gemma4VisionEncoder.forward
 
 pytestmark = [pytest.mark.gemma4_vision]
 
@@ -95,8 +100,12 @@ def _unpad_activation_quarters(padded: torch.Tensor, orig: int, padded_dim: int)
         "Gemma4RMSNorm",
         "Gemma4VisionEncoder",
         "Gemma4VisionPatchEmbedder",
+        "Gemma4VisionPooler",
         "apply_multidimensional_rope",
         "Gemma4VisionRotaryEmbedding",
+        # Compared by name in the multimodal dispatch: a rename routes a gemma-4 tower
+        # into `pixtral.apply` instead.
+        "Gemma4VisionModel",
     ],
 )
 def test_patched_upstream_symbols_still_exist(name):
@@ -758,3 +767,68 @@ def test_pooling_matmul_matches_the_host_average_on_device():
     )
 
     torch.testing.assert_close(convert(got, device="cpu").float(), want, rtol=2e-2, atol=2e-2)
+
+
+# ---------------------------------------------------------------------------
+# The composed encoder forward
+# ---------------------------------------------------------------------------
+
+
+def _encoder(num_layers: int = 2, num_patches: int = NUM_PATCHES):
+    """A small real `Gemma4VisionEncoder` at 26B-A4B's head_dim, on the host."""
+    config = _vision_config()
+    config.num_hidden_layers = num_layers
+    config.intermediate_size = 200
+    # Without a named implementation `create_bidirectional_mask` early-exits to `None`,
+    # and the stock forward would silently attend over the padding patches.
+    config._attn_implementation = "sdpa"
+    torch.manual_seed(0)
+    return modeling_gemma4.Gemma4VisionEncoder(config).eval()
+
+
+def _encoder_inputs(batch: int = 1, num_patches: int = NUM_PATCHES, valid: int | None = None):
+    hidden = NUM_HEADS * ORIG_HEAD_DIM
+    embeds = torch.randn(batch, num_patches, hidden)
+    mask = torch.ones(batch, num_patches, dtype=torch.bool)
+    if valid is not None:
+        mask[:, valid:] = False
+    return embeds, mask, _position_ids(num_patches).expand(batch, -1, -1)
+
+
+@pytest.mark.parametrize("valid", [None, NUM_PATCHES - 7], ids=["all_valid", "padded_patches"])
+def test_patched_encoder_forward_matches_stock(valid):
+    """The assembled walk — rope, attention, both norms, padded MLP — over two layers."""
+    from spyre_inference.multimodal import gemma4_vision
+
+    encoder = _encoder()
+    embeds, mask, pos = _encoder_inputs(valid=valid)
+
+    # `_prepare_attention` pads the projections in place, so the reference gets a copy.
+    with torch.inference_mode():
+        expected = STOCK_ENCODER_FORWARD(
+            copy.deepcopy(encoder), embeds, mask, pixel_position_ids=pos
+        ).last_hidden_state
+
+    gemma4_vision.patch_vision_encoder()
+    gemma4_vision.patch_rms_norm()
+    with torch.inference_mode():
+        actual = encoder(embeds, mask, pixel_position_ids=pos).last_hidden_state
+
+    assert actual.shape == expected.shape
+    cosine = torch.nn.functional.cosine_similarity(
+        actual.flatten(), expected.flatten(), dim=0
+    ).item()
+    assert cosine > 0.999, f"cosine {cosine}"
+
+
+def test_patched_encoder_rejects_a_batch_mixing_valid_patch_counts():
+    """`attn_mask` comes from row 0, so a ragged batch must be refused, not attended."""
+    from spyre_inference.multimodal import gemma4_vision
+
+    gemma4_vision.patch_vision_encoder()
+    encoder = _encoder()
+    embeds, mask, pos = _encoder_inputs(batch=2)
+    mask[1, -5:] = False
+
+    with pytest.raises(NotImplementedError, match="valid-patch counts"):
+        encoder(embeds, mask, pixel_position_ids=pos)

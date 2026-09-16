@@ -123,6 +123,7 @@ def _build_metadata(
     block_table: torch.Tensor,
     slot_mapping: torch.Tensor,
     sliding_window: int | None = None,
+    dtype: torch.dtype = torch.float16,
 ):
     """Use the real SpyreAttentionMetadataBuilder to construct metadata."""
     from vllm.config import get_current_vllm_config
@@ -142,7 +143,7 @@ def _build_metadata(
             num_kv_heads=num_kv_heads,
             head_size=head_size,
             head_size_v=head_size,
-            dtype=torch.float16,
+            dtype=dtype,
             sliding_window=sliding_window,
         )
     else:
@@ -150,7 +151,7 @@ def _build_metadata(
             block_size=block_size,
             num_kv_heads=num_kv_heads,
             head_size=head_size,
-            dtype=torch.float16,
+            dtype=dtype,
         )
 
     builder = SpyreAttentionMetadataBuilder(
@@ -362,6 +363,7 @@ def _run_spyre_attn_test(
     num_query_heads: int = 32,
     num_kv_heads: int = 8,
     head_size: int = 128,
+    dtype: torch.dtype = torch.float16,
     expect_fused_store: bool | None = None,
     expect_query_widths: set[int] | None = None,
 ) -> None:
@@ -374,7 +376,11 @@ def _run_spyre_attn_test(
         pytest.skip("Compiled attention targets Spyre; Inductor CPU codegen is unsupported here.")
 
     num_blocks = 256
-    dtype = torch.float16
+
+    from vllm.config import get_current_vllm_config
+
+    # SpyreAttentionImpl and the metadata builder both read the dtype off the VllmConfig.
+    get_current_vllm_config().model_config.dtype = dtype
 
     torch.set_default_device("cpu")
     set_random_seed(0)
@@ -406,8 +412,6 @@ def _run_spyre_attn_test(
     # The extra entries point at garbage pages on purpose: padded blocks are
     # fully masked and must not affect the result.
     max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
-    from vllm.config import get_current_vllm_config
-
     buckets = SpyreAttnBucketer(get_current_vllm_config()).num_blocks_buckets
     padded_width = SpyreAttnBucketer._round_up(max_num_blocks_per_seq, buckets)
     if padded_width is not None:
@@ -453,6 +457,7 @@ def _run_spyre_attn_test(
         block_table=block_tables,
         slot_mapping=slot_mapping,
         sliding_window=sliding_window,
+        dtype=dtype,
     )
 
     attn_impl = SpyreAttentionImpl(
@@ -534,6 +539,10 @@ def _run_spyre_attn_test(
         atol, rtol = 0.3, 0.2
     else:
         atol, rtol = 0.2, 0.2
+    if dtype is torch.bfloat16 and alibi_slopes is not None:
+        # The reference builds the ALiBi bias in fp32, the impl at model dtype: bf16 costs
+        # up to 0.5 of a logit at kv=512. Non-ALiBi bf16 holds the fp16 tolerance.
+        atol, rtol = atol * 4, rtol * 2
 
     assert_close_outliers(
         output.to("cpu"),
@@ -1265,6 +1274,52 @@ def test_supported_dtypes_includes_bfloat16():
 
     assert torch.float16 in SpyreAttentionBackend.supported_dtypes
     assert torch.bfloat16 in SpyreAttentionBackend.supported_dtypes
+
+
+@pytest.mark.parametrize(
+    "configure_device",
+    [pytest.param("spyre", id="device_spyre")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [
+        pytest.param("NONE", id="compilation_NONE"),
+        pytest.param("STOCK_TORCH_COMPILE", id="compilation_STOCK"),
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    ("seq_lens", "sliding_window", "use_alibi"),
+    [
+        pytest.param([(1, 512)], None, False, id="decode(q=1,kv=512)"),
+        pytest.param([(32, 256)], None, False, id="prefill(q=32,kv=256)"),
+        pytest.param([(1, 256), (32, 256)], None, False, id="mixed(decode+prefill)"),
+        pytest.param([(32, 256)], 64, False, id="sliding_window(q=32,kv=256)"),
+        pytest.param([(1, 512)], None, True, id="alibi_decode(q=1,kv=512)"),
+    ],
+)
+def test_spyre_attn_bfloat16(
+    default_vllm_config,
+    seq_lens: list[tuple[int, int]],
+    sliding_window: int | None,
+    use_alibi: bool,
+    configure_compilation: str,
+    configure_device: str,
+) -> None:
+    """Run the kernels at bf16: KV cache, masks and ALiBi slopes all follow model dtype.
+
+    TP1 only, matching the platform — bf16 with TP>1 is rejected as all_reduce is fp16-only.
+    """
+    _run_spyre_attn_test(
+        seq_lens=seq_lens,
+        block_size=128,
+        sliding_window=sliding_window,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+        use_alibi=use_alibi,
+        dtype=torch.bfloat16,
+    )
 
 
 def test_sliding_window_none_equivalence(default_vllm_config):

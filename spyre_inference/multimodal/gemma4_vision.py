@@ -445,12 +445,16 @@ def patch_vision_encoder() -> None:
         cos = convert(cos, device=device)
         sin = convert(sin, device=device)
 
-        # One shared key-validity mask for the whole batch (padded_sdpa's contract). A
-        # batch mixing different valid-patch counts per row would need padded_sdpa
-        # extended to a per-row mask.
+        # padded_sdpa takes one key-validity mask for the whole batch, so a batch mixing
+        # valid-patch counts per row is refused rather than attended through row 0's mask.
         seq_len = attention_mask.shape[-1]
-        key_valid = convert(attention_mask[0], device="cpu").bool()
-        attn_mask = key_valid.unsqueeze(0).expand(seq_len, seq_len)
+        mask_host = convert(attention_mask, device="cpu")
+        if not bool((mask_host == mask_host[0]).all()):
+            raise NotImplementedError(
+                "Gemma 4 vision needs one key-validity mask shared by the whole batch "
+                "on Spyre; this batch mixes valid-patch counts per row."
+            )
+        attn_mask = mask_host[0].bool().unsqueeze(0).expand(seq_len, seq_len)
 
         orig_intermediate = config.intermediate_size
         padded_intermediate = align_up(orig_intermediate)
