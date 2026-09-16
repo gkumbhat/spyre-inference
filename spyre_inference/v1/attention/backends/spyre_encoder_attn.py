@@ -17,46 +17,27 @@
 Selected by ``TorchSpyrePlatform.get_attn_backend_cls`` for ENCODER/ENCODER_ONLY
 layers. Operates on direct Q/K/V tensors rather than the paged KV-cache path.
 
-Dense per-sequence attention over the packed ``[T, H, D]`` list; request
-boundaries ride in int32 row-index tables, so a Spyre card never has to do
-offset arithmetic on *shapes* -- offsets are data. Unlike the decoder, there is
-no paged KV cache forcing a block-wise walk: a sequence's whole K/V already
-fits in one gathered tensor, so attention is one dense
-``QKᵀ -> +mask -> softmax -> ·V``, not an online-softmax loop. That was blocked
-on torch-spyre#4526 (Inductor rewrites a visible ``matmul + mask + softmax +
-matmul`` into an ``F.sdpa``-equivalent that drops the additive mask on Spyre);
-now that it is fixed, the dense form is safe.
+Attention runs over the packed ``[T, H, D]`` token list; request boundaries ride
+in int32 row-index tables, so a card never does offset arithmetic on *shapes* --
+offsets are data. Requests sharing a padded length are served by one
+gather/attend/store (opt-in, ``SPYRE_ENCODER_BATCHED_ATTN``), since these
+kernels are dispatch-bound rather than compute-bound.
 
-Three separate compiled functions, not one, and that split is the point:
+Three separately compiled functions, and the split is the point: under
+``dynamic=False`` Dynamo keys on every argument's exact shape, so folding the
+gather and store into the attention math would make the expensive graph
+recompile per ``(buffer_rows, extent)`` instead of per ``extent``. Gather and
+store are cheap and keyed on the step's buffer size; the attention math is keyed
+only on the sequence's own padded length.
 
-- ``_encoder_gather_kernel`` pulls one sequence's rows out of the step's full
-  body buffer via ``index_select``.
-- ``_encoder_dense_attn_kernel`` does the actual attention math on those
-  already-gathered, sequence-sized tensors.
-- ``_encoder_store_kernel`` scatters the result back with ``index_copy_``.
+Two torch-spyre bugs shape the design. A compiled region reads its arguments
+from offset 0 and ignores ``storage_offset`` (#3770), so a sequence is gathered
+with ``index_select`` rather than sliced; a gather selecting its whole source
+faults the card (#4033), so an identity gather is skipped instead.
 
-Under ``dynamic=False`` Dynamo guards on every argument's exact shape, not just
-the ones the graph's output depends on. A step's Q/K/V/output buffers are sized
-to the *body token bucket* (``buffer_rows``), which varies across the whole
-compile_sizes ladder -- if the gather, the attention math, and the store were
-one function, that function's cache key would include ``buffer_rows``, and the
-expensive attention graph would recompile once per ``(buffer_rows, extent)``
-pair instead of once per ``extent``. Splitting gather/store (cheap: a handful
-of ops, keyed on ``buffer_rows``) away from the attention math (the expensive
-part, keyed only on the sequence's own padded length) collapses that back down
-to one compile per distinct length -- mirroring the decoder's own
-``_index_copy_kernel``, which is "compiled alone" for the same reason.
-
-Two torch-spyre bugs still shape the design. A compiled region reads its
-arguments from offset 0 and ignores ``storage_offset`` (#3770), so a sequence
-is gathered with ``index_select`` rather than sliced. A gather that selects its
-whole source faults the card (#4033), so an identity gather is skipped instead.
-
-No fallbacks: torch-spyre has no on-device ``arange``, ``full``, or similar
-construction op, so every index and mask tensor this file touches -- row
-tables, mask tiles -- is built on the host and ``convert``'d once, then cached
-and reused across sequences, layers, and steps. None of that construction
-happens inside a compiled kernel.
+No fallbacks: there is no on-device ``arange`` or ``full``, so every index and
+mask tensor here is built on the host, ``convert``'d once, then cached and
+reused across sequences, layers and steps.
 """
 
 from __future__ import annotations
@@ -118,58 +99,7 @@ def _encoder_gather_kernel(query, key, value, row_index):
 _encoder_gather_compiled = torch.compile(_encoder_gather_kernel, dynamic=False)
 
 
-def _encoder_dense_attn_kernel(
-    q_rows,
-    k_rows,
-    v_rows,
-    mask,
-    scale,
-    num_heads,
-    num_kv_heads,
-    head_size,
-):
-    """Dense masked self-attention over one already-gathered sequence.
-
-    ``head_size`` need not be stick-aligned: the kernel never slices a matmul
-    operand, so Inductor's ``insert_bmm_padding`` can pad the contraction
-    dimension itself.
-
-    Expected shapes:
-        q_rows: [extent, num_heads, head_size], one sequence, already gathered
-            (or passed straight through when the buffer already holds exactly
-            this sequence -- see ``needs_gather`` at the call site).
-        k_rows/v_rows: [extent, num_kv_heads, head_size], likewise.
-        mask: [num_kv_heads, num_queries_per_kv, 1, extent] additive mask. The
-            query axis is 1 because an encoder mask depends only on the KV
-            column: every query row, real or padding, attends to exactly the
-            real keys. That is what makes the padding rows exact duplicates of
-            the last real row, which in turn makes the duplicate-index store
-            downstream harmless.
-
-    Returns [extent, num_heads, head_size].
-    """
-    num_queries_per_kv = num_heads // num_kv_heads
-    extent = q_rows.shape[0]
-
-    q = (
-        (q_rows.unsqueeze(0).transpose(1, 2) * scale)
-        .reshape(num_kv_heads, num_queries_per_kv, extent, head_size)
-    )
-    k = k_rows.unsqueeze(0).transpose(1, 2).reshape(num_kv_heads, 1, extent, head_size)
-    v = v_rows.unsqueeze(0).transpose(1, 2).reshape(num_kv_heads, 1, extent, head_size)
-
-    scores = torch.matmul(q, k.transpose(-2, -1)) + mask
-    probs = torch.softmax(scores, dim=-1)
-    attn = torch.matmul(probs, v)
-
-    attn = attn.reshape(1, num_heads, extent, head_size).transpose(1, 2)
-    return attn.reshape(extent, num_heads, head_size)
-
-
-_encoder_dense_attn_compiled = torch.compile(_encoder_dense_attn_kernel, dynamic=False)
-
-
-def _encoder_grouped_attn_kernel(
+def _encoder_sdpa_kernel(
     q_rows,
     k_rows,
     v_rows,
@@ -180,59 +110,43 @@ def _encoder_grouped_attn_kernel(
     num_kv_heads,
     head_size,
 ):
-    """Dense masked self-attention over ``group`` sequences of equal padded length.
+    """Masked bidirectional attention over ``group`` sequences of equal padded length.
 
-    Same math as ``_encoder_dense_attn_kernel``, one call for the whole group.
-    Worth it because these kernels are dispatch-bound, not compute-bound: at
-    extent 64 the attention matmuls cost the same as the pure-copy store, so
-    collapsing ``group`` dispatches into one is nearly free.
+    ``group == 1`` is the ordinary single-sequence case, so this serves both.
 
-    ``group`` is folded into the *leading* batch dim, giving 4-D operands. The
-    apparently natural 5-D form ``[group, num_kv_heads, num_queries_per_kv,
-    extent, head_size]`` does not lower: torch-spyre's
-    ``insert_restickify_padding`` rejects the interleaved index it produces
-    ("host dim 0 ... carries multiple free symbols"). Keeping the rank at 4 --
-    the same rank the per-sequence kernel already uses -- avoids that.
+    ``F.scaled_dot_product_attention`` broadcasts the KV heads itself under
+    ``enable_gqa``, so operands stay 4-D and no ``num_queries_per_kv`` axis is
+    materialised -- which also keeps this clear of torch-spyre's
+    ``insert_restickify_padding``, whose assert rejects the interleaved index a
+    rank-5 matmul input picks up from ``reshape -> transpose -> reshape``.
+    Calling SDPA at all was blocked on torch-spyre#4526, where Inductor rewrote
+    a visible ``matmul + mask + softmax + matmul`` into an SDPA-equivalent that
+    dropped the additive mask.
 
-    Expected shapes:
-        q_rows: [group * extent, num_heads, head_size], members back to back.
-        k_rows/v_rows: [group * extent, num_kv_heads, head_size], likewise.
-        mask: [group * num_kv_heads, num_queries_per_kv, 1, extent] -- each
-            member's own mask, concatenated on dim 0 in member order, which is
-            the order the folded batch dim indexes (``g * num_kv_heads + h``).
-            Members may have different real ``kv_len``; only the mask differs.
+    Shapes: q_rows [group * extent, num_heads, head_size]; k_rows/v_rows the
+    same with num_kv_heads; mask [group, 1, 1, extent], one row per member. The
+    head and query axes broadcast because an encoder mask depends only on the KV
+    column -- every query row, real or padding, attends to exactly the real keys.
 
-    Returns [group * extent, num_heads, head_size], members back to back.
+    Returns [group * extent, num_heads, head_size].
     """
-    num_queries_per_kv = num_heads // num_kv_heads
     extent = q_rows.shape[0] // group
-
-    q = (
-        q_rows.reshape(group, extent, num_heads, head_size).transpose(1, 2) * scale
-    ).reshape(group * num_kv_heads, num_queries_per_kv, extent, head_size)
-    k = (
-        k_rows.reshape(group, extent, num_kv_heads, head_size)
-        .transpose(1, 2)
-        .reshape(group * num_kv_heads, 1, extent, head_size)
+    q = q_rows.reshape(group, extent, num_heads, head_size).transpose(1, 2)
+    k = k_rows.reshape(group, extent, num_kv_heads, head_size).transpose(1, 2)
+    v = v_rows.reshape(group, extent, num_kv_heads, head_size).transpose(1, 2)
+    attn = F.scaled_dot_product_attention(
+        q,
+        k,
+        v,
+        attn_mask=mask,
+        scale=scale,
+        is_causal=False,
+        enable_gqa=(num_heads != num_kv_heads),
     )
-    v = (
-        v_rows.reshape(group, extent, num_kv_heads, head_size)
-        .transpose(1, 2)
-        .reshape(group * num_kv_heads, 1, extent, head_size)
-    )
-
-    scores = torch.matmul(q, k.transpose(-2, -1)) + mask
-    probs = torch.softmax(scores, dim=-1)
-    attn = torch.matmul(probs, v)
-
-    return (
-        attn.reshape(group, num_heads, extent, head_size)
-        .transpose(1, 2)
-        .reshape(group * extent, num_heads, head_size)
-    )
+    return attn.transpose(1, 2).reshape(group * extent, num_heads, head_size)
 
 
-_encoder_grouped_attn_compiled = torch.compile(_encoder_grouped_attn_kernel, dynamic=False)
+_encoder_sdpa_compiled = torch.compile(_encoder_sdpa_kernel, dynamic=False)
 
 
 def _encoder_store_kernel(out, row_index, attn):
@@ -253,8 +167,8 @@ def _create_dense_attn_kernel(num_heads: int, num_kv_heads: int, head_size: int)
     """Test helper: bind the non-tensor args the way a forward call would."""
 
     def specialized_dense_attn_kernel(q_rows, k_rows, v_rows, mask, scale):
-        return _encoder_dense_attn_kernel(
-            q_rows, k_rows, v_rows, mask, scale, num_heads, num_kv_heads, head_size
+        return _encoder_sdpa_kernel(
+            q_rows, k_rows, v_rows, mask, scale, 1, num_heads, num_kv_heads, head_size
         )
 
     return specialized_dense_attn_kernel
@@ -262,50 +176,21 @@ def _create_dense_attn_kernel(num_heads: int, num_kv_heads: int, head_size: int)
 
 @dataclass
 class EncoderSeqPlan:
-    """Everything the kernels need for one request, built once per step."""
+    """What the kernels need for one group of equal-extent requests, per step.
 
-    start: int
-    query_len: int
-    needs_gather: bool
-    row_table: torch.Tensor
-    mask: torch.Tensor
-
-
-@dataclass
-class EncoderGroupPlan:
-    """Several equal-extent requests served by one gather/attend/store each.
-
-    ``group`` is always a power of two, and a step's requests at a given extent
-    are split into power-of-two chunks rather than padded up to one: padding a
-    group of 5 up to 8 would gather and attend 3 phantom sequences, while
-    splitting into 4 + 1 wastes nothing and keeps every shape on the same short
-    bucket ladder the ungrouped path already warms.
+    A group of one is the ordinary single-request case, so this covers both.
     """
 
     starts: list[int]
     query_lens: list[int]
     extent: int
-    group: int
+    needs_gather: bool
     row_table: torch.Tensor
     mask: torch.Tensor
 
-
-def _power_of_two_chunks(count: int, limit: int) -> list[int]:
-    """Split ``count`` members into descending power-of-two chunks, each <= ``limit``.
-
-    ``limit`` caps a chunk so its gathered row count stays within the row-count
-    ladder warmup already covers, which is what lets grouping reuse the existing
-    gather/store graphs instead of adding a shape axis to them.
-    """
-    chunks: list[int] = []
-    remaining = count
-    while remaining:
-        chunk = 1
-        while chunk * 2 <= remaining and chunk * 2 <= limit:
-            chunk *= 2
-        chunks.append(chunk)
-        remaining -= chunk
-    return chunks
+    @property
+    def group(self) -> int:
+        return len(self.starts)
 
 
 def encoder_index_dtype(device: torch.device) -> torch.dtype:
@@ -326,20 +211,16 @@ def encoder_row_table(start: int, query_len: int, extent: int, dtype: torch.dtyp
 
 def _const_tile(
     masked: bool,
-    num_kv_heads: int,
-    num_queries_per_kv: int,
     dtype: torch.dtype,
     device: torch.device,
     cache: dict | None,
 ) -> torch.Tensor:
     """Shared all-zero or all-masked 64-wide tile. Read-only: every mask aliases it."""
-    cache_key = (masked, num_kv_heads, num_queries_per_kv, dtype, str(device))
+    cache_key = (masked, dtype, str(device))
     tile = None if cache is None else cache.get(cache_key)
     if tile is None:
         fill = torch.finfo(dtype).min if masked else 0.0
-        host = torch.full(
-            (num_kv_heads, num_queries_per_kv, 1, ENCODER_BLOCK_SIZE), fill, dtype=dtype
-        )
+        host = torch.full((1, 1, 1, ENCODER_BLOCK_SIZE), fill, dtype=dtype)
         tile = convert(host, device)
         if cache is not None:
             cache[cache_key] = tile
@@ -349,35 +230,32 @@ def _const_tile(
 def encoder_mask(
     extent: int,
     kv_len: int,
-    num_kv_heads: int,
-    num_queries_per_kv: int,
     dtype: torch.dtype,
     device: torch.device,
     cache: dict | None = None,
 ) -> torch.Tensor:
-    """Dense additive mask [num_kv_heads, num_queries_per_kv, 1, extent].
+    """Additive mask [1, 1, 1, extent] for one sequence.
 
-    Built by concatenating 64-wide tiles, not by materialising ``extent``
-    fresh elements: interior tiles (entirely real keys) and beyond-the-end
-    tiles (entirely padding) are shared constants that ``cache`` hands out by
-    reference, so only the one tile straddling ``kv_len`` -- if any -- is
-    request-specific. The concatenation itself is a cheap on-device op; this
-    is where the mask's ``L``-squared growth disappears.
+    The head and query axes are 1 and left to broadcast: an encoder mask depends
+    only on the KV column, since every query row -- real or padding -- attends to
+    exactly the real keys. That also makes the mask ``num_heads`` times smaller
+    than a per-head one, which matters because it is rebuilt per request per step.
+
+    Built by concatenating 64-wide tiles rather than materialising ``extent``
+    fresh elements: interior tiles (all real keys) and beyond-the-end tiles (all
+    padding) are shared constants handed out by reference from ``cache``, so only
+    the one tile straddling ``kv_len`` -- if any -- is request-specific.
     """
     num_blocks = extent // ENCODER_BLOCK_SIZE
     tiles: list[torch.Tensor] = []
     for i in range(num_blocks):
         lo = i * ENCODER_BLOCK_SIZE
         if lo + ENCODER_BLOCK_SIZE <= kv_len:
-            tiles.append(_const_tile(False, num_kv_heads, num_queries_per_kv, dtype, device, cache))
+            tiles.append(_const_tile(False, dtype, device, cache))
         elif lo >= kv_len:
-            tiles.append(_const_tile(True, num_kv_heads, num_queries_per_kv, dtype, device, cache))
+            tiles.append(_const_tile(True, dtype, device, cache))
         else:
-            host = torch.full(
-                (num_kv_heads, num_queries_per_kv, 1, ENCODER_BLOCK_SIZE),
-                torch.finfo(dtype).min,
-                dtype=dtype,
-            )
+            host = torch.full((1, 1, 1, ENCODER_BLOCK_SIZE), torch.finfo(dtype).min, dtype=dtype)
             host[..., : kv_len - lo] = 0
             tiles.append(convert(host, device))
     return tiles[0] if num_blocks == 1 else torch.cat(tiles, dim=-1)
@@ -422,14 +300,12 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         super().__init__(*args, **kwargs)
         if self._compile_attn:
             self._gather_fn = _encoder_gather_compiled
-            self._attn_fn = _encoder_dense_attn_compiled
+            self._attn_fn = _encoder_sdpa_compiled
             self._store_fn = _encoder_store_compiled
-            self._grouped_attn_fn = _encoder_grouped_attn_compiled
         else:
             self._gather_fn = _encoder_gather_kernel
-            self._attn_fn = _encoder_dense_attn_kernel
+            self._attn_fn = _encoder_sdpa_kernel
             self._store_fn = _encoder_store_kernel
-            self._grouped_attn_fn = _encoder_grouped_attn_kernel
         # Grouping only pays off through the compiled kernels; in eager mode the
         # per-request loop has no launch overhead to amortise.
         self._batched_attn = self._compile_attn and envs.SPYRE_ENCODER_BATCHED_ATTN
@@ -442,26 +318,10 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
     def _run_gather(self, query, key, value, row_index):
         return _call_kernel("encoder_gather", self._gather_fn, query, key, value, row_index)
 
-    def _run_attn(self, q_rows, k_rows, v_rows, mask, num_heads, num_kv_heads, head_size):
+    def _run_attn(self, q_rows, k_rows, v_rows, mask, group, num_heads, num_kv_heads, head_size):
         return _call_kernel(
-            "encoder_dense_attn",
+            "encoder_sdpa",
             self._attn_fn,
-            q_rows,
-            k_rows,
-            v_rows,
-            mask,
-            self.scale,
-            num_heads,
-            num_kv_heads,
-            head_size,
-        )
-
-    def _run_grouped_attn(
-        self, q_rows, k_rows, v_rows, mask, group, num_heads, num_kv_heads, head_size
-    ):
-        return _call_kernel(
-            "encoder_grouped_attn",
-            self._grouped_attn_fn,
             q_rows,
             k_rows,
             v_rows,
@@ -488,35 +348,18 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
     ) -> None:
         """Compile every kernel a batch of this token count can ask for.
 
-        A request's padded length follows its own length, not the body bucket,
-        so the warmup dummies do not span the ladder on their own -- one long
-        request mid-serve would otherwise stall the server compiling. Doing it
-        here, on the first forward for each body size, keeps that cost inside
-        warmup, where the dummy runs already visit every body size.
+        A request's padded length follows its own length, not the body bucket, so
+        the warmup dummies do not span the ladder on their own; doing it here, on
+        the first forward per body size, keeps the cost inside warmup.
 
-        Every kernel is warmed against the step's own real tensors, never a
-        freshly built stand-in, because a Spyre tensor's *device layout* is part
-        of the compiled function's cache key and a stand-in does not reproduce
-        it. Two ways that bites, both observed on hardware:
-
-        - a fused-QKV projection (``qkv.split(...)``) hands ``query`` out as a
-          strided view, so a contiguous dummy warms a different specialization
-          than a real gather presents;
-        - ``output`` reaches us as ``torch.empty(rows, H*D).view(-1, H, D)``,
-          whose layout differs from a same-shaped ``torch.zeros``, so a scratch
-          destination warmed a store the real one could not reuse.
-
-        Warming the store therefore writes into the caller's ``output``. That is
-        safe: the per-plan loop immediately after this call overwrites every row
-        belonging to a real request, and rows outside those requests are padding
-        the pooler never reads. Values are irrelevant either way -- only
-        shape/stride/dtype/layout reach the cache key.
-
-        Both gather and store are keyed on ``buffer_rows`` (as well as
-        ``extent``, for gather), so both are rewarmed every time a new
-        ``buffer_rows`` is seen -- unlike attention, whose cache key is
-        ``extent`` alone, so calling it again on an already-seen extent is
-        just a cache hit, not a second compile.
+        Kernels are warmed against the caller's real tensors, never a stand-in: a
+        Spyre tensor's device layout is part of the cache key, and a stand-in does
+        not reproduce it. Both bit us -- a fused-QKV ``query`` is a strided view,
+        and ``output`` arrives as ``torch.empty(rows, H*D).view(-1, H, D)`` whose
+        layout differs from a same-shaped ``torch.zeros``. Warming the store
+        therefore writes into ``output``, which is safe because the per-plan loop
+        right after overwrites every real request's rows and the rest is padding
+        the pooler never reads.
         """
         buffer_rows = query.shape[0]
         if buffer_rows in self._warmed_buffers:
@@ -524,35 +367,31 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         self._warmed_buffers.add(buffer_rows)
 
         dtype, device = query.dtype, query.device
-        num_queries_per_kv = num_heads // num_kv_heads
         index_dtype = encoder_index_dtype(device)
 
         extent = ENCODER_BLOCK_SIZE
         while extent <= buffer_rows:
             rows = convert(encoder_row_table(0, extent, extent, index_dtype), device)
             q_rows, k_rows, v_rows = self._run_gather(query, key, value, rows)
-            mask = encoder_mask(
-                extent, extent, num_kv_heads, num_queries_per_kv, dtype, device, self._const_tiles
+            mask = encoder_mask(extent, extent, dtype, device, self._const_tiles)
+            attn = self._run_attn(
+                q_rows, k_rows, v_rows, mask, 1, num_heads, num_kv_heads, head_size
             )
-            attn = self._run_attn(q_rows, k_rows, v_rows, mask, num_heads, num_kv_heads, head_size)
             self._run_store(output, rows, attn)
 
             if self._batched_attn:
-                # Grouped attention is keyed on (group, extent). Gather and store
-                # are keyed on the *total* row count, which for a power-of-two
-                # group of a power-of-two extent is another entry on the same
-                # ladder this loop already walks -- so they need nothing extra.
+                # Attention is keyed on (group, extent); gather and store on the
+                # total row count, which for power-of-two group and extent is
+                # another entry on the ladder this loop already walks.
                 group = 2
                 while group * extent <= buffer_rows:
                     g_rows = convert(
-                        torch.cat(
-                            [encoder_row_table(0, extent, extent, index_dtype)] * group
-                        ),
+                        torch.cat([encoder_row_table(0, extent, extent, index_dtype)] * group),
                         device,
                     )
                     gq, gk, gv = self._run_gather(query, key, value, g_rows)
                     g_mask = torch.cat([mask] * group, dim=0)
-                    g_attn = self._run_grouped_attn(
+                    g_attn = self._run_attn(
                         gq, gk, gv, g_mask, group, num_heads, num_kv_heads, head_size
                     )
                     self._run_store(output, g_rows, g_attn)
@@ -563,10 +402,8 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         self,
         attn_metadata: SpyreAttentionMetadata,
         query: torch.Tensor,
-        num_kv_heads: int,
-        num_queries_per_kv: int,
     ) -> list[EncoderSeqPlan]:
-        """Row tables and masks for every request in the step."""
+        """Row tables and masks for the step, one plan per group of equal extent."""
         query_start_loc = attn_metadata.query_start_loc.cpu().tolist()
         seq_lens = attn_metadata.seq_lens.cpu().tolist()
         # The body may 1D-pad past num_actual_tokens; those rows are not a request.
@@ -575,8 +412,8 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         device = query.device
         index_dtype = encoder_index_dtype(device)
 
-        # (start, query_len, kv_len, extent) per real request, in arrival order.
-        requests: list[tuple[int, int, int, int]] = []
+        # (start, query_len, kv_len) keyed by extent, in arrival order.
+        by_extent: dict[int, list[tuple[int, int, int]]] = {}
         for seq_idx in range(attn_metadata.num_seqs):
             start = int(query_start_loc[seq_idx])
             query_len = int(query_start_loc[seq_idx + 1]) - start
@@ -585,80 +422,50 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
             query_len = min(query_len, num_tokens - start)
             kv_len = min(int(seq_lens[seq_idx]), query_len)
             extent = _blocks_for(max(query_len, kv_len)) * ENCODER_BLOCK_SIZE
-            requests.append((start, query_len, kv_len, extent))
+            by_extent.setdefault(extent, []).append((start, query_len, kv_len))
 
-        def single(start: int, query_len: int, kv_len: int, extent: int) -> EncoderSeqPlan:
+        def plan(members: list[tuple[int, int, int]], extent: int) -> EncoderSeqPlan:
+            exact_fill = (
+                len(members) == 1 and members[0][0] == 0 and members[0][1] == extent == buffer_rows
+            )
             return EncoderSeqPlan(
-                start=start,
-                query_len=query_len,
-                needs_gather=not (start == 0 and query_len == extent and buffer_rows == extent),
+                starts=[m[0] for m in members],
+                query_lens=[m[1] for m in members],
+                extent=extent,
+                # An identity gather faults the card (torch-spyre#4033).
+                needs_gather=not exact_fill,
                 row_table=convert(
-                    encoder_row_table(start, query_len, extent, index_dtype), device
-                ),
-                mask=encoder_mask(
-                    extent,
-                    kv_len,
-                    num_kv_heads,
-                    num_queries_per_kv,
-                    query.dtype,
+                    torch.cat(
+                        [encoder_row_table(m[0], m[1], extent, index_dtype) for m in members]
+                    ),
                     device,
-                    self._const_tiles,
+                ),
+                # Concatenated, not stacked: member order along dim 0 is what the
+                # kernel's batch dim indexes.
+                mask=torch.cat(
+                    [
+                        encoder_mask(extent, m[2], query.dtype, device, self._const_tiles)
+                        for m in members
+                    ],
+                    dim=0,
                 ),
             )
 
-        if not self._batched_attn:
-            return [single(*r) for r in requests]
-
-        by_extent: dict[int, list[tuple[int, int, int, int]]] = {}
-        for req in requests:
-            by_extent.setdefault(req[3], []).append(req)
-
-        plans: list[EncoderSeqPlan | EncoderGroupPlan] = []
+        plans: list[EncoderSeqPlan] = []
         for extent, members in sorted(by_extent.items()):
-            # Cap a chunk's gathered rows at buffer_rows so the gather and store
-            # keep reusing the row-count graphs warmup already built for them.
-            limit = max(1, buffer_rows // extent)
+            if not self._batched_attn:
+                plans.extend(plan([m], extent) for m in members)
+                continue
+            # Split into descending power-of-two chunks rather than padding up to
+            # one: padding 5 members to 8 would attend 3 phantom sequences. Chunks
+            # are capped so their row count stays on the ladder warmup covers, which
+            # is what lets gather and store reuse their existing graphs.
+            cap = 1 << (max(1, buffer_rows // extent).bit_length() - 1)
             offset = 0
-            for chunk in _power_of_two_chunks(len(members), limit):
-                part = members[offset : offset + chunk]
+            while offset < len(members):
+                chunk = min(1 << ((len(members) - offset).bit_length() - 1), cap)
+                plans.append(plan(members[offset : offset + chunk], extent))
                 offset += chunk
-                if chunk == 1:
-                    plans.append(single(*part[0]))
-                    continue
-                plans.append(
-                    EncoderGroupPlan(
-                        starts=[m[0] for m in part],
-                        query_lens=[m[1] for m in part],
-                        extent=extent,
-                        group=chunk,
-                        row_table=convert(
-                            torch.cat(
-                                [
-                                    encoder_row_table(m[0], m[1], extent, index_dtype)
-                                    for m in part
-                                ]
-                            ),
-                            device,
-                        ),
-                        # Member order along dim 0 is what the kernel's folded
-                        # batch dim indexes, so concatenate, do not stack.
-                        mask=torch.cat(
-                            [
-                                encoder_mask(
-                                    extent,
-                                    m[2],
-                                    num_kv_heads,
-                                    num_queries_per_kv,
-                                    query.dtype,
-                                    device,
-                                    self._const_tiles,
-                                )
-                                for m in part
-                            ],
-                            dim=0,
-                        ),
-                    )
-                )
         return plans
 
     def forward(  # ty: ignore[invalid-method-override]
@@ -709,44 +516,34 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
 
         # Built once per step; the whole encoder stack shares one build.
         if attn_metadata.encoder_seq_plans is None:
-            attn_metadata.encoder_seq_plans = self._build_plans(
-                attn_metadata, query, num_kv_heads, num_heads // num_kv_heads
-            )
+            attn_metadata.encoder_seq_plans = self._build_plans(attn_metadata, query)
 
         for plan in attn_metadata.encoder_seq_plans:
-            if isinstance(plan, EncoderGroupPlan):
-                q_rows, k_rows, v_rows = self._run_gather(query, key, value, plan.row_table)
-                attn = self._run_grouped_attn(
-                    q_rows, k_rows, v_rows, plan.mask, plan.group,
-                    num_heads, num_kv_heads, head_size,
-                )
-                if store_mode == "index":
-                    self._run_store(output, plan.row_table, attn)
-                else:
-                    for i, (start, query_len) in enumerate(zip(plan.starts, plan.query_lens)):
-                        base = i * plan.extent
-                        output[start : start + query_len] = attn[base : base + query_len]
-                continue
-
             if plan.needs_gather:
                 q_rows, k_rows, v_rows = self._run_gather(query, key, value, plan.row_table)
             else:
-                # index_select always returns a fresh contiguous tensor, so the
-                # gather path never hits this -- but a fused QKV projection
-                # (qkv.split(...)) hands out strided views, and a compiled
-                # region can't resolve that layout for the matmul/reduction
-                # that follows. .contiguous() is a no-op when it's already
-                # contiguous, so this only ever costs a real copy for fused
-                # QKV models. Same fix the old pack path applied for the same
-                # reason ("Fused QKV views are strided").
+                # A fused QKV projection (qkv.split(...)) hands out strided views,
+                # which a compiled region cannot resolve; index_select would have
+                # returned something contiguous, so only this path needs the copy.
                 q_rows, k_rows, v_rows = query.contiguous(), key.contiguous(), value.contiguous()
 
-            attn = self._run_attn(q_rows, k_rows, v_rows, plan.mask, num_heads, num_kv_heads, head_size)
+            attn = self._run_attn(
+                q_rows,
+                k_rows,
+                v_rows,
+                plan.mask,
+                plan.group,
+                num_heads,
+                num_kv_heads,
+                head_size,
+            )
 
             if store_mode == "index":
                 self._run_store(output, plan.row_table, attn)
             else:
-                output[plan.start : plan.start + plan.query_len] = attn[: plan.query_len]
+                for i, (start, query_len) in enumerate(zip(plan.starts, plan.query_lens)):
+                    base = i * plan.extent
+                    output[start : start + query_len] = attn[base : base + query_len]
 
         return output
 

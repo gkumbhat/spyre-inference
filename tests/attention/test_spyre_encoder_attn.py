@@ -255,9 +255,11 @@ def test_blocks_for_rounds_up_to_powers_of_two():
 
 
 def test_encoder_mask_cuts_at_the_boundary_block():
-    mask = encoder_mask(3 * ENCODER_BLOCK_SIZE, 100, 2, 1, torch.float32, torch.device("cpu"), {})
+    mask = encoder_mask(3 * ENCODER_BLOCK_SIZE, 100, torch.float32, torch.device("cpu"), {})
     masked = torch.finfo(torch.float32).min
-    assert mask.shape == (2, 1, 1, 3 * ENCODER_BLOCK_SIZE)
+    # Head and query axes stay 1 and broadcast: an encoder mask depends only on
+    # the KV column, so it need not be materialised per head.
+    assert mask.shape == (1, 1, 1, 3 * ENCODER_BLOCK_SIZE)
     # Block 0 (cols 0:64) is all real keys, block 1 (64:128) straddles
     # kv_len=100, block 2 (128:192) is all padding.
     assert torch.equal(mask[..., :64], torch.zeros_like(mask[..., :64]))
@@ -267,8 +269,8 @@ def test_encoder_mask_cuts_at_the_boundary_block():
 
 
 def test_encoder_mask_single_block_skips_the_cat():
-    mask = encoder_mask(ENCODER_BLOCK_SIZE, 64, 2, 1, torch.float32, torch.device("cpu"), {})
-    assert mask.shape == (2, 1, 1, ENCODER_BLOCK_SIZE)
+    mask = encoder_mask(ENCODER_BLOCK_SIZE, 64, torch.float32, torch.device("cpu"), {})
+    assert mask.shape == (1, 1, 1, ENCODER_BLOCK_SIZE)
 
 
 def test_row_table_clamps_padding_lanes_to_the_last_real_row():
@@ -292,7 +294,7 @@ def test_dense_attn_kernel_never_calls_arange(monkeypatch):
     q_rows = torch.randn(extent, num_heads, head_size, dtype=torch.float32)
     k_rows = torch.randn(extent, num_kv_heads, head_size, dtype=torch.float32)
     v_rows = torch.randn(extent, num_kv_heads, head_size, dtype=torch.float32)
-    mask = encoder_mask(extent, length, num_kv_heads, 1, q_rows.dtype, q_rows.device, {})
+    mask = encoder_mask(extent, length, q_rows.dtype, q_rows.device, {})
 
     real_arange = torch.arange
     calls = {"n": 0}
@@ -339,7 +341,6 @@ def _dense_attn(
     """Drive gather + dense attention over a packed list the way ``forward`` does."""
     num_heads, head_size = query.shape[1], query.shape[2]
     num_kv_heads = key.shape[1]
-    num_queries_per_kv = num_heads // num_kv_heads
     index_dtype = encoder_index_dtype(query.device)
     tile_cache: dict = {}
     attn_fn = _create_dense_attn_kernel(num_heads, num_kv_heads, head_size)
@@ -348,9 +349,7 @@ def _dense_attn(
     for length in query_lens:
         extent = _blocks_for(length) * ENCODER_BLOCK_SIZE
         row_index = encoder_row_table(start, length, extent, index_dtype)
-        mask = encoder_mask(
-            extent, length, num_kv_heads, num_queries_per_kv, query.dtype, query.device, tile_cache
-        )
+        mask = encoder_mask(extent, length, query.dtype, query.device, tile_cache)
         q_rows, k_rows, v_rows = _encoder_gather_kernel(query, key, value, row_index)
         attn = attn_fn(q_rows, k_rows, v_rows, mask, scale)
         out.index_copy_(0, row_index, attn)
@@ -663,7 +662,7 @@ def test_encoder_seq_plans_built_once_and_reused_across_layers(default_vllm_conf
     cached_plans = attn_metadata.encoder_seq_plans
     assert cached_plans is not None
     assert len(cached_plans) == 1
-    assert cached_plans[0].query_len == 32
+    assert cached_plans[0].query_lens == [32]
 
     impl.forward(**fwd, output=torch.empty_like(query))
     assert attn_metadata.encoder_seq_plans is cached_plans
@@ -726,7 +725,8 @@ def test_encoder_build_survives_a_body_bucket_past_max_model_len(default_vllm_co
 
 
 @pytest.mark.parametrize(
-    "configure_compilation", [pytest.param("STOCK_TORCH_COMPILE", id="compilation_STOCK")],
+    "configure_compilation",
+    [pytest.param("STOCK_TORCH_COMPILE", id="compilation_STOCK")],
     indirect=True,
 )
 @pytest.mark.parametrize(

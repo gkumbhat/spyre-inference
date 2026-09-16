@@ -82,9 +82,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Batch encoder attention over requests that share a padded length, instead of
     # one gather/attend/store per request. Off by default: grouping trades kernel
     # launches for extra warmup graphs, and the balance is workload-dependent.
-    "SPYRE_ENCODER_BATCHED_ATTN": lambda: bool(
-        int(os.getenv("SPYRE_ENCODER_BATCHED_ATTN", "0"))
-    ),
+    "SPYRE_ENCODER_BATCHED_ATTN": lambda: bool(int(os.getenv("SPYRE_ENCODER_BATCHED_ATTN", "0"))),
     # When "1", reuse compiled Spyre kernels across processes by caching them on
     # disk. Off by default. TORCHINDUCTOR_FORCE_DISABLE_CACHES=1 disables the cache
     # even when this flag is enabled.

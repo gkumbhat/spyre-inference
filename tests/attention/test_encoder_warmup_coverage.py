@@ -74,12 +74,21 @@ class TestWarmKernelsCoversTheBucket:
 
         monkeypatch.setattr(impl, "_run_gather", counting_run_gather)
         query, key, value = _dummy_qkv(
-            buffer_rows, impl.num_heads, impl.num_kv_heads, impl.head_size,
-            impl.model_dtype, torch.device("cpu"),
+            buffer_rows,
+            impl.num_heads,
+            impl.num_kv_heads,
+            impl.head_size,
+            impl.model_dtype,
+            torch.device("cpu"),
         )
         impl._warm_kernels(
-            query, key, value, torch.zeros_like(query),
-            impl.num_heads, impl.num_kv_heads, impl.head_size,
+            query,
+            key,
+            value,
+            torch.zeros_like(query),
+            impl.num_heads,
+            impl.num_kv_heads,
+            impl.head_size,
         )
 
         expected_extents = set()
@@ -112,12 +121,21 @@ class TestWarmKernelsCoversTheBucket:
 
         for buffer_rows in (256, 128, 64):  # largest first, like real warmup
             query, key, value = _dummy_qkv(
-                buffer_rows, impl.num_heads, impl.num_kv_heads, impl.head_size,
-                impl.model_dtype, torch.device("cpu"),
+                buffer_rows,
+                impl.num_heads,
+                impl.num_kv_heads,
+                impl.head_size,
+                impl.model_dtype,
+                torch.device("cpu"),
             )
             impl._warm_kernels(
-                query, key, value, torch.zeros_like(query),
-                impl.num_heads, impl.num_kv_heads, impl.head_size,
+                query,
+                key,
+                value,
+                torch.zeros_like(query),
+                impl.num_heads,
+                impl.num_kv_heads,
+                impl.head_size,
             )
 
         assert seen_out_rows == {64, 128, 256}
@@ -136,8 +154,12 @@ class TestWarmKernelsCoversTheBucket:
         impl = _make_impl()
         buffer_rows = 128
         query, key, value = _dummy_qkv(
-            buffer_rows, impl.num_heads, impl.num_kv_heads, impl.head_size,
-            impl.model_dtype, torch.device("cpu"),
+            buffer_rows,
+            impl.num_heads,
+            impl.num_kv_heads,
+            impl.head_size,
+            impl.model_dtype,
+            torch.device("cpu"),
         )
         # Built the way vLLM builds it: a view of a 2-D allocation.
         output = torch.zeros(
@@ -153,8 +175,13 @@ class TestWarmKernelsCoversTheBucket:
 
         monkeypatch.setattr(impl, "_run_store", recording_run_store)
         impl._warm_kernels(
-            query, key, value, output,
-            impl.num_heads, impl.num_kv_heads, impl.head_size,
+            query,
+            key,
+            value,
+            output,
+            impl.num_heads,
+            impl.num_kv_heads,
+            impl.head_size,
         )
 
         assert seen_out, "warmup must exercise the store"
@@ -188,8 +215,13 @@ class TestWarmKernelsCoversTheBucket:
 
         monkeypatch.setattr(impl, "_run_gather", recording_run_gather)
         impl._warm_kernels(
-            query, key, value, torch.zeros_like(query),
-            impl.num_heads, impl.num_kv_heads, impl.head_size,
+            query,
+            key,
+            value,
+            torch.zeros_like(query),
+            impl.num_heads,
+            impl.num_kv_heads,
+            impl.head_size,
         )
 
         assert seen_strides and all(s == query.stride() for s in seen_strides)
@@ -206,19 +238,33 @@ class TestWarmKernelsCoversTheBucket:
 
         monkeypatch.setattr(impl, "_run_gather", counting_run_gather)
         query, key, value = _dummy_qkv(
-            128, impl.num_heads, impl.num_kv_heads, impl.head_size,
-            impl.model_dtype, torch.device("cpu"),
+            128,
+            impl.num_heads,
+            impl.num_kv_heads,
+            impl.head_size,
+            impl.model_dtype,
+            torch.device("cpu"),
         )
 
         impl._warm_kernels(
-            query, key, value, torch.zeros_like(query),
-            impl.num_heads, impl.num_kv_heads, impl.head_size,
+            query,
+            key,
+            value,
+            torch.zeros_like(query),
+            impl.num_heads,
+            impl.num_kv_heads,
+            impl.head_size,
         )
         first = calls["n"]
         assert first > 0
         impl._warm_kernels(
-            query, key, value, torch.zeros_like(query),
-            impl.num_heads, impl.num_kv_heads, impl.head_size,
+            query,
+            key,
+            value,
+            torch.zeros_like(query),
+            impl.num_heads,
+            impl.num_kv_heads,
+            impl.head_size,
         )
         assert calls["n"] == first
 

@@ -198,18 +198,11 @@ _last_graph_count = 0
 _late_compiles: dict[str, int] = {}
 
 
-def late_compile_counts() -> dict[str, int]:
-    """Graphs compiled after warmup, by label. Empty means genuinely none."""
-    return dict(_late_compiles)
-
-
 def note_unattributed_compiles(where: str) -> None:
-    """Report graphs compiled since the last accounted point, outside our kernels.
+    """Report graphs compiled outside our kernels, which ``_call_kernel`` cannot see.
 
-    ``_call_kernel`` only sees its own call, so a compile in the model body or the
-    pooler is invisible to it -- which made "no warning" look like "no compiles".
-    Calling this at a known point in the step closes that gap: anything the kernels
-    did not account for is reported here instead.
+    Without this a compile in the body or pooler is invisible, so "no warning"
+    does not mean "no compiles".
     """
     global _last_graph_count
     now = counters["stats"]["unique_graphs"]
@@ -235,10 +228,8 @@ def _call_kernel(label: str, fn, *args):
     a single-tenant serving process; if it ever stops holding, the cost is a spurious
     warning, not a wrong result.
 
-    Every late compile is logged, not just the first: these are not one-off events
-    (a fresh shape compiles whenever traffic first reaches it), and ``warning_once``
-    deduplicates on the message, so it reported "at least one" as though it were
-    exactly one.
+    Every late compile is logged, not just the first: ``warning_once`` dedups on
+    the message, so it reported "at least one" as though it were exactly one.
     """
     global _last_graph_count
     if not _warmup_complete:
