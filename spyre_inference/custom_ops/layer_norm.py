@@ -100,8 +100,7 @@ class SpyreLayerNorm(torch.nn.LayerNorm):
                 from vllm.platforms import current_platform
 
                 logger.info_once(
-                    "Compiling SpyreLayerNorm as its own graph: no enclosing graph "
-                    "covers it."
+                    "Compiling SpyreLayerNorm as its own graph: no enclosing graph covers it."
                 )
                 # dynamic=False is mandatory: the Spyre backend rejects SymInt shapes.
                 kernel = torch.compile(

@@ -67,8 +67,8 @@ def register() -> None:
     if getattr(vit_attn_wrappers.apply_sdpa, "_spyre_patched", False):
         return
 
-    _padded_apply_sdpa._spyre_patched = True  # ty: ignore[unresolved-attribute]
-    vit_attn_wrappers.apply_sdpa = _padded_apply_sdpa
+    _padded_apply_sdpa._spyre_patched = True
+    vit_attn_wrappers.apply_sdpa = _padded_apply_sdpa  # ty: ignore[invalid-assignment]
     logger.debug_once(
         "Patched vllm.v1.attention.ops.vit_attn_wrappers.apply_sdpa to pad to "
         "the 64-element stick before calling SDPA."

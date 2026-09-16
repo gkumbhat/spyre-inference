@@ -239,11 +239,13 @@ class TestPoolingWarmupSkipsDecoderAttnBugForMultiRequestCells:
         calls: list[tuple[int, bool, bool]] = []
 
         def dummy_run(num_tokens, **kwargs):
-            calls.append((
-                num_tokens,
-                bool(kwargs.get("create_mixed_batch")),
-                bool(kwargs.get("force_attention")),
-            ))
+            calls.append(
+                (
+                    num_tokens,
+                    bool(kwargs.get("create_mixed_batch")),
+                    bool(kwargs.get("force_attention")),
+                )
+            )
             return object(), object()
 
         runner = SimpleNamespace(

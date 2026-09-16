@@ -85,5 +85,7 @@ def _spyre_merge_multimodal_embeddings(
 def register() -> None:
     """Monkeypatch ``_merge_multimodal_embeddings`` to avoid the unimplemented
     ``aten::_index_put_impl_`` op on Spyre."""
-    vllm_utils._merge_multimodal_embeddings = _spyre_merge_multimodal_embeddings
+    vllm_utils._merge_multimodal_embeddings = (  # ty: ignore[invalid-assignment]
+        _spyre_merge_multimodal_embeddings
+    )
     logger.debug_once("Patched vllm._merge_multimodal_embeddings for Spyre")
