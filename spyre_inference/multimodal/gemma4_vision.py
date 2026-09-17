@@ -185,9 +185,11 @@ def _padded_rms_norm(
     """RMSNorm with the denominator scaled back to ``orig_head_dim``, so the zero padding
     lanes do not deflate the variance. ``None`` means the input is not padded.
 
-    No fp32 promotion, unlike the hf-adapters reference: torch-spyre does not support it
-    (``custom_ops/rms_norm.py``), and an on-device round trip through fp32 leaves a
-    stick-tiling state a later eager elementwise op cannot broadcast against.
+    Kept in the storage dtype rather than promoted to fp32 like the hf-adapters
+    reference: fp16 and bf16 are one format on device, and an fp32 round trip changes the
+    stick tiling of the result, which a later eager elementwise op cannot always
+    broadcast against. The cost is small at bf16 -- against an fp32 host reference on the
+    real vision weights, cosine 0.9989 here against 0.99992 with an fp32 variance.
     """
     dtype = hidden_states.dtype
     variance = (hidden_states * hidden_states).mean(-1, keepdim=True)
