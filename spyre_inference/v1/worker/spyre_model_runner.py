@@ -415,8 +415,14 @@ class _SpyreModelWrapper:
             return t
 
         kwargs = tree_map(_to_spyre_float, kwargs)
-        out = self._model.embed_multimodal(**kwargs)
-        return out
+        # Vision towers run eager, so each Spyre op with a decomposition reaches it
+        # through torch-spyre's lazily-compiled PrivateUse1 kernel, which compiles
+        # without fullgraph. Decompositions built on for_each_tile (SDPA since
+        # torch-spyre#4550) emit a scan whose while_loop lowering reads the loop index
+        # with .item(); without fullgraph that needs capture_scalar_outputs, or the
+        # trace dies with DataDependentOutputException.
+        with torch._dynamo.config.patch(capture_scalar_outputs=True):
+            return self._model.embed_multimodal(**kwargs)
 
     def embed_input_ids(
         self,
