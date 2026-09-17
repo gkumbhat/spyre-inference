@@ -1035,6 +1035,7 @@ class SpyreAttentionBackend(AttentionBackend):
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
         "auto",
         "float16",
+        "bfloat16",
     ]
 
     @staticmethod
@@ -1125,6 +1126,14 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # TorchSpyrePlatform.check_and_update_config enforces float16 or bfloat16.
         _dtype = get_current_vllm_config().model_config.dtype
         self.model_dtype: torch.dtype = _dtype if isinstance(_dtype, torch.dtype) else torch.float16
+
+        # The kernels read a page at model dtype and Spyre has no cast on the way in, so
+        # the two 2-byte dtypes are not interchangeable per-cache.
+        if kv_cache_dtype not in ("auto", str(self.model_dtype).removeprefix("torch.")):
+            raise ValueError(
+                f"kv_cache_dtype={kv_cache_dtype} does not match the model dtype "
+                f"{self.model_dtype} on Spyre; use 'auto'."
+            )
 
         # ALiBi slopes: per-head linear-bias coefficients (BLOOM/MPT style).
         # Reshape once to [num_kv_heads, num_queries_per_kv, 1, 1] so the
@@ -1519,15 +1528,11 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
     @classmethod
     def allocate_pages(
-        cls,
-        num_blocks: int,
-        spec: AttentionSpec,
-        device: torch.device,
-        *,
-        dtype: torch.dtype,
+        cls, num_blocks: int, spec: AttentionSpec, device: torch.device
     ) -> SpyrePagedKVCache:
         """Allocate the paged K/V tensors in the layout this impl's kernels read."""
         # Host-allocated then transferred: only .to() takes a device_layout.
+        dtype = spec.dtype
         layout = slot_major_kv_layout(
             num_blocks * spec.block_size, spec.num_kv_heads, spec.head_size, dtype
         )

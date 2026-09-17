@@ -90,6 +90,31 @@ def test_torch_accelerator_ops_are_noop():
         torch.accelerator.empty_host_cache = saved_empty_host_cache
 
 
+def test_memory_info_falls_back_to_host_ram(monkeypatch):
+    """Spyre registers no accelerator memory-info hook, so the native call raises;
+    vLLM's vision-encoder chunking budget needs a real number back."""
+    from spyre_inference.platform import _disable_torch_accelerator
+
+    def _unimplemented(*args, **kwargs):
+        raise NotImplementedError("getMemoryInfo is not implemented for this allocator yet.")
+
+    monkeypatch.setattr(torch.accelerator, "get_memory_info", _unimplemented, raising=True)
+    _disable_torch_accelerator()
+
+    free, total = torch.accelerator.get_memory_info()
+    assert free > 0
+    assert total >= free
+
+
+def test_memory_info_passes_through_when_the_native_call_works(monkeypatch):
+    from spyre_inference.platform import _disable_torch_accelerator
+
+    monkeypatch.setattr(torch.accelerator, "get_memory_info", lambda *a, **k: (123, 456))
+    _disable_torch_accelerator()
+
+    assert torch.accelerator.get_memory_info() == (123, 456)
+
+
 def test_num_gpu_blocks_override_homogeneous():
     """Non-hybrid models get seqs × blocks/seq pinned, plus the null block."""
     from spyre_inference.platform import TorchSpyrePlatform

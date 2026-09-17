@@ -436,6 +436,12 @@ def patch_vision_encoder() -> None:
         orig_head_dim = config.head_dim
         padded_head_dim = _padded_head_dim(orig_head_dim)
 
+        if getattr(self.layers[0].self_attn, "_spyre_padded_head_dim", None) != padded_head_dim:
+            raise RuntimeError(
+                "Gemma 4 vision weights are not padded; `pad_vision_weights` runs from "
+                "`apply()` at load time and has to precede the first forward."
+            )
+
         device = inputs_embeds.device
         dtype = inputs_embeds.dtype
 
@@ -456,13 +462,8 @@ def patch_vision_encoder() -> None:
             )
         attn_mask = mask_host[0].bool().unsqueeze(0).expand(seq_len, seq_len)
 
-        orig_intermediate = config.intermediate_size
-        padded_intermediate = align_up(orig_intermediate)
-
         hidden_states = inputs_embeds
         for layer in self.layers[: config.num_hidden_layers]:
-            _prepare_attention(layer.self_attn, num_heads, orig_head_dim, padded_head_dim)
-            _pad_mlp(layer, orig_intermediate, padded_intermediate)
             hidden_states = _run_layer(
                 layer,
                 hidden_states,
@@ -608,34 +609,6 @@ def patch_pooler() -> None:
     )
 
 
-def patch_accelerator_memory_info() -> None:
-    """Fall back to host RAM for ``torch.accelerator.get_memory_info()``.
-
-    ``_process_image_input`` calls this to size its encoder-chunking budget, and Spyre
-    registers no memory-info hook, so the native call always raises. Host RAM is the right
-    substitute: the transients this budget guards run on the host.
-    """
-    orig = torch.accelerator.get_memory_info
-    if getattr(orig, "_spyre_patched", False):
-        return
-
-    def _get_memory_info(*args, **kwargs):
-        try:
-            return orig(*args, **kwargs)
-        except NotImplementedError:
-            import psutil
-
-            vm = psutil.virtual_memory()
-            return (vm.available, vm.total)
-
-    _get_memory_info._spyre_patched = True
-    torch.accelerator.get_memory_info = _get_memory_info  # ty: ignore[invalid-assignment]
-    logger.info_once(
-        "Spyre: torch.accelerator.get_memory_info() falls back to host RAM "
-        "(psutil) when the native accelerator call is unimplemented."
-    )
-
-
 def patch_patch_embedder() -> None:
     """Run ``Gemma4VisionPatchEmbedder``'s position-embedding gather on the host.
 
@@ -668,6 +641,31 @@ def patch_patch_embedder() -> None:
     logger.info_once("Spyre: Gemma4VisionPatchEmbedder position-embedding gather runs on CPU.")
 
 
+def pad_vision_weights(model: torch.nn.Module) -> None:
+    """Pad the encoder's attention projections, norms and MLP width to the stick.
+
+    Load-time weight surgery rather than a first-forward side effect: `apply()` already
+    runs after the weights land and before compile, and a forward that padded in place
+    would both probe every layer forever and mutate the module mid-trace.
+    """
+    encoder = getattr(getattr(model, "vision_tower", None), "encoder", None)
+    if encoder is None:
+        return
+    config = encoder.config
+    padded_head_dim = _padded_head_dim(config.head_dim)
+    padded_intermediate = align_up(config.intermediate_size)
+    for layer in encoder.layers[: config.num_hidden_layers]:
+        _prepare_attention(
+            layer.self_attn, config.num_attention_heads, config.head_dim, padded_head_dim
+        )
+        _pad_mlp(layer, config.intermediate_size, padded_intermediate)
+    logger.info_once(
+        "Spyre: padded the Gemma 4 vision tower's head dim to %d and its MLP width to %d.",
+        padded_head_dim,
+        padded_intermediate,
+    )
+
+
 def place_vision_tail_on_cpu(model: torch.nn.Module) -> None:
     """Keep the post-pooler tail on the host: standardize buffers and ``embed_vision``.
 
@@ -693,9 +691,9 @@ def place_vision_tail_on_cpu(model: torch.nn.Module) -> None:
 def apply(model: torch.nn.Module, device: torch.device) -> None:
     """Install every Gemma 4 vision-tower workaround."""
     del device
-    patch_accelerator_memory_info()
     patch_rms_norm()
     patch_patch_embedder()
     patch_pooler()
     patch_vision_encoder()
+    pad_vision_weights(model)
     place_vision_tail_on_cpu(model)

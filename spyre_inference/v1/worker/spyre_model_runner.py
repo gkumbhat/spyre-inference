@@ -1350,9 +1350,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             # stubs) gets the token-major default.
             impl = getattr(static_ctx.get(kv_cache_tensor.shared_by[0]), "impl", None)
             impl_cls = type(impl) if isinstance(impl, SpyreAttentionImpl) else SpyreAttentionImpl
-            page_cache = impl_cls.allocate_pages(
-                num_blocks, spec, self._spyre_device, dtype=self._model_dtype()
-            )
+            page_cache = impl_cls.allocate_pages(num_blocks, spec, self._spyre_device)
             for layer_name in kv_cache_tensor.shared_by:
                 kv_caches[layer_name] = page_cache
 

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""End-to-end multimodal (Pixtral vision + Ministral-3 decoder) tests.
+"""End-to-end multimodal tests: Pixtral vision + Ministral-3, and the Gemma 4 tower.
 
 No upstream VLM generation test runs on Spyre (see the test_pixtral.py entry in
 `upstream_tests.yaml`), so the end-to-end guarantee lives here. A synthetic image has
@@ -28,6 +28,10 @@ from spyre_testing_plugin.pytest_plugin import spyre_device_count
 # Pixtral vision encoder + multimodal projector + Ministral-3 text decoder.
 # The 14B is what this branch was brought up against — no smaller stand-in.
 MODEL = "mistralai/Ministral-3-14B-Instruct-2512-BF16"
+
+# Stock transformers vision tower + Gemma-4 MoE decoder, the second vision path here.
+# `-it`: the base checkpoint ships no chat template.
+GEMMA4_MODEL = "google/gemma-4-26B-A4B-it"
 
 MAX_MODEL_LEN = 4096
 MAX_TOKENS = 16
@@ -70,17 +74,24 @@ def _conversation(*uris: str):
     ]
 
 
-def _generate(conversations, enforce_eager: bool, images_per_prompt: int = 1):
+def _generate(
+    conversations,
+    enforce_eager: bool,
+    images_per_prompt: int = 1,
+    model: str = MODEL,
+    config_format: str = "mistral",
+    dtype: str = "float16",
+):
     from vllm import LLM, SamplingParams
 
     llm = LLM(
-        model=MODEL,
+        model=model,
         # Explicit, not `auto`: auto's mistral probe is a live Hub call, so the
         # offline CI runner silently loads the unpatched HF tower instead.
-        config_format="mistral",
+        config_format=config_format,
         max_model_len=MAX_MODEL_LEN,
         max_num_seqs=len(conversations),
-        dtype="float16",
+        dtype=dtype,
         enforce_eager=enforce_eager,
         limit_mm_per_prompt={"image": images_per_prompt},
     )
@@ -132,6 +143,32 @@ def test_two_image_prompt_produces_output():
     (text,) = _generate([_conversation(*uris)], enforce_eager=True, images_per_prompt=2)
 
     assert text.strip(), "empty generation from the two-image multimodal path"
+
+
+@pytest.mark.multimodal
+@pytest.mark.gemma4_vision
+@pytest.mark.uses_subprocess
+def test_gemma4_single_image_prompt_produces_output(monkeypatch):
+    """The Gemma 4 tower on card, which the unit tests cannot reach: they check the
+    rewrite on CPU, this checks that what it rewrites to actually lowers.
+
+    `dtype="auto"`: the platform picks this checkpoint's dtype itself.
+    """
+    if spyre_device_count() == 0:
+        pytest.skip("Spyre device not available")
+
+    monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")
+
+    uri = _synthetic_image_data_uri()
+    (text,) = _generate(
+        [_conversation(uri)],
+        enforce_eager=True,
+        model=GEMMA4_MODEL,
+        config_format="hf",
+        dtype="auto",
+    )
+
+    assert text.strip(), "empty generation from the Gemma 4 vision path"
 
 
 if __name__ == "__main__":

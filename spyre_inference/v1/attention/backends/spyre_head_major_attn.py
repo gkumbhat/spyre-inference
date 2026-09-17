@@ -148,13 +148,9 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
 
     @classmethod
     def allocate_pages(
-        cls,
-        num_blocks: int,
-        spec: AttentionSpec,
-        device: torch.device,
-        *,
-        dtype: torch.dtype,
+        cls, num_blocks: int, spec: AttentionSpec, device: torch.device
     ) -> SpyrePagedKVCache:
+        dtype = spec.dtype
         layout = head_major_kv_layout(
             num_blocks * spec.num_kv_heads, spec.block_size, spec.head_size, dtype
         )

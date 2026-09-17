@@ -68,6 +68,22 @@ def _disable_torch_accelerator() -> None:
     if hasattr(torch.accelerator, "empty_host_cache"):
         torch.accelerator.empty_host_cache = _noop  # ty: ignore[invalid-assignment]
 
+    # get_memory_info() has a real caller rather than a shutdown one: vLLM sizes its
+    # vision-encoder chunking budget with it. Host RAM is the right answer, since the
+    # transients that budget guards run on the host.
+    native_memory_info = torch.accelerator.get_memory_info
+
+    def _memory_info(*args, **kwargs) -> tuple[int, int]:
+        try:
+            return native_memory_info(*args, **kwargs)
+        except NotImplementedError:
+            import psutil
+
+            vm = psutil.virtual_memory()
+            return (vm.available, vm.total)
+
+    torch.accelerator.get_memory_info = _memory_info  # ty: ignore[invalid-assignment]
+
 
 _disable_torch_accelerator()
 
@@ -338,8 +354,15 @@ class TorchSpyrePlatform(CpuPlatform):
 
     @classmethod
     def _default_dtype(cls, vllm_config: VllmConfig) -> torch.dtype:
-        """float16, except a gemma-4 run that builds its vision tower, which overflows it
-        to NaN logits.
+        """float16, except a gemma-4 run that builds its vision tower, which fp16 cannot
+        run.
+
+        Both dtypes map to the same device format (``SEN169_FP16``), so the choice is about
+        the host dtypes and the cast onto the card, not on-device arithmetic. Two things
+        break there at fp16: the tower's activations reach ``|h| ~ 2400`` by layer 26, so
+        IEEE fp16 overflows ``h*h`` in half of its RMSNorms host-side (cosine 0.04 against
+        fp32 with real weights), and a forced-fp16 run does not even lower -- a mixed-EA
+        layout error on the encoder's ``residual + post_attention_layernorm(...)``.
 
         Scoped to the vision checkpoints on purpose: text-only gemma-4 is validated in
         fp16 here. Runs after vLLM resolved ``model_config.dtype``, so an explicit

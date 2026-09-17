@@ -23,6 +23,7 @@ The patches are `getattr`-guarded, so a transformers rename would silently no-op
 """
 
 import copy
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -33,6 +34,24 @@ configuration_gemma4 = pytest.importorskip("transformers.models.gemma4.configura
 
 # The patch replaces the class attribute process-wide, so capture the stock forward here.
 STOCK_ENCODER_FORWARD = modeling_gemma4.Gemma4VisionEncoder.forward
+
+# `Gemma4RMSNorm` is shared with the gemma-4 text model, so a patch that outlives the
+# test changes every later one in the process.
+_PATCHED_ATTRS = [
+    (modeling_gemma4.Gemma4RMSNorm, "forward"),
+    (modeling_gemma4.Gemma4VisionEncoder, "forward"),
+    (modeling_gemma4.Gemma4VisionPooler, "forward"),
+    (modeling_gemma4.Gemma4VisionPatchEmbedder, "_position_embeddings"),
+]
+
+
+@pytest.fixture(autouse=True)
+def restore_patched_classes():
+    stock = [(cls, name, getattr(cls, name)) for cls, name in _PATCHED_ATTRS]
+    yield
+    for cls, name, attr in stock:
+        setattr(cls, name, attr)
+
 
 pytestmark = [pytest.mark.gemma4_vision]
 
@@ -425,31 +444,6 @@ def test_dispatch_routes_gemma4_tower_away_from_pixtral(monkeypatch):
     assert called == [], "a text-only model must get no vision patches"
 
 
-def test_accelerator_memory_info_falls_back_to_host_ram(monkeypatch):
-    """Spyre registers no accelerator memory-info hook, so the native call raises;
-    Gemma 4's encoder chunking needs a real number back."""
-    from spyre_inference.multimodal import gemma4_vision
-
-    def _unimplemented(*args, **kwargs):
-        raise NotImplementedError("getMemoryInfo is not implemented for this allocator yet.")
-
-    monkeypatch.setattr(torch.accelerator, "get_memory_info", _unimplemented, raising=True)
-    gemma4_vision.patch_accelerator_memory_info()
-
-    free, total = torch.accelerator.get_memory_info()
-    assert free > 0
-    assert total >= free
-
-
-def test_accelerator_memory_info_passes_through_when_native_call_works(monkeypatch):
-    from spyre_inference.multimodal import gemma4_vision
-
-    monkeypatch.setattr(torch.accelerator, "get_memory_info", lambda *a, **k: (123, 456))
-    gemma4_vision.patch_accelerator_memory_info()
-
-    assert torch.accelerator.get_memory_info() == (123, 456)
-
-
 # ---------------------------------------------------------------------------
 # Correctness regressions
 # ---------------------------------------------------------------------------
@@ -786,6 +780,13 @@ def _encoder(num_layers: int = 2, num_patches: int = NUM_PATCHES):
     return modeling_gemma4.Gemma4VisionEncoder(config).eval()
 
 
+def _pad(encoder) -> None:
+    """`pad_vision_weights` walks a model down to its encoder, the way `apply()` does."""
+    from spyre_inference.multimodal import gemma4_vision
+
+    gemma4_vision.pad_vision_weights(SimpleNamespace(vision_tower=SimpleNamespace(encoder=encoder)))
+
+
 def _encoder_inputs(batch: int = 1, num_patches: int = NUM_PATCHES, valid: int | None = None):
     hidden = NUM_HEADS * ORIG_HEAD_DIM
     embeds = torch.randn(batch, num_patches, hidden)
@@ -811,6 +812,7 @@ def test_patched_encoder_forward_matches_stock(valid):
 
     gemma4_vision.patch_vision_encoder()
     gemma4_vision.patch_rms_norm()
+    _pad(encoder)
     with torch.inference_mode():
         actual = encoder(embeds, mask, pixel_position_ids=pos).last_hidden_state
 
@@ -827,8 +829,35 @@ def test_patched_encoder_rejects_a_batch_mixing_valid_patch_counts():
 
     gemma4_vision.patch_vision_encoder()
     encoder = _encoder()
+    _pad(encoder)
     embeds, mask, pos = _encoder_inputs(batch=2)
     mask[1, -5:] = False
 
     with pytest.raises(NotImplementedError, match="valid-patch counts"):
         encoder(embeds, mask, pixel_position_ids=pos)
+
+
+def test_patched_encoder_refuses_to_pad_its_own_weights():
+    """Padding is load-time work `apply()` does, not a first-forward side effect: an
+    unpadded tower has to say so instead of mutating itself mid-trace."""
+    from spyre_inference.multimodal import gemma4_vision
+
+    gemma4_vision.patch_vision_encoder()
+    encoder = _encoder()
+    embeds, mask, pos = _encoder_inputs()
+
+    with pytest.raises(RuntimeError, match="not padded"):
+        encoder(embeds, mask, pixel_position_ids=pos)
+
+
+def test_pad_vision_weights_pads_every_layer():
+    """`pad_vision_weights` reaches the layers through the tower, as `apply()` hands it
+    the whole model."""
+    encoder = _encoder(num_layers=3)
+    _pad(encoder)
+
+    from spyre_inference.multimodal.utils import align_up
+
+    for layer in encoder.layers:
+        assert layer.self_attn.q_proj.linear.out_features == NUM_HEADS * PADDED_HEAD_DIM
+        assert layer.mlp.gate_proj.linear.out_features == align_up(encoder.config.intermediate_size)

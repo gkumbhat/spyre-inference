@@ -1270,6 +1270,20 @@ def test_supported_dtypes_includes_bfloat16():
 
     assert torch.float16 in SpyreAttentionBackend.supported_dtypes
     assert torch.bfloat16 in SpyreAttentionBackend.supported_dtypes
+    assert "bfloat16" in SpyreAttentionBackend.supported_kv_cache_dtypes
+
+
+def test_kv_cache_dtype_that_disagrees_with_the_model_is_rejected(default_vllm_config):
+    """The kernels read a page at model dtype with no cast on the way in, so an explicit
+    `--kv-cache-dtype` naming the other 2-byte dtype has to fail at construction."""
+    from spyre_inference.v1.attention.backends.spyre_attn import SpyreAttentionImpl
+
+    kwargs = dict(num_heads=8, head_size=64, scale=0.125, num_kv_heads=8)
+    for accepted in ("auto", "float16"):
+        assert SpyreAttentionImpl(kv_cache_dtype=accepted, **kwargs) is not None
+
+    with pytest.raises(ValueError, match="does not match the model dtype"):
+        SpyreAttentionImpl(kv_cache_dtype="bfloat16", **kwargs)
 
 
 @pytest.mark.parametrize(
