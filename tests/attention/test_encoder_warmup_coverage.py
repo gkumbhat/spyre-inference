@@ -66,13 +66,14 @@ class TestWarmKernelsCoversTheBucket:
         buffer_rows = 256
         seen_gathers: set[int] = set()
         impl = _make_impl()
-        real_run_gather = impl._run_gather
+        real_run = impl._run_fused
 
-        def counting_run_gather(query, key, value, row_index):
+        def counting_run(out, row_index, *args, **kwargs):
             seen_gathers.add(row_index.shape[0])
-            return real_run_gather(query, key, value, row_index)
+            return real_run(out, row_index, *args, **kwargs)
 
-        monkeypatch.setattr(impl, "_run_gather", counting_run_gather)
+        # The gather is inside the fused graph; its row table is arg 2.
+        monkeypatch.setattr(impl, "_run_fused", counting_run)
         query, key, value = _dummy_qkv(
             buffer_rows,
             impl.num_heads,
@@ -111,13 +112,14 @@ class TestWarmKernelsCoversTheBucket:
         """
         impl = _make_impl()
         seen_out_rows: set[int] = set()
-        real_run_store = impl._run_store
+        real_run = impl._run_fused
 
-        def counting_run_store(out, row_index, attn):
+        def counting_run(out, *args, **kwargs):
             seen_out_rows.add(out.shape[0])
-            return real_run_store(out, row_index, attn)
+            return real_run(out, *args, **kwargs)
 
-        monkeypatch.setattr(impl, "_run_store", counting_run_store)
+        # The store is fused into the attention call, so hook that.
+        monkeypatch.setattr(impl, "_run_fused", counting_run)
 
         for buffer_rows in (256, 128, 64):  # largest first, like real warmup
             query, key, value = _dummy_qkv(
@@ -167,13 +169,14 @@ class TestWarmKernelsCoversTheBucket:
         ).view(-1, impl.num_heads, impl.head_size)
 
         seen_out = []
-        real_run_store = impl._run_store
+        real_run = impl._run_fused
 
-        def recording_run_store(out, row_index, attn):
+        def recording_run(out, *args, **kwargs):
             seen_out.append(out)
-            return real_run_store(out, row_index, attn)
+            return real_run(out, *args, **kwargs)
 
-        monkeypatch.setattr(impl, "_run_store", recording_run_store)
+        # The store is fused into the attention call, so hook that.
+        monkeypatch.setattr(impl, "_run_fused", recording_run)
         impl._warm_kernels(
             query,
             key,
@@ -207,13 +210,14 @@ class TestWarmKernelsCoversTheBucket:
         assert not query.is_contiguous(), "test setup must exercise a genuinely strided view"
 
         seen_strides: list[tuple] = []
-        real_run_gather = impl._run_gather
+        real_run = impl._run_fused
 
-        def recording_run_gather(q, k, v, row_index):
+        def recording_run(out, row_index, q, k, v, *args, **kwargs):
             seen_strides.append(q.stride())
-            return real_run_gather(q, k, v, row_index)
+            return real_run(out, row_index, q, k, v, *args, **kwargs)
 
-        monkeypatch.setattr(impl, "_run_gather", recording_run_gather)
+        # The gather is inside the fused graph, which takes the buffers directly.
+        monkeypatch.setattr(impl, "_run_fused", recording_run)
         impl._warm_kernels(
             query,
             key,
@@ -230,13 +234,13 @@ class TestWarmKernelsCoversTheBucket:
         """A second call at the same ``buffer_rows`` must not re-warm anything."""
         impl = _make_impl()
         calls = {"n": 0}
-        real_run_gather = impl._run_gather
+        real_run = impl._run_fused
 
-        def counting_run_gather(*args, **kwargs):
+        def counting_run(*args, **kwargs):
             calls["n"] += 1
-            return real_run_gather(*args, **kwargs)
+            return real_run(*args, **kwargs)
 
-        monkeypatch.setattr(impl, "_run_gather", counting_run_gather)
+        monkeypatch.setattr(impl, "_run_fused", counting_run)
         query, key, value = _dummy_qkv(
             128,
             impl.num_heads,
@@ -345,13 +349,13 @@ def test_warmup_stops_at_the_longest_reachable_extent(monkeypatch):
     # this test is about the extent axis, so measure it on its own.
     monkeypatch.setattr(impl, "_batched_attn", False)
     seen: set[int] = set()
-    real_run_gather = impl._run_gather
+    real_run = impl._run_fused
 
-    def counting_run_gather(query, key, value, row_index):
+    def counting_run(out, row_index, *args, **kwargs):
         seen.add(row_index.shape[0])
-        return real_run_gather(query, key, value, row_index)
+        return real_run(out, row_index, *args, **kwargs)
 
-    monkeypatch.setattr(impl, "_run_gather", counting_run_gather)
+    monkeypatch.setattr(impl, "_run_fused", counting_run)
     query, key, value = _dummy_qkv(
         512,
         impl.num_heads,

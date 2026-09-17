@@ -32,8 +32,7 @@ only on the sequence's own padded length.
 
 Two torch-spyre bugs shape the design. A compiled region reads its arguments
 from offset 0 and ignores ``storage_offset`` (#3770), so a sequence is gathered
-with ``index_select`` rather than sliced; a gather selecting its whole source
-faults the card (#4033), so an identity gather is skipped instead.
+with ``index_select`` rather than sliced.
 
 No fallbacks: there is no on-device ``arange`` or ``full``, so every index and
 mask tensor here is built on the host, ``convert``'d once, then cached and
@@ -165,6 +164,46 @@ def _encoder_store_kernel(out, row_index, attn):
 _encoder_store_compiled = torch.compile(_encoder_store_kernel, dynamic=False)
 
 
+def _encoder_fused_kernel(
+    out,
+    row_index,
+    query,
+    key,
+    value,
+    mask,
+    scale,
+    group,
+    num_heads,
+    num_kv_heads,
+    head_size,
+):
+    """Gather, attend and store one group of equal-extent requests, in one graph.
+
+    Every jobplan launch carries its own parameter upload, so launch count is a
+    device-path cost, not just host bookkeeping: profiling put attention at 61%
+    of the launches in a step. One graph per group per layer instead of three
+    removes two thirds of those.
+
+    The copies themselves do not get cheaper -- index_select is charged for the
+    source and index_copy_ for the destination, whatever graph they sit in
+    (torch-spyre#4239 is fixed only for layout-compliant destinations). This buys
+    launch overhead and the intermediate round trips, not copy cost.
+
+    Keyed on ``(out.shape[0], group, extent)``. That carries ``buffer_rows``
+    into the expensive attention graph, which the three-way split existed to
+    avoid, so it trades warmup for serving throughput.
+    """
+    q_rows, k_rows, v_rows = _encoder_gather_kernel(query, key, value, row_index)
+    attn = _encoder_sdpa_kernel(
+        q_rows, k_rows, v_rows, mask, scale, group, num_heads, num_kv_heads, head_size
+    )
+    out.index_copy_(0, row_index, attn)
+    return out
+
+
+_encoder_fused_compiled = torch.compile(_encoder_fused_kernel, dynamic=False)
+
+
 def _create_dense_attn_kernel(num_heads: int, num_kv_heads: int, head_size: int):
     """Test helper: bind the non-tensor args the way a forward call would."""
 
@@ -186,7 +225,6 @@ class EncoderSeqPlan:
     starts: list[int]
     query_lens: list[int]
     extent: int
-    needs_gather: bool
     row_table: torch.Tensor
     mask: torch.Tensor
 
@@ -321,10 +359,12 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
             self._gather_fn = _encoder_gather_compiled
             self._attn_fn = _encoder_sdpa_compiled
             self._store_fn = _encoder_store_compiled
+            self._fused_fn = _encoder_fused_compiled
         else:
             self._gather_fn = _encoder_gather_kernel
             self._attn_fn = _encoder_sdpa_kernel
             self._store_fn = _encoder_store_kernel
+            self._fused_fn = _encoder_fused_kernel
         # Grouping only pays off through the compiled kernels; in eager mode the
         # per-request loop has no launch overhead to amortise.
         self._batched_attn = self._compile_attn and envs.SPYRE_ENCODER_BATCHED_ATTN
@@ -353,6 +393,35 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
             q_rows,
             k_rows,
             v_rows,
+            mask,
+            self.scale,
+            group,
+            num_heads,
+            num_kv_heads,
+            head_size,
+        )
+
+    def _run_fused(
+        self,
+        out,
+        row_index,
+        query,
+        key,
+        value,
+        mask,
+        group,
+        num_heads,
+        num_kv_heads,
+        head_size,
+    ):
+        return _call_kernel(
+            "encoder_fused",
+            self._fused_fn,
+            out,
+            row_index,
+            query,
+            key,
+            value,
             mask,
             self.scale,
             group,
@@ -401,29 +470,43 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         max_extent = min(buffer_rows, self._max_extent)
         while extent <= max_extent:
             rows = convert(encoder_row_table(0, extent, extent, index_dtype), device)
-            q_rows, k_rows, v_rows = self._run_gather(query, key, value, rows)
             mask = encoder_mask(extent, extent, dtype, device, self._const_tiles)
-            attn = self._run_attn(
-                q_rows, k_rows, v_rows, mask, 1, num_heads, num_kv_heads, head_size
+            # The fused graph gathers internally, so warm it on the buffers, not
+            # on gathered rows. The standalone gather/attn/store still need
+            # warming for the exact-fill plan, which cannot use the fused graph.
+            self._run_fused(
+                output,
+                rows,
+                query,
+                key,
+                value,
+                mask,
+                1,
+                num_heads,
+                num_kv_heads,
+                head_size,
             )
-            self._run_store(output, rows, attn)
 
             if self._batched_attn:
-                # Attention is keyed on (group, extent); gather and store on the
-                # total row count, which for power-of-two group and extent is
-                # another entry on the ladder this loop already walks.
                 group = 2
                 while group * extent <= buffer_rows:
                     g_rows = convert(
                         torch.cat([encoder_row_table(0, extent, extent, index_dtype)] * group),
                         device,
                     )
-                    gq, gk, gv = self._run_gather(query, key, value, g_rows)
                     g_mask = torch.cat([mask] * group, dim=0)
-                    g_attn = self._run_attn(
-                        gq, gk, gv, g_mask, group, num_heads, num_kv_heads, head_size
+                    self._run_fused(
+                        output,
+                        g_rows,
+                        query,
+                        key,
+                        value,
+                        g_mask,
+                        group,
+                        num_heads,
+                        num_kv_heads,
+                        head_size,
                     )
-                    self._run_store(output, g_rows, g_attn)
                     group *= 2
             extent *= 2
 
@@ -454,15 +537,10 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
             by_extent.setdefault(extent, []).append((start, query_len, kv_len))
 
         def plan(members: list[tuple[int, int, int]], extent: int) -> EncoderSeqPlan:
-            exact_fill = (
-                len(members) == 1 and members[0][0] == 0 and members[0][1] == extent == buffer_rows
-            )
             return EncoderSeqPlan(
                 starts=[m[0] for m in members],
                 query_lens=[m[1] for m in members],
                 extent=extent,
-                # An identity gather faults the card (torch-spyre#4033).
-                needs_gather=not exact_fill,
                 row_table=convert(
                     torch.cat(
                         [encoder_row_table(m[0], m[1], extent, index_dtype) for m in members]
@@ -568,14 +646,23 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
             attn_metadata.encoder_seq_plans = self._build_plans(attn_metadata, query)
 
         for plan in attn_metadata.encoder_seq_plans:
-            if plan.needs_gather:
-                q_rows, k_rows, v_rows = self._run_gather(query, key, value, plan.row_table)
-            else:
-                # A fused QKV projection (qkv.split(...)) hands out strided views,
-                # which a compiled region cannot resolve; index_select would have
-                # returned something contiguous, so only this path needs the copy.
-                q_rows, k_rows, v_rows = query.contiguous(), key.contiguous(), value.contiguous()
+            if store_mode == "index":
+                # One graph for the whole plan: gather, attend, store.
+                self._run_fused(
+                    output,
+                    plan.row_table,
+                    query,
+                    key,
+                    value,
+                    plan.mask,
+                    plan.group,
+                    num_heads,
+                    num_kv_heads,
+                    head_size,
+                )
+                continue
 
+            q_rows, k_rows, v_rows = self._run_gather(query, key, value, plan.row_table)
             attn = self._run_attn(
                 q_rows,
                 k_rows,
@@ -586,13 +673,9 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
                 num_kv_heads,
                 head_size,
             )
-
-            if store_mode == "index":
-                self._run_store(output, plan.row_table, attn)
-            else:
-                for i, (start, query_len) in enumerate(zip(plan.starts, plan.query_lens)):
-                    base = i * plan.extent
-                    output[start : start + query_len] = attn[base : base + query_len]
+            for i, (start, query_len) in enumerate(zip(plan.starts, plan.query_lens)):
+                base = i * plan.extent
+                output[start : start + query_len] = attn[base : base + query_len]
 
         if narrow_into is not None:
             rows = narrow_into.shape[0]

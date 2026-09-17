@@ -77,7 +77,7 @@ def configure_compilation(request, monkeypatch):
 
     cfg.mode = compilation_mode
     # Increase recompilation limit: the block kernel is specialized (and so
-    # recompiled) per unique (num_blocks, needs_gather).
+    # recompiled) per unique (group, extent, buffer_rows).
     torch._dynamo.config.accumulated_recompile_limit = 1024
 
     yield mode_name
@@ -580,7 +580,7 @@ def test_single_sequence_exactly_filling_the_buffer_handles_a_fused_qkv_view(
     default_vllm_config, configure_device: str
 ) -> None:
     """Regression test: a single request whose length exactly equals the padded
-    extent takes the ``needs_gather=False`` path, which used to hand the raw
+    extent used to take a no-gather path, which handed the raw
     query/key/value straight to the attention math with no normalization. A
     model with a fused QKV projection (``qkv.split(...)``) hands out *strided*
     views there, not contiguous tensors -- on real Spyre hardware this crashed
