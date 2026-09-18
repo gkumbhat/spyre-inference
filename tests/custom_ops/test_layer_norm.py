@@ -55,7 +55,7 @@ def test_spyre_layer_norm_cpu_matches_reference(default_vllm_config, elementwise
     )
 
     torch.testing.assert_close(actual.float(), expected.float(), atol=1e-2, rtol=1e-2)
-    assert layer._spyre_kernel is None
+    assert layer.spyre_compiled_kernel is None
 
 
 @pytest.mark.layer_norm
@@ -86,18 +86,18 @@ def test_spyre_layer_norm_matches_reference_on_spyre(
     actual = layer(x.to("spyre"))
 
     assert actual.device.type == "spyre"
-    assert layer._spyre_kernel is not None  # lazily compiled and cached
+    assert layer.spyre_compiled_kernel is not None  # lazily compiled and cached
     torch.testing.assert_close(actual.cpu().float(), expected.float(), atol=1e-2, rtol=1e-2)
 
-    kernel_after_first_call = layer._spyre_kernel
+    kernel_after_first_call = layer.spyre_compiled_kernel
     layer(x.to("spyre"))
-    assert layer._spyre_kernel is kernel_after_first_call  # reused, not rebuilt
+    assert layer.spyre_compiled_kernel is kernel_after_first_call  # reused, not rebuilt
 
 
 @pytest.mark.layer_norm
 def test_spyre_layer_norm_eager_mode_skips_torch_compile():
     """CompilationMode.NONE (enforce_eager) runs the raw _layer_norm_kernel
-    directly, without wrapping it in its own torch.compile call."""
+    directly, without ever populating a torch.compile'd kernel."""
     from vllm.config import (
         CompilationMode,
         DeviceConfig,
@@ -107,7 +107,7 @@ def test_spyre_layer_norm_eager_mode_skips_torch_compile():
     )
     from vllm.config.compilation import CompilationConfig
 
-    from spyre_inference.custom_ops.layer_norm import SpyreLayerNorm, _layer_norm_kernel
+    from spyre_inference.custom_ops.layer_norm import SpyreLayerNorm
 
     # TorchSpyrePlatform.check_and_update_config keys off model_config.enforce_eager
     # (not compilation_config.mode -- see platform.py) and runs automatically inside
@@ -122,7 +122,7 @@ def test_spyre_layer_norm_eager_mode_skips_torch_compile():
         layer = SpyreLayerNorm(64, eps=1e-5).to(torch.float16).to("spyre")
         layer(torch.randn(2, 64, dtype=torch.float16).to("spyre"))
 
-    assert layer._spyre_kernel is _layer_norm_kernel
+    assert layer.spyre_compiled_kernel is None
 
 
 @pytest.mark.layer_norm
@@ -149,7 +149,7 @@ def test_spyre_layer_norm_inline_inside_compiled_graph(default_vllm_config):
     actual = compiled(x.to("spyre"))
 
     torch.testing.assert_close(actual.cpu().float(), expected.float(), atol=1e-2, rtol=1e-2)
-    assert layer._spyre_kernel is None
+    assert layer.spyre_compiled_kernel is None
 
 
 if __name__ == "__main__":
