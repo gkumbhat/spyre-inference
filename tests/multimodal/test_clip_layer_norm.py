@@ -85,6 +85,23 @@ def test_apply_skips_missing_post_layernorm():
     assert model.vision_model.post_layernorm is None
 
 
+def test_apply_skips_a_non_layernorm_boundary_norm():
+    """A vision tower using RMSNorm/nn.Identity for its boundary norm (not CLIP's
+    plain LayerNorm) must be left alone, not crash on `normalized_shape`."""
+    model = types.SimpleNamespace(
+        text_model=types.SimpleNamespace(final_layer_norm=torch.nn.Identity()),
+        vision_model=types.SimpleNamespace(
+            pre_layrnorm=torch.nn.Identity(), post_layernorm=torch.nn.Identity()
+        ),
+    )
+
+    apply_clip_patches(model, torch.device("cpu"))
+
+    assert isinstance(model.text_model.final_layer_norm, torch.nn.Identity)
+    assert isinstance(model.vision_model.pre_layrnorm, torch.nn.Identity)
+    assert isinstance(model.vision_model.post_layernorm, torch.nn.Identity)
+
+
 def test_apply_tolerates_a_model_with_neither_tower():
     """apply_multimodal_patches gates on hasattr(text_model/vision_model); apply()
     itself must also tolerate a model missing both (defensive, not load-bearing)."""
@@ -111,14 +128,26 @@ def test_apply_preserves_shape_eps_affine_bias(elementwise_affine, bias):
 
 
 def test_apply_multimodal_patches_dispatches_to_clip():
-    """`hasattr(model, "text_model"/"vision_model")` is the gate `apply_multimodal_patches`
-    uses to route CLIP-shaped models to clip.apply() -- a rename would silently stop
-    dispatching, so pin the exact attribute names."""
+    """`model.config.model_type == "clip"` is the gate `apply_multimodal_patches` uses
+    to route to clip.apply() -- a rename would silently stop dispatching, so pin the
+    exact check."""
     model = _fake_clip_model()
+    model.config = types.SimpleNamespace(model_type="clip")
 
     apply_multimodal_patches(model, torch.device("cpu"))
 
     assert isinstance(model.text_model.final_layer_norm, SpyreLayerNorm)
+
+
+def test_apply_multimodal_patches_skips_a_non_clip_model_with_the_same_shape():
+    """A model_type mismatch (e.g. BLIP-2, which also sets vision_model) must not
+    dispatch to clip.apply() just because the attributes happen to be present."""
+    model = _fake_clip_model()
+    model.config = types.SimpleNamespace(model_type="blip-2")
+
+    apply_multimodal_patches(model, torch.device("cpu"))
+
+    assert not isinstance(model.text_model.final_layer_norm, SpyreLayerNorm)
 
 
 if __name__ == "__main__":
