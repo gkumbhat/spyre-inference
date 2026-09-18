@@ -443,9 +443,22 @@ class _SpyreModelWrapper:
         __call__, so it needs its own CPU <-> Spyre boundary conversion.
         `group_and_batch_mm_kwargs` batches multimodal kwargs onto
         self.device=CPU, but the vision tower's weights live on Spyre.
+
+        Cast to float16 explicitly (not just a device move): a processor may hand
+        back fp32 pixel_values, which the model itself never downcasts, so an
+        on-device fp32 tensor would either need a CPU round-trip (`convert`) or
+        run as fp32 "garbage" (torch-spyre#2971). A variable-resolution model can
+        also hand back `pixel_values` as `list[Tensor]` rather than one stacked
+        tensor, so the conversion must recurse via `tree_map`, not a flat
+        per-kwarg pass.
         """
 
-        kwargs_converted = {key: self._to_spyre(val) for key, val in kwargs.items()}
+        def _to_spyre_float(t):
+            if isinstance(t, torch.Tensor) and t.is_floating_point():
+                return convert(t, dtype=torch.float16, device=self._spyre_device)
+            return t
+
+        kwargs_converted = tree_map(_to_spyre_float, kwargs)
         result = self._model.embed_multimodal(**kwargs_converted)
         return tree_map(self._to_cpu, result)
 
@@ -458,7 +471,23 @@ class _SpyreModelWrapper:
         multimodal_embeddings come back from embed_multimodal already
         converted to CPU, but the text embedding table (and the merge with
         multimodal_embeddings) lives on Spyre.
+
+        Bucket the token count: this runs on the raw scheduled count, so at TP>1
+        the vocab-parallel all_reduce is `num_tokens * hidden` for every distinct
+        prompt length, and some of those collective schedules fail to build. Pad
+        on CPU and trim after; padding inside a compiled collective corrupts
+        output. `is_multimodal` is padded the same way so it still lines up with
+        `input_ids` for the merge; the padded rows are never multimodal.
         """
+        num_tokens = input_ids.shape[0]
+        bucketer = self._shape_bucketer
+        padded_tokens = bucketer.find_bucket(num_tokens) if bucketer is not None else None
+        if padded_tokens is not None and padded_tokens != num_tokens:
+            input_ids = F.pad(input_ids, (0, padded_tokens - num_tokens))
+            if is_multimodal is not None:
+                is_multimodal = F.pad(is_multimodal, (0, padded_tokens - num_tokens))
+        else:
+            padded_tokens = None
 
         input_ids = convert(input_ids, dtype=torch.int64, device=self._spyre_device)
         is_multimodal = self._to_spyre(is_multimodal)
@@ -467,6 +496,15 @@ class _SpyreModelWrapper:
         result = self._model.embed_input_ids(
             input_ids, multimodal_embeddings, is_multimodal=is_multimodal
         )
+        if padded_tokens is not None:
+            # A plain prefix slice, not select_rows: the padding above always
+            # appends at the end, so the real rows are always 0..num_tokens
+            # contiguously -- no gather needed, and this result has already been
+            # through the multimodal merge (a torch.where select), whose output
+            # layout select_rows's own compiled index_select does not accept.
+            result = tree_map(
+                lambda t: t[:num_tokens] if isinstance(t, torch.Tensor) else t, result
+            )
         return tree_map(self._to_cpu, result)
 
     def __getattr__(self, name):
