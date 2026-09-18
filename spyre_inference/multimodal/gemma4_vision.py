@@ -188,7 +188,7 @@ def _padded_rms_norm(
     Kept in the storage dtype rather than promoted to fp32 like the hf-adapters
     reference: an fp32 round trip changes the stick tiling of the result, and the eager
     elementwise op that follows then fails to lower at all (mixed-EA broadcast). Measured
-    on device with the input held identical, this norm is exact to bf16 rounding --
+    on device with the input held identical, this norm is exact to 2-byte rounding --
     cosine 1.00002 against an fp32 host reference, per-op relative error 5e-3 -- so the
     2-byte variance is not what costs this tower accuracy.
     """
@@ -245,9 +245,10 @@ def _fp32_inv_freq(rotary_emb, config) -> tuple[torch.Tensor, float]:
     """Rope frequencies in fp32 plus the initializer's attention scaling, recomputed rather
     than read off the module buffer.
 
-    `model.to(bfloat16)` downcasts `inv_freq`, and these frequencies span 1.0 down to
-    ~1e-4 where bf16 costs real precision -- amplified because the angle is
-    `position * inv_freq`. Upcasting the buffer cannot recover the lost bits.
+    `model.to(...)` downcasts `inv_freq` to the model dtype, and these frequencies span
+    1.0 down to ~1e-4 -- the angle is `position * inv_freq`, so the relative error a
+    16-bit buffer carries is amplified by the position. Upcasting it back cannot recover
+    the lost bits.
 
     The initializer is resolved off the rotary module before the global registry:
     transformers renames this tower's rope type from `default` to `axial` after 5.16.1, and

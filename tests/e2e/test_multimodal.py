@@ -150,10 +150,7 @@ def test_two_image_prompt_produces_output():
 @pytest.mark.uses_subprocess
 def test_gemma4_single_image_prompt_produces_output(monkeypatch):
     """The Gemma 4 tower on card, which the unit tests cannot reach: they check the
-    rewrite on CPU, this checks that what it rewrites to actually lowers.
-
-    `dtype="auto"`: the platform picks this checkpoint's dtype itself.
-    """
+    rewrite on CPU, this checks that what it rewrites to actually lowers."""
     if spyre_device_count() == 0:
         pytest.skip("Spyre device not available")
 
@@ -165,7 +162,6 @@ def test_gemma4_single_image_prompt_produces_output(monkeypatch):
         enforce_eager=True,
         model=GEMMA4_MODEL,
         config_format="hf",
-        dtype="auto",
     )
 
     assert text.strip(), "empty generation from the Gemma 4 vision path"

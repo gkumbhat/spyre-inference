@@ -1348,8 +1348,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
     # --- KV cache allocation ---
 
     def _model_dtype(self) -> torch.dtype:
-        """The activation dtype the platform settled on (float16, or bfloat16 for
-        checkpoints that overflow it)."""
+        """The activation dtype the platform settled on (float16 unless bfloat16 was
+        asked for explicitly)."""
         dtype = self.model_config.dtype
         return dtype if isinstance(dtype, torch.dtype) else torch.float16
 

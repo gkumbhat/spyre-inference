@@ -30,14 +30,10 @@ See the [Examples](../examples/offline_inference/torch_spyre_inference.md) page 
 ## Gemma-4: text-only use of a vision checkpoint
 
 Every Gemma-4 repository carries a `vision_config`, so `google/gemma-4-31B` and
-`google/gemma-4-26B-A4B` load as `Gemma4ForConditionalGeneration` and run in bfloat16 —
-float16 overflows the vision tower's residual stream. torch-spyre's `all_reduce` is
-float16-only and its FP8 linear kernel produces float16, so a bfloat16 run is rejected
-with `tensor_parallel_size > 1` or with quantization.
+`google/gemma-4-26B-A4B` load as `Gemma4ForConditionalGeneration` and build a vision
+tower — weights to load and graphs to warm up that a text-only workload never runs.
 
-To use one of those repositories for text only, pin its decoder architecture — the run is
-then float16, and tensor parallelism and quantization work as they do for any other
-decoder:
+To use one of those repositories for text only, pin its decoder architecture:
 
 ```python
 llm = LLM(
@@ -47,8 +43,9 @@ llm = LLM(
 )
 ```
 
-A repository with no vision tower gets that override by default, so this is only needed
-for the multimodal ones.
+That is also the configuration the tensor-parallel and compile e2e tests run these
+checkpoints under. A repository with no vision tower gets the override by default, so
+this is only needed for the multimodal ones.
 
 ## Decoder compile buckets
 

@@ -50,10 +50,9 @@ _COSINE_MIN = 0.99
             None,
         ),
         # Both gemma-4 checkpoints carry a vision_config, so an unpinned run resolves
-        # Gemma4ForConditionalGeneration in bf16. These references are text-backbone
-        # fp16 ones, and this test is about the compiled decoder -- pin the backbone
-        # instead of re-capturing them; the vision tower is covered by
-        # tests/multimodal/test_gemma4_vision.py.
+        # Gemma4ForConditionalGeneration and builds the tower. This test is about the
+        # compiled decoder -- pin the backbone rather than pay for the tower; the vision
+        # path is covered by tests/multimodal/test_gemma4_vision.py.
         (
             "google/gemma-4-31B",
             "\n\nWhat are the main businesses of IBM?\n\nWhat are the main businesses of",

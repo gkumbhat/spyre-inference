@@ -159,8 +159,8 @@ def test_force_text_backbone_ignores_unrelated_model_type(monkeypatch):
     ],
 )
 def test_is_multimodal_gemma4_requires_a_vision_tower(hf_config, expected):
-    """The bf16 switch this gates is scoped to vision checkpoints; widening it would
-    change the dtype of every existing Gemma deployment."""
+    """``force_text_backbone`` gates on this: a checkpoint with a tower keeps the
+    multimodal architecture, one without it is pinned to the text backbone."""
     from spyre_inference.models.gemma4 import is_multimodal_gemma4
 
     assert is_multimodal_gemma4(hf_config) is expected

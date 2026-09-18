@@ -450,17 +450,17 @@ def test_dispatch_routes_gemma4_tower_away_from_pixtral(monkeypatch):
 
 
 def test_fp32_inv_freq_is_recomputed_not_read_off_a_downcast_buffer():
-    """`model.to(bfloat16)` downcasts `inv_freq`, and these frequencies span a range
-    where bf16 costs real precision. Recomputing must recover full fp32."""
+    """`model.to(...)` downcasts `inv_freq` to the model dtype, and these frequencies
+    span a range where 16 bits cost real precision. Recomputing must recover full fp32."""
     from spyre_inference.multimodal.gemma4_vision import _fp32_inv_freq
 
     config = _vision_config()
     rope = modeling_gemma4.Gemma4VisionRotaryEmbedding(config)
     exact = rope.inv_freq.float().clone()
 
-    # Simulate the bf16 cast the real model applies to the whole tower.
-    rope.inv_freq = rope.inv_freq.to(torch.bfloat16)
-    assert not torch.allclose(rope.inv_freq.float(), exact), "premise: bf16 loses bits"
+    # Simulate the fp16 cast the real model applies to the whole tower.
+    rope.inv_freq = rope.inv_freq.to(torch.float16)
+    assert not torch.allclose(rope.inv_freq.float(), exact), "premise: fp16 loses bits"
 
     recovered, attention_scaling = _fp32_inv_freq(rope, config)
     assert recovered.dtype == torch.float32
@@ -650,7 +650,7 @@ def test_padding_on_device_weights_matches_padding_on_host():
 
     torch.manual_seed(0)
     layer = modeling_gemma4.Gemma4VisionEncoderLayer(config=config, layer_idx=0)
-    layer = layer.to(torch.bfloat16).eval()
+    layer = layer.to(torch.float16).eval()
 
     # Reference: pad on the host, then move.
     on_host = copy.deepcopy(layer)
@@ -663,12 +663,18 @@ def test_padding_on_device_weights_matches_padding_on_host():
     gv._prepare_attention(on_device.self_attn, NUM_HEADS, orig_hd, padded_hd)
     gv._pad_mlp(on_device, config.intermediate_size, padded_inter)
 
+    # Every host<->device convert halves an fp16 subnormal (normals round-trip exactly),
+    # and padding on device round-trips through `_host`, so its subnormals come back one
+    # halving further down -- an error bounded by half the largest subnormal. A wrongly
+    # composed slice-assign moves whole weights, so `smallest_normal` still catches it.
     checked = 0
     for name, want in on_host.named_parameters():
         got = dict(on_device.named_parameters())[name]
         torch.testing.assert_close(
             got.detach().to("cpu").float(),
             want.detach().to("cpu").float(),
+            rtol=0,
+            atol=torch.finfo(torch.float16).smallest_normal,
             msg=lambda m, name=name: f"{name} differs when padded on device:\n{m}",
         )
         checked += 1
@@ -676,7 +682,7 @@ def test_padding_on_device_weights_matches_padding_on_host():
 
 
 # ---------------------------------------------------------------------------
-# Pooling: the average runs on device as one bf16 matmul
+# Pooling: the average runs on device as one 2-byte matmul
 # ---------------------------------------------------------------------------
 
 
@@ -793,8 +799,8 @@ def test_patched_pooler_delegates_when_there_is_nothing_to_pool():
 
 
 def test_pooling_matmul_matches_the_host_average_on_device():
-    """The bf16 device matmul against the fp32 host average. Stock rounds its fp32 result
-    straight back to the input dtype, so bf16 concedes only accumulation precision."""
+    """The fp16 device matmul against the fp32 host average. Stock rounds its fp32 result
+    straight back to the input dtype, so fp16 concedes only accumulation precision."""
     if not spyre_available():
         pytest.skip("Spyre device not available")
 
@@ -807,8 +813,8 @@ def test_pooling_matmul_matches_the_host_average_on_device():
 
     device = torch.device("spyre")
     got = torch.matmul(
-        convert(weights.to(torch.bfloat16), device=device).transpose(1, 2),
-        convert(hidden_states.to(torch.bfloat16), device=device),
+        convert(weights.to(torch.float16), device=device).transpose(1, 2),
+        convert(hidden_states.to(torch.float16), device=device),
     )
 
     torch.testing.assert_close(convert(got, device="cpu").float(), want, rtol=2e-2, atol=2e-2)

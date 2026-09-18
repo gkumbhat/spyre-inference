@@ -41,16 +41,15 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_b
 if TYPE_CHECKING:
     # NB: We can't eagerly import many things from vllm since vllm.config
     # will import this file. These would lead to circular imports
-    from vllm.config import ModelConfig, VllmConfig
+    from vllm.config import VllmConfig
 else:
-    ModelConfig = None
     VllmConfig = None
 
 logger = init_logger(__name__)
 
-# Dtypes torch-spyre can run; bfloat16 only for checkpoints that overflow float16 (see
-# `_default_dtype`). Both are 2 bytes wide, so every stick-alignment constant in this
-# plugin holds for either.
+# Dtypes torch-spyre can run. float16 is the default and the validated one; bfloat16 is
+# accepted only when asked for explicitly. Both are 2 bytes wide, so every
+# stick-alignment constant in this plugin holds for either.
 _SUPPORTED_DTYPES = frozenset({torch.float16, torch.bfloat16})
 
 
@@ -358,74 +357,7 @@ class TorchSpyrePlatform(CpuPlatform):
         # In check_and_update_config we assert the dtype is one Spyre supports.
         # This must be set here as the default, otherwise all usage (including test fixtures) would
         # require setting the dtype.
-        vllm_config.model_config.dtype = cls._default_dtype(vllm_config)
-
-    @classmethod
-    def _default_dtype(cls, vllm_config: VllmConfig) -> torch.dtype:
-        """float16, except a gemma-4 run that builds its vision tower, which fp16 cannot
-        run.
-
-        Both dtypes map to the same device format (``SEN169_FP16``), so the choice is about
-        the host dtypes and the cast onto the card, not on-device arithmetic. Two things
-        break there at fp16: the tower's activations reach ``|h| ~ 2400`` by layer 26, so
-        IEEE fp16 overflows ``h*h`` in half of its RMSNorms host-side (cosine 0.04 against
-        fp32 with real weights), and a forced-fp16 run does not even lower -- a mixed-EA
-        layout error on the encoder's ``residual + post_attention_layernorm(...)``.
-
-        Scoped to the vision checkpoints on purpose: text-only gemma-4 is validated in
-        fp16 here. Runs after vLLM resolved ``model_config.dtype``, so an explicit
-        ``--dtype`` is indistinguishable from ``auto`` and the decision comes from the
-        config instead.
-
-        The choice is recorded on the ``ModelConfig`` because this hook runs again for the
-        nested text config a multimodal model builds its decoder from
-        (``VllmConfig.with_hf_config``, which deep-copies, so the marker rides along).
-        That nested config resolves ``Gemma4ForCausalLM``, so re-deciding would downgrade
-        the decoder to fp16 while its weights stayed bf16 -- disagreeing with
-        ``head_dtype`` and silently diverting the lm-head onto a fallback path.
-        """
-        from spyre_inference.models.gemma4 import is_multimodal_gemma4
-
-        model_config = vllm_config.model_config
-        hf_config = getattr(model_config, "hf_config", None)
-        already_chosen = getattr(model_config, "_spyre_requires_bfloat16", False)
-        # Gate on the architecture vLLM resolved, not on `vision_config` alone: pinning
-        # `hf_overrides` to the text backbone leaves `vision_config` on the config while
-        # resolving `Gemma4ForCausalLM`, and that text-only path is validated in fp16 --
-        # and is the only one that runs under TP>1 (see check_and_update_config).
-        builds_vision_tower = (
-            getattr(model_config, "architecture", None) == "Gemma4ForConditionalGeneration"
-            and hf_config is not None
-            and is_multimodal_gemma4(hf_config)
-        )
-        if already_chosen or builds_vision_tower:
-            if not already_chosen:
-                resolved = getattr(model_config, "dtype", None)
-                if resolved == torch.bfloat16:
-                    logger.info("Selecting torch.bfloat16: this checkpoint overflows float16.")
-                else:
-                    logger.warning(
-                        "Overriding the resolved dtype %s with torch.bfloat16: this "
-                        "checkpoint overflows float16.",
-                        resolved,
-                    )
-            model_config._spyre_requires_bfloat16 = True
-            return torch.bfloat16
-        return torch.float16
-
-    @classmethod
-    def _gemma4_text_backbone_hint(cls, model_config: ModelConfig) -> str:
-        """Both bfloat16 rejections are reachable only through a vision checkpoint, which a
-        text-only launch can opt out of."""
-        if not getattr(model_config, "_spyre_requires_bfloat16", False):
-            return ""
-        from spyre_inference.models.gemma4 import GEMMA4_TEXT_BACKBONE_OVERRIDE
-
-        return (
-            " For text-only use of this checkpoint, pass "
-            f"hf_overrides={GEMMA4_TEXT_BACKBONE_OVERRIDE!r} to load its decoder without "
-            "the vision tower, which runs in float16."
-        )
+        vllm_config.model_config.dtype = torch.float16
 
     @classmethod
     def get_device_communicator_cls(cls) -> str:
@@ -646,8 +578,7 @@ class TorchSpyrePlatform(CpuPlatform):
                 raise ValueError(
                     f"Spyre does not support quantization ({quantization}) with "
                     f"{torch.bfloat16}: the FP8 linear kernel produces float16 only, and "
-                    "this model requires bfloat16. Run the unquantized checkpoint."
-                    + cls._gemma4_text_backbone_hint(vllm_config.model_config)
+                    "the run was asked for in bfloat16. Run the unquantized checkpoint."
                 )
 
             # Pad attention head_dim up to a stick-aligned size on the native path.
@@ -689,9 +620,7 @@ class TorchSpyrePlatform(CpuPlatform):
                 f"Spyre does not support tensor_parallel_size > 1 with "
                 f"{torch.bfloat16} (got tensor_parallel_size="
                 f"{parallel_config.tensor_parallel_size}): torch-spyre's all_reduce is "
-                f"float16-only, and this model requires bfloat16. Run it at "
-                f"tensor_parallel_size=1."
-                + cls._gemma4_text_backbone_hint(vllm_config.model_config)
+                f"float16-only. Run it at tensor_parallel_size=1 or in float16."
             )
 
         # Clamp CPU threading env vars before workers fork so they inherit the

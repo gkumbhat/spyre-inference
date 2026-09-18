@@ -1034,8 +1034,8 @@ def test_kv_cache_shape_matches_runner_allocation():
 
 
 def test_supported_dtypes_includes_bfloat16():
-    """bf16 has to be declared here too, or backend selection rejects a checkpoint
-    TorchSpyrePlatform picked bf16 for (Gemma-4 vision, which overflows fp16)."""
+    """Nothing selects bf16 by default, but `--dtype bfloat16` has to reach the kernels
+    rather than be rejected during backend selection."""
     from spyre_inference.v1.attention.backends.spyre_attn import SpyreAttentionBackend
 
     assert torch.float16 in SpyreAttentionBackend.supported_dtypes

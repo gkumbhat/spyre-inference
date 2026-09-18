@@ -87,10 +87,9 @@ def repair_head_dim_access(config: Any) -> None:
                 setattr(text_config, global_attr, values.pop())
 
 
-# The supported way to run a checkpoint that carries a vision tower as text-only: it keeps
-# the run in float16, so tensor parallelism and quantization stay available (both are
-# rejected for bfloat16 in `check_and_update_config`). Applied by default to a checkpoint
-# with no tower; pass it as `hf_overrides` to opt a vision checkpoint in.
+# The supported way to run a checkpoint that carries a vision tower as text-only: it skips
+# the tower's weights and warmup entirely. Applied by default to a checkpoint with no
+# tower; pass it as `hf_overrides` to opt a vision checkpoint in.
 GEMMA4_TEXT_BACKBONE_OVERRIDE = {"architectures": ["Gemma4ForCausalLM"]}
 
 

@@ -83,8 +83,8 @@ def parse_args():
         type=str,
         default="auto",
         help=(
-            "Leave as auto: the platform picks float16, or bfloat16 for checkpoints "
-            "that overflow it. An explicit float16 is overridden for those, with a warning."
+            "Leave as auto: the platform runs every model in float16 and overrides "
+            "whatever is passed here."
         ),
     )
     return parser.parse_args()
@@ -242,8 +242,7 @@ def compare_multimodal_with_cpu(args, prepared, outputs, max_tokens, model_dtype
 
     try:
         processor = AutoProcessor.from_pretrained(args.model)
-        # Whatever the platform settled on: float16 for a bfloat16 checkpoint would
-        # put the NaNs on the oracle's side.
+        # Whatever the platform settled on, so the oracle's arithmetic matches the run's.
         model = AutoModelForImageTextToText.from_pretrained(args.model, dtype=model_dtype)
     except Exception as exc:  # noqa: BLE001 - a missing HF-format config is not fatal
         # mistral-format repos may carry no HF processor config, leaving no CPU oracle.

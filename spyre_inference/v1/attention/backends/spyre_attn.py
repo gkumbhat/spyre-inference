@@ -1031,7 +1031,8 @@ class SpyreAttentionBackend(AttentionBackend):
     forward_includes_kv_cache_update: bool = False
     supported_dtypes: ClassVar[list[torch.dtype]] = [
         torch.float16,
-        # For checkpoints that overflow fp16 (see TorchSpyrePlatform._default_dtype).
+        # Only reachable through an explicit `--dtype bfloat16`; the platform's own
+        # default is float16 for every model.
         torch.bfloat16,
     ]
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
