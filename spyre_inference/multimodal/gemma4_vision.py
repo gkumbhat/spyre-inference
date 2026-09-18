@@ -186,10 +186,11 @@ def _padded_rms_norm(
     lanes do not deflate the variance. ``None`` means the input is not padded.
 
     Kept in the storage dtype rather than promoted to fp32 like the hf-adapters
-    reference: fp16 and bf16 are one format on device, and an fp32 round trip changes the
-    stick tiling of the result, which a later eager elementwise op cannot always
-    broadcast against. The cost is small at bf16 -- against an fp32 host reference on the
-    real vision weights, cosine 0.9989 here against 0.99992 with an fp32 variance.
+    reference: an fp32 round trip changes the stick tiling of the result, and the eager
+    elementwise op that follows then fails to lower at all (mixed-EA broadcast). Measured
+    on device with the input held identical, this norm is exact to bf16 rounding --
+    cosine 1.00002 against an fp32 host reference, per-op relative error 5e-3 -- so the
+    2-byte variance is not what costs this tower accuracy.
     """
     dtype = hidden_states.dtype
     variance = (hidden_states * hidden_states).mean(-1, keepdim=True)
@@ -254,18 +255,38 @@ def _fp32_inv_freq(rotary_emb, config) -> torch.Tensor:
     return inv_freq.float()
 
 
+# Permutation matrices for `_apply_rope`, keyed by (dim, dtype, device).
+_ROPE_SWAP: dict[tuple, torch.Tensor] = {}
+
+
+def _rope_swap_matrix(dim: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    key = (dim, dtype, str(device))
+    swap = _ROPE_SWAP.get(key)
+    if swap is None:
+        half = dim // 2
+        rows = torch.cat([torch.arange(half, dim), torch.arange(0, half)])
+        swap = torch.zeros(dim, dim, dtype=dtype)
+        swap[rows, torch.arange(dim)] = 1.0
+        if device.type != "cpu":
+            swap = convert(swap, device=device, dtype=dtype)
+        _ROPE_SWAP[key] = swap
+    return swap
+
+
 def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    """`x*cos + rotate_half(x)*sin`, with the half-swap done by slicing.
+    """`x*cos + rotate_half(x)*sin`, with the half-swap done as a permutation matmul.
 
-    Slicing is legal here where Pixtral needs a matmul instead: the padded head_dim puts
-    each half on a whole stick, whereas Pixtral's 64-wide heads give 32-wide halves. It is
-    also required, not just simpler -- at this tower's shapes the matmul form's reduction
-    fails to tile after the RMSNorm reduction preceding it.
+    `torch.cat([x[..., half:], x[..., :half]], -1)` is silently wrong on device whenever
+    `x` came from a matmul, as q/k always have: both slices read back correctly, the `cat`
+    returns uncorrelated data, and nothing warns. It cost this tower its sight -- final
+    vision-embedding cosine 0.12 against a host fp32 reference, versus 0.997 through the
+    permutation. Slice-free rewrites (`stack`/`flip`, `index_select`, integer-index
+    gather) are either wrong the same way or fail to lower, so the swap goes through a
+    fixed permutation matrix.
 
-    `sin` already carries `rotate_half`'s sign flip, so the swap is a plain `cat`.
+    `sin` already carries `rotate_half`'s sign flip, so the permutation is a plain swap.
     """
-    half = x.shape[-1] // 2
-    swapped = torch.cat([x[..., half:], x[..., :half]], dim=-1)
+    swapped = x @ _rope_swap_matrix(x.shape[-1], x.dtype, x.device)
     return x * cos + swapped * sin
 
 
