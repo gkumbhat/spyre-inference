@@ -36,16 +36,26 @@ logger = init_logger(__name__)
 # Spyre stick (64 fp16 elements), and the encoder attention KV block width.
 ENCODER_SEQ_ALIGNMENT = 64
 
+# Body-bucket floor. Above the stick because each body bucket multiplies warmup.
+ENCODER_MIN_BODY_BUCKET = 4 * ENCODER_SEQ_ALIGNMENT
 
-def default_encoder_len_buckets(max_model_len: int) -> list[int]:
-    """Stick-aligned prompt-length buckets from 64 up to ``max_model_len``.
+
+def default_encoder_len_buckets(
+    max_model_len: int, floor: int = ENCODER_SEQ_ALIGNMENT
+) -> list[int]:
+    """Stick-aligned prompt-length buckets from ``floor`` up to ``max_model_len``.
 
     Powers of two through the last value that still fits, then ``max_model_len``
     rounded down to a stick if that is not already a bucket.
+
+    ``floor`` defaults to one stick, which is what the token pooler wants: its
+    ladder pads a single request's rows, so a coarse bottom end is pure waste.
+    The body wants ``ENCODER_MIN_BODY_BUCKET`` instead -- there a bucket costs a
+    whole attention warmup sweep, and steps below it are unreachable in practice.
     """
     cap = max(1, int(max_model_len))
     buckets: list[int] = []
-    size = ENCODER_SEQ_ALIGNMENT
+    size = floor
     while size < cap:
         buckets.append(size)
         size *= 2

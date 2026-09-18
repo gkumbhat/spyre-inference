@@ -376,3 +376,45 @@ def test_warmup_stops_at_the_longest_reachable_extent(monkeypatch):
 
     assert seen, "warmup must still exercise the reachable extents"
     assert max(seen) <= 128, f"warmed unreachable extents: {sorted(seen)}"
+
+
+def test_warmup_stops_at_max_num_seqs_groups(monkeypatch):
+    """A group holds one member per request, so it cannot exceed ``max_num_seqs``.
+
+    The sweep bounds the group axis by ``buffer_rows // extent``, which at a small
+    batch size is far larger: with max_num_seqs=4 and a 2048-row bucket it built
+    groups up to 32, a fifth of the warm variants unreachable by any plan.
+    """
+    impl = _make_impl()
+    monkeypatch.setattr(impl, "_max_group", 4)
+    monkeypatch.setattr(impl, "_max_extent", ENCODER_LEN_ALIGNMENT)
+    buffer_rows = 2048
+    seen: set[int] = set()
+    real_run = impl._run_fused
+
+    def counting_run(out, row_index, *args, **kwargs):
+        # row_index holds group * extent rows; extent is pinned to one unit above.
+        seen.add(row_index.shape[0] // ENCODER_LEN_ALIGNMENT)
+        return real_run(out, row_index, *args, **kwargs)
+
+    monkeypatch.setattr(impl, "_run_fused", counting_run)
+    query, key, value = _dummy_qkv(
+        buffer_rows,
+        impl.num_heads,
+        impl.num_kv_heads,
+        impl.head_size,
+        impl.model_dtype,
+        torch.device("cpu"),
+    )
+    impl._warm_kernels(
+        query,
+        key,
+        value,
+        torch.zeros_like(query),
+        impl.num_heads,
+        impl.num_kv_heads,
+        impl.head_size,
+    )
+
+    assert seen, "warmup must still exercise the reachable groups"
+    assert max(seen) <= 4, f"warmed groups no plan can reach: {sorted(seen)}"

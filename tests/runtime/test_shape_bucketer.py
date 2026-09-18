@@ -176,6 +176,13 @@ class TestEncoderLenLadder:
         assert default_encoder_len_buckets(100) == [64]
         assert default_encoder_len_buckets(768) == [64, 128, 256, 512, 768]
 
+    def test_default_encoder_len_buckets_honours_a_higher_floor(self):
+        """The body raises the floor to keep warmup short; the pooler keeps the stick."""
+        assert default_encoder_len_buckets(2048, floor=256) == [256, 512, 1024, 2048]
+        assert default_encoder_len_buckets(512, floor=256) == [256, 512]
+        # A model shorter than the floor still gets one usable bucket.
+        assert default_encoder_len_buckets(100, floor=256) == [64]
+
 
 class TestLogitsRowBuckets:
     def test_clips_prefill_bucket_to_max_num_reqs(self):

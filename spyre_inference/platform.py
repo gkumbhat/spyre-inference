@@ -270,8 +270,7 @@ class TorchSpyrePlatform(CpuPlatform):
             if all(s not in vllm_config.compilation_config.custom_ops for s in ("all", "none")):
                 vllm_config.compilation_config.custom_ops.append("all")
 
-            # Body: 1D compile_sizes (packed token counts). Encoder flash is
-            # varlen on that list — see SpyreEncoderAttentionImpl.
+            # Body: 1D compile_sizes (packed token counts).
             # Honor a user-set list (#638); otherwise generate defaults.
             if vllm_config.compilation_config.compile_sizes:
                 compile_sizes = vllm_config.compilation_config.compile_sizes
@@ -302,10 +301,15 @@ class TorchSpyrePlatform(CpuPlatform):
                         max_capture_size = model_len
 
                     from spyre_inference.v1.worker.spyre_shape_bucketer import (
+                        ENCODER_MIN_BODY_BUCKET,
                         default_encoder_len_buckets,
                     )
 
-                    compile_sizes = [*default_encoder_len_buckets(max_capture_size)]
+                    compile_sizes = [
+                        *default_encoder_len_buckets(
+                            max_capture_size, floor=ENCODER_MIN_BODY_BUCKET
+                        )
+                    ]
                     logger.info(
                         "Pooling body token buckets (1D compile_sizes): %s",
                         compile_sizes,

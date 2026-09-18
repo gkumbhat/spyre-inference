@@ -340,10 +340,13 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         # can reach.
         from vllm.config import get_current_vllm_config
 
+        config = get_current_vllm_config()
         self._max_extent = (
-            _alignment_units_for(get_current_vllm_config().model_config.max_model_len)
-            * ENCODER_LEN_ALIGNMENT
+            _alignment_units_for(config.model_config.max_model_len) * ENCODER_LEN_ALIGNMENT
         )
+        # A group cannot hold more requests than a step can run, so warming past
+        # max_num_seqs compiles graphs no plan can dispatch to.
+        self._max_group = config.scheduler_config.max_num_seqs
 
     def _run_gather(self, query, key, value, row_index):
         return _call_kernel("encoder_gather", self._gather_fn, query, key, value, row_index)
@@ -451,7 +454,7 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
 
             if self._batched_attn:
                 group = 2
-                while group * extent <= buffer_rows:
+                while group * extent <= buffer_rows and group <= self._max_group:
                     g_rows = convert(
                         torch.cat([encoder_row_table(0, extent, extent, index_dtype)] * group),
                         device,
@@ -495,7 +498,7 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
                 continue
             query_len = min(query_len, num_tokens - start)
             kv_len = min(int(seq_lens[seq_idx]), query_len)
-            extent = _alignment_units_for(max(query_len, kv_len)) * ENCODER_LEN_ALIGNMENT
+            extent = _alignment_units_for(query_len) * ENCODER_LEN_ALIGNMENT
             by_extent.setdefault(extent, []).append((start, query_len, kv_len))
 
         def plan(members: list[tuple[int, int, int]], extent: int) -> EncoderSeqPlan:
