@@ -437,30 +437,27 @@ class _SpyreModelWrapper:
         return logits
 
     def embed_multimodal(self, **kwargs):
-        """Move multimodal encoder inputs (e.g. pixel_values) onto Spyre.
+        """Move float multimodal inputs (e.g. ``pixel_values``) onto Spyre.
 
-        _execute_mm_encoder calls this directly on `self.model`, bypassing
-        __call__, so it needs its own CPU <-> Spyre boundary conversion.
-        `group_and_batch_mm_kwargs` batches multimodal kwargs onto
-        self.device=CPU, but the vision tower's weights live on Spyre.
-
-        Cast to float16 explicitly (not just a device move): a processor may hand
-        back fp32 pixel_values, which the model itself never downcasts, so an
-        on-device fp32 tensor would either need a CPU round-trip (`convert`) or
-        run as fp32 "garbage" (torch-spyre#2971). A variable-resolution model can
-        also hand back `pixel_values` as `list[Tensor]` rather than one stacked
-        tensor, so the conversion must recurse via `tree_map`, not a flat
-        per-kwarg pass.
+        The runner reaches this through ``__getattr__``, bypassing ``__call__``'s
+        input conversion, so pixel tensors would otherwise arrive on CPU while the
+        vision weights are on Spyre.
         """
 
         def _to_spyre_float(t):
             if isinstance(t, torch.Tensor) and t.is_floating_point():
-                return convert(t, dtype=torch.float16, device=self._spyre_device)
+                return convert(t, dtype=self._model_dtype, device=self._spyre_device)
             return t
 
-        kwargs_converted = tree_map(_to_spyre_float, kwargs)
-        result = self._model.embed_multimodal(**kwargs_converted)
-        return tree_map(self._to_cpu, result)
+        kwargs = tree_map(_to_spyre_float, kwargs)
+        # Vision towers run eager, so each Spyre op with a decomposition reaches it
+        # through torch-spyre's lazily-compiled PrivateUse1 kernel, which compiles
+        # without fullgraph. Decompositions built on for_each_tile (SDPA since
+        # torch-spyre#4550) emit a scan whose while_loop lowering reads the loop index
+        # with .item(); without fullgraph that needs capture_scalar_outputs, or the
+        # trace dies with DataDependentOutputException.
+        with torch._dynamo.config.patch(capture_scalar_outputs=True):
+            return self._model.embed_multimodal(**kwargs)
 
     def embed_input_ids(self, input_ids, multimodal_embeddings=None, *, is_multimodal=None):
         """Move input_ids/is_multimodal/multimodal_embeddings onto Spyre.
