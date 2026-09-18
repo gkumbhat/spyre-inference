@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Test select_rows row-gather correctness, including the Spyre view/_base
-handling that lets it avoid a full-tensor clone before index_select."""
+"""Test select_rows row-gather correctness, including the storage_offset
+check that avoids an unnecessary clone for full, unsliced buffers."""
 
 import sys
 
@@ -50,11 +50,10 @@ def test_select_rows_cpu_handles_2d_pack_indices():
 
 @pytest.mark.parametrize("num_scheduled_tokens", [5, 10, 20])
 def test_select_rows_on_spyre_from_full_prefix_slice(num_scheduled_tokens):
-    """Regression test for the fix this replaces a `.clone()` with: hidden_states
-    arrives as a slice of a larger persistent buffer, mirroring vLLM's
-    `hidden_states[:num_scheduled_tokens]` trim before pooling -- including the
-    num_scheduled_tokens == buffer_size case, which is still a view (row_offset
-    0) rather than the identical tensor object."""
+    """hidden_states arrives as a slice of a larger persistent buffer, mirroring
+    vLLM's `hidden_states[:num_scheduled_tokens]` trim before pooling. A nonzero
+    storage_offset (mid-buffer slice) triggers a clone; a zero-offset slice
+    (num_scheduled_tokens == buffer_size) does not."""
     torch.manual_seed(2)
     buffer_size, hidden_size = 20, 64
     buffer = torch.randn(buffer_size, hidden_size, dtype=torch.float16)
@@ -77,8 +76,8 @@ def test_select_rows_on_spyre_from_full_prefix_slice(num_scheduled_tokens):
 
 
 def test_select_rows_on_spyre_offset_matches_sliced_rows():
-    """The slice's row offset must shift indices relative to the *base* buffer:
-    a mid-buffer slice's row 0 is the base buffer's row 5, not its row 0."""
+    """A mid-buffer slice has a nonzero storage_offset; select_rows clones it
+    before index_select so the native scheduler can map the source correctly."""
     torch.manual_seed(3)
     buffer = torch.arange(20 * 4, dtype=torch.float32).reshape(20, 4).to(torch.float16)
     sliced = buffer[5:15]  # rows 5..14 of the base buffer
@@ -91,11 +90,11 @@ def test_select_rows_on_spyre_offset_matches_sliced_rows():
 
 
 def test_select_rows_on_spyre_non_view_hidden_states():
-    """A fresh (non-view) tensor has `_base is None`; select_rows must fall back
-    to indexing it directly rather than assuming a parent buffer exists."""
+    """A fresh (non-view) tensor has storage_offset 0; select_rows skips the
+    clone and indexes it directly."""
     torch.manual_seed(4)
     hidden = torch.randn(10, 16, dtype=torch.float16)
-    assert hidden._base is None
+    assert hidden.storage_offset() == 0
     row_indices = torch.tensor([2, 5])
 
     actual = select_rows(hidden.to("spyre"), row_indices)
