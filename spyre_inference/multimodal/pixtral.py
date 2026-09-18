@@ -24,6 +24,7 @@ from __future__ import annotations
 from functools import cache
 
 import torch
+import torch.nn as nn
 
 from vllm.logger import init_logger
 

@@ -181,11 +181,8 @@ def test_each_instance_compiles_its_own_kernel(compile_calls, mode) -> None:
 def test_the_real_layers_opt_in() -> None:
     """Guards against the decorator or mixin being dropped from a layer."""
     from spyre_inference.custom_ops.gemma_rms_norm import SpyreGemmaRMSNorm
-<<<<<<< HEAD
-    from spyre_inference.custom_ops.logits_processor import SpyreLogitsProcessor
-=======
     from spyre_inference.custom_ops.layer_norm import SpyreLayerNorm
->>>>>>> 754df6b (layer_norm: accumulate mean/var in fp32, reuse CompileOutermost)
+    from spyre_inference.custom_ops.logits_processor import SpyreLogitsProcessor
     from spyre_inference.custom_ops.parallel_lm_head import SpyreUnquantizedLMHeadMethod
     from spyre_inference.custom_ops.vocab_parallel_embedding import (
         SpyreVocabParallelEmbedding,
@@ -193,10 +190,7 @@ def test_the_real_layers_opt_in() -> None:
 
     for cls, method in (
         (SpyreGemmaRMSNorm, "forward_oot"),
-<<<<<<< HEAD
-=======
         (SpyreLayerNorm, "_spyre_forward"),
->>>>>>> 754df6b (layer_norm: accumulate mean/var in fp32, reuse CompileOutermost)
         (SpyreVocabParallelEmbedding, "forward"),
         (SpyreUnquantizedLMHeadMethod, "apply"),
         (SpyreLogitsProcessor, "_all_gather_logits"),
@@ -446,11 +440,8 @@ def test_each_instance_compiles_its_own_kernel(compile_calls, mode) -> None:
 def test_the_real_layers_opt_in() -> None:
     """Guards against the decorator or mixin being dropped from a layer."""
     from spyre_inference.custom_ops.gemma_rms_norm import SpyreGemmaRMSNorm
-<<<<<<< HEAD
-    from spyre_inference.custom_ops.logits_processor import SpyreLogitsProcessor
-=======
     from spyre_inference.custom_ops.layer_norm import SpyreLayerNorm
->>>>>>> 754df6b (layer_norm: accumulate mean/var in fp32, reuse CompileOutermost)
+    from spyre_inference.custom_ops.logits_processor import SpyreLogitsProcessor
     from spyre_inference.custom_ops.parallel_lm_head import SpyreUnquantizedLMHeadMethod
     from spyre_inference.custom_ops.vocab_parallel_embedding import (
         SpyreVocabParallelEmbedding,
@@ -458,10 +449,7 @@ def test_the_real_layers_opt_in() -> None:
 
     for cls, method in (
         (SpyreGemmaRMSNorm, "forward_oot"),
-<<<<<<< HEAD
-=======
         (SpyreLayerNorm, "_spyre_forward"),
->>>>>>> 754df6b (layer_norm: accumulate mean/var in fp32, reuse CompileOutermost)
         (SpyreVocabParallelEmbedding, "forward"),
         (SpyreUnquantizedLMHeadMethod, "apply"),
         (SpyreLogitsProcessor, "_all_gather_logits"),
@@ -710,11 +698,8 @@ def test_each_instance_compiles_its_own_kernel(compile_calls, mode) -> None:
 def test_the_real_layers_opt_in() -> None:
     """Guards against the decorator or mixin being dropped from a layer."""
     from spyre_inference.custom_ops.gemma_rms_norm import SpyreGemmaRMSNorm
-<<<<<<< HEAD
-    from spyre_inference.custom_ops.logits_processor import SpyreLogitsProcessor
-=======
     from spyre_inference.custom_ops.layer_norm import SpyreLayerNorm
->>>>>>> 754df6b (layer_norm: accumulate mean/var in fp32, reuse CompileOutermost)
+    from spyre_inference.custom_ops.logits_processor import SpyreLogitsProcessor
     from spyre_inference.custom_ops.parallel_lm_head import SpyreUnquantizedLMHeadMethod
     from spyre_inference.custom_ops.vocab_parallel_embedding import (
         SpyreVocabParallelEmbedding,
@@ -722,10 +707,7 @@ def test_the_real_layers_opt_in() -> None:
 
     for cls, method in (
         (SpyreGemmaRMSNorm, "forward_oot"),
-<<<<<<< HEAD
-=======
         (SpyreLayerNorm, "_spyre_forward"),
->>>>>>> 754df6b (layer_norm: accumulate mean/var in fp32, reuse CompileOutermost)
         (SpyreVocabParallelEmbedding, "forward"),
         (SpyreUnquantizedLMHeadMethod, "apply"),
         (SpyreLogitsProcessor, "_all_gather_logits"),
@@ -975,11 +957,8 @@ def test_each_instance_compiles_its_own_kernel(compile_calls, mode) -> None:
 def test_the_real_layers_opt_in() -> None:
     """Guards against the decorator or mixin being dropped from a layer."""
     from spyre_inference.custom_ops.gemma_rms_norm import SpyreGemmaRMSNorm
-<<<<<<< HEAD
-    from spyre_inference.custom_ops.logits_processor import SpyreLogitsProcessor
-=======
     from spyre_inference.custom_ops.layer_norm import SpyreLayerNorm
->>>>>>> 754df6b (layer_norm: accumulate mean/var in fp32, reuse CompileOutermost)
+    from spyre_inference.custom_ops.logits_processor import SpyreLogitsProcessor
     from spyre_inference.custom_ops.parallel_lm_head import SpyreUnquantizedLMHeadMethod
     from spyre_inference.custom_ops.vocab_parallel_embedding import (
         SpyreVocabParallelEmbedding,
@@ -987,10 +966,7 @@ def test_the_real_layers_opt_in() -> None:
 
     for cls, method in (
         (SpyreGemmaRMSNorm, "forward_oot"),
-<<<<<<< HEAD
-=======
         (SpyreLayerNorm, "_spyre_forward"),
->>>>>>> 754df6b (layer_norm: accumulate mean/var in fp32, reuse CompileOutermost)
         (SpyreVocabParallelEmbedding, "forward"),
         (SpyreUnquantizedLMHeadMethod, "apply"),
         (SpyreLogitsProcessor, "_all_gather_logits"),
