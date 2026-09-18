@@ -147,10 +147,16 @@ def test_two_image_prompt_produces_output():
 
 @pytest.mark.multimodal
 @pytest.mark.gemma4_vision
+@pytest.mark.parametrize("enforce_eager", [True, False], ids=["eager", "compiled"])
 @pytest.mark.uses_subprocess
-def test_gemma4_single_image_prompt_produces_output(monkeypatch):
+def test_gemma4_single_image_prompt_produces_output(enforce_eager, monkeypatch):
     """The Gemma 4 tower on card, which the unit tests cannot reach: they check the
-    rewrite on CPU, this checks that what it rewrites to actually lowers."""
+    rewrite on CPU, this checks that what it rewrites to actually lowers.
+
+    Both modes, as for Pixtral above: compiled is the repo default, and the tower's
+    rewrites (permutation-matmul rope, padded SDPA, the pooling matmul) have to lower
+    inside a graph, not just run eagerly.
+    """
     if spyre_device_count() == 0:
         pytest.skip("Spyre device not available")
 
@@ -159,7 +165,7 @@ def test_gemma4_single_image_prompt_produces_output(monkeypatch):
     uri = _synthetic_image_data_uri()
     (text,) = _generate(
         [_conversation(uri)],
-        enforce_eager=True,
+        enforce_eager=enforce_eager,
         model=GEMMA4_MODEL,
         config_format="hf",
     )
