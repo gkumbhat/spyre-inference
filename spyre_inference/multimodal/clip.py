@@ -55,17 +55,27 @@ def _to_spyre_layer_norm(ln: torch.nn.LayerNorm, device: torch.device) -> torch.
 
 
 def apply(model: torch.nn.Module, device: torch.device) -> None:
-    """Swap CLIP's three boundary LayerNorms for ``SpyreLayerNorm``, in place."""
+    """Swap CLIP's three boundary LayerNorms for ``SpyreLayerNorm``, in place.
+
+    The ``isinstance`` checks are a second line of defense on top of the
+    ``model_type == "clip"`` dispatch gate in ``multimodal/__init__.py``: they
+    keep this a no-op (rather than an ``AttributeError`` on ``normalized_shape``)
+    for any boundary norm that isn't a plain ``nn.LayerNorm``.
+    """
     text_model = getattr(model, "text_model", None)
-    if text_model is not None and hasattr(text_model, "final_layer_norm"):
-        text_model.final_layer_norm = _to_spyre_layer_norm(text_model.final_layer_norm, device)
+    if text_model is not None:
+        ln = getattr(text_model, "final_layer_norm", None)
+        if isinstance(ln, torch.nn.LayerNorm):
+            text_model.final_layer_norm = _to_spyre_layer_norm(ln, device)
 
     vision_model = getattr(model, "vision_model", None)
     if vision_model is not None:
-        if hasattr(vision_model, "pre_layrnorm"):
-            vision_model.pre_layrnorm = _to_spyre_layer_norm(vision_model.pre_layrnorm, device)
-        if getattr(vision_model, "post_layernorm", None) is not None:
-            vision_model.post_layernorm = _to_spyre_layer_norm(vision_model.post_layernorm, device)
+        pre_ln = getattr(vision_model, "pre_layrnorm", None)
+        if isinstance(pre_ln, torch.nn.LayerNorm):
+            vision_model.pre_layrnorm = _to_spyre_layer_norm(pre_ln, device)
+        post_ln = getattr(vision_model, "post_layernorm", None)
+        if isinstance(post_ln, torch.nn.LayerNorm):
+            vision_model.post_layernorm = _to_spyre_layer_norm(post_ln, device)
 
     logger.info_once(
         "Spyre: CLIP's boundary LayerNorms (pre_layrnorm/post_layernorm/"

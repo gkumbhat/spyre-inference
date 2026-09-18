@@ -36,5 +36,9 @@ def apply_multimodal_patches(model: torch.nn.Module, device: torch.device) -> No
         pixtral.apply(model, device)
 
     # CLIPEmbeddingModel: text_model/vision_model, not vision_encoder/vision_tower.
-    if hasattr(model, "text_model") or hasattr(model, "vision_model"):
+    # Gated on model_type, not just attribute presence: other architectures (e.g.
+    # BLIP-2) also set `vision_model`, and clip.apply() assumes CLIP's specific
+    # LayerNorm-based boundary norms.
+    hf_config = getattr(model, "config", None)
+    if getattr(hf_config, "model_type", None) == "clip":
         clip.apply(model, device)
