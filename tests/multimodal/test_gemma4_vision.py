@@ -462,9 +462,60 @@ def test_fp32_inv_freq_is_recomputed_not_read_off_a_downcast_buffer():
     rope.inv_freq = rope.inv_freq.to(torch.bfloat16)
     assert not torch.allclose(rope.inv_freq.float(), exact), "premise: bf16 loses bits"
 
-    recovered = _fp32_inv_freq(rope, config)
+    recovered, attention_scaling = _fp32_inv_freq(rope, config)
     assert recovered.dtype == torch.float32
+    assert attention_scaling == 1.0
     torch.testing.assert_close(recovered, exact, rtol=1e-6, atol=1e-9)
+
+
+def test_fp32_inv_freq_resolves_the_rope_type_off_the_module_not_the_registry():
+    """transformers renames this tower's rope type from `default` to `axial` after the
+    pinned 5.16.1, and its axial initializer is a class-local staticmethod that
+    `ROPE_INIT_FUNCTIONS` does not carry -- resolving through the registry raises KeyError.
+    """
+    from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+
+    from spyre_inference.multimodal.gemma4_vision import _fp32_inv_freq
+
+    assert "axial" not in ROPE_INIT_FUNCTIONS, "premise: the registry has no axial entry"
+
+    config = _vision_config()
+    config.rope_parameters = dict(config.rope_parameters, rope_type="axial")
+
+    class AxialRotary(torch.nn.Module):
+        @staticmethod
+        def compute_axial_rope_parameters(cfg, device=None, **kwargs):
+            spatial_dim = cfg.head_dim // 2
+            base = cfg.rope_parameters["rope_theta"]
+            inv_freq = 1.0 / (
+                base ** (torch.arange(0, spatial_dim, 2, dtype=torch.float) / spatial_dim)
+            )
+            return inv_freq, 2.0
+
+    inv_freq, attention_scaling = _fp32_inv_freq(AxialRotary(), config)
+    assert inv_freq.shape == (ORIG_HEAD_DIM // 4,)
+    assert attention_scaling == 2.0
+
+
+def test_rope_cos_sin_applies_attention_scaling_to_the_real_lanes_only():
+    from spyre_inference.multimodal.gemma4_vision import _gemma4_rope_cos_sin
+
+    config = _vision_config()
+    rope = modeling_gemma4.Gemma4VisionRotaryEmbedding(config)
+    args = (rope.inv_freq, _position_ids(), PADDED_HEAD_DIM, torch.float32)
+    cos, sin = _gemma4_rope_cos_sin(*args)
+    cos_scaled, sin_scaled = _gemma4_rope_cos_sin(*args, 2.0)
+
+    quarter = ORIG_HEAD_DIM // 4
+    half = PADDED_HEAD_DIM // 2
+    real = [slice(0, 2 * quarter), slice(half, half + 2 * quarter)]
+    pad = [slice(2 * quarter, half), slice(half + 2 * quarter, PADDED_HEAD_DIM)]
+    for lanes in real:
+        torch.testing.assert_close(cos_scaled[..., lanes], 2.0 * cos[..., lanes])
+        torch.testing.assert_close(sin_scaled[..., lanes], 2.0 * sin[..., lanes])
+    for lanes in pad:
+        assert torch.all(cos_scaled[..., lanes] == 1.0)
+        assert torch.all(sin_scaled[..., lanes] == 0.0)
 
 
 # ---------------------------------------------------------------------------

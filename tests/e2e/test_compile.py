@@ -24,7 +24,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from spyre_inference.models.gemma4 import _gemma4_text_backbone_override
+from spyre_inference.models.gemma4 import GEMMA4_TEXT_BACKBONE_OVERRIDE
 
 # enforce_eager=False builds a subprocess EngineCore, so uses_subprocess runs these
 # before any in-process test initializes the Spyre device (a subprocess cannot open
@@ -57,12 +57,12 @@ _COSINE_MIN = 0.99
         (
             "google/gemma-4-31B",
             "\n\nWhat are the main businesses of IBM?\n\nWhat are the main businesses of",
-            _gemma4_text_backbone_override,
+            GEMMA4_TEXT_BACKBONE_OVERRIDE,
         ),
         (
             "google/gemma-4-26B-A4B",
             "\n\nWhat is the difference between a product and a service?\n\nWhat is the",
-            _gemma4_text_backbone_override,
+            GEMMA4_TEXT_BACKBONE_OVERRIDE,
         ),
     ],
     ids=["micro-g3.3", "gemma-3-1b-it", "gemma-4-31B-text", "gemma-4-26B-A4B-text"],

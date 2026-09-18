@@ -23,7 +23,7 @@ import pytest
 from spyre_testing_plugin.pytest_plugin import spyre_device_count
 from spyre_testing_plugin.vfio_reaper import wait_until_card_free
 
-from spyre_inference.models.gemma4 import _gemma4_text_backbone_override
+from spyre_inference.models.gemma4 import GEMMA4_TEXT_BACKBONE_OVERRIDE
 
 
 @pytest.mark.uses_subprocess
@@ -133,7 +133,7 @@ def test_tp2_llm_generate_matches_tp1() -> None:
         # gemma-4 vision checkpoints only run in bf16, which torch-spyre's all_reduce
         # does not accept (the platform rejects that combination outright), so this row
         # pins the text-only backbone -- the decoder is what TP splits anyway.
-        ("google/gemma-4-26B-A4B", _gemma4_text_backbone_override),
+        ("google/gemma-4-26B-A4B", GEMMA4_TEXT_BACKBONE_OVERRIDE),
     ],
     ids=["micro-g3.3", "gemma-4-26B-A4B-text"],
 )

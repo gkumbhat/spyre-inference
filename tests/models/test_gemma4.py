@@ -25,9 +25,9 @@ from types import SimpleNamespace
 import pytest
 
 from spyre_inference.models.gemma4 import (
-    _gemma4_multimodal_head_dim_override,
-    _gemma4_text_backbone_override,
+    GEMMA4_TEXT_BACKBONE_OVERRIDE,
     force_text_backbone,
+    repair_head_dim_access,
 )
 
 
@@ -62,13 +62,13 @@ def test_force_text_backbone_applies_for_pure_text_checkpoint(monkeypatch, model
     engine_args = _engine_args()
     force_text_backbone(engine_args)
 
-    assert engine_args.hf_overrides is _gemma4_text_backbone_override
+    assert engine_args.hf_overrides == GEMMA4_TEXT_BACKBONE_OVERRIDE
 
 
 def test_force_text_backbone_skips_for_vlm_checkpoint_with_vision_config(monkeypatch):
-    """A vision checkpoint must keep its architectures -- forcing the text backbone
-    would strip the tower -- but still needs the head-dim repair, since
-    Gemma4ForConditionalGeneration re-triggers the bare head_dim read."""
+    """A vision checkpoint must keep its architectures -- forcing the text backbone would
+    strip the tower. It needs no override at all: the head-dim repair runs from the
+    platform hook."""
     hf_config = SimpleNamespace(
         model_type="gemma4",
         vision_config=SimpleNamespace(model_type="gemma4_vision"),
@@ -79,7 +79,7 @@ def test_force_text_backbone_skips_for_vlm_checkpoint_with_vision_config(monkeyp
     engine_args = _engine_args()
     force_text_backbone(engine_args)
 
-    assert engine_args.hf_overrides is _gemma4_multimodal_head_dim_override
+    assert engine_args.hf_overrides is None
 
 
 def test_audio_only_checkpoint_is_rejected(monkeypatch):
@@ -109,21 +109,31 @@ def test_vision_plus_audio_checkpoint_is_allowed_for_its_vision_path(monkeypatch
     engine_args = _engine_args()
     force_text_backbone(engine_args)
 
-    assert engine_args.hf_overrides is _gemma4_multimodal_head_dim_override
+    assert engine_args.hf_overrides is None
 
 
-def test_multimodal_head_dim_override_repairs_access_without_touching_architectures():
-    text_config = SimpleNamespace(architectures=None)
+def test_repair_head_dim_access_reaches_the_nested_text_config():
+    text_config = SimpleNamespace(model_type="gemma4_text")
     config = SimpleNamespace(
-        architectures=["Gemma4ForConditionalGeneration"], text_config=text_config
+        model_type="gemma4",
+        architectures=["Gemma4ForConditionalGeneration"],
+        text_config=text_config,
     )
 
-    result = _gemma4_multimodal_head_dim_override(config)
+    repair_head_dim_access(config)
 
-    assert result is config
     assert config.architectures == ["Gemma4ForConditionalGeneration"]
     assert config.allow_global_per_layer_attribute_access is True
     assert text_config.allow_global_per_layer_attribute_access is True
+
+
+def test_repair_head_dim_access_ignores_an_unrelated_config():
+    """It runs from `check_and_update_config`, i.e. for every model Spyre loads."""
+    config = SimpleNamespace(model_type="llama")
+
+    repair_head_dim_access(config)
+
+    assert not hasattr(config, "allow_global_per_layer_attribute_access")
 
 
 def test_force_text_backbone_ignores_unrelated_model_type(monkeypatch):
@@ -181,7 +191,10 @@ def test_multimodal_gemma4_delegates_its_text_half_through_the_model_registry():
 
 def test_force_text_backbone_respects_user_supplied_hf_overrides(monkeypatch):
     """Skipped entirely (not even a get_config call) when the user already set
-    hf_overrides -- existing behavior, unrelated to the vision_config gate."""
+    hf_overrides. Safe because the head-dim repair no longer rides on this override:
+    `repair_head_dim_access` runs from the platform hook, so a user override -- a dict
+    such as GEMMA4_TEXT_BACKBONE_OVERRIDE included -- still gets it.
+    """
 
     def _boom(*args, **kwargs):
         raise AssertionError("get_config should not be called when hf_overrides is already set")

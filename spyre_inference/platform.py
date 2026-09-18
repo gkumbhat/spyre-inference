@@ -41,8 +41,9 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_b
 if TYPE_CHECKING:
     # NB: We can't eagerly import many things from vllm since vllm.config
     # will import this file. These would lead to circular imports
-    from vllm.config import VllmConfig
+    from vllm.config import ModelConfig, VllmConfig
 else:
+    ModelConfig = None
     VllmConfig = None
 
 logger = init_logger(__name__)
@@ -413,6 +414,20 @@ class TorchSpyrePlatform(CpuPlatform):
         return torch.float16
 
     @classmethod
+    def _gemma4_text_backbone_hint(cls, model_config: ModelConfig) -> str:
+        """Both bfloat16 rejections are reachable only through a vision checkpoint, which a
+        text-only launch can opt out of."""
+        if not getattr(model_config, "_spyre_requires_bfloat16", False):
+            return ""
+        from spyre_inference.models.gemma4 import GEMMA4_TEXT_BACKBONE_OVERRIDE
+
+        return (
+            " For text-only use of this checkpoint, pass "
+            f"hf_overrides={GEMMA4_TEXT_BACKBONE_OVERRIDE!r} to load its decoder without "
+            "the vision tower, which runs in float16."
+        )
+
+    @classmethod
     def get_device_communicator_cls(cls) -> str:
         # The base `CpuPlatform` returns `CpuCommunicator`, which delegates
         # to gloo collectives. With `dist_backend = "cpu:gloo,spyre:spyreccl"`
@@ -610,6 +625,13 @@ class TorchSpyrePlatform(CpuPlatform):
         # A bare VllmConfig() (no model) reaches this hook too; guard each
         # model_config access like upstream CpuPlatform.
         if vllm_config.model_config is not None:
+            # From here, not from `hf_overrides`, so a user-supplied override does not skip
+            # it; no-op for every other model. Runs again for the nested text config a
+            # multimodal model builds its decoder from.
+            from spyre_inference.models.gemma4 import repair_head_dim_access
+
+            repair_head_dim_access(vllm_config.model_config.hf_config)
+
             if vllm_config.model_config.dtype not in _SUPPORTED_DTYPES:
                 supported = sorted(str(d) for d in _SUPPORTED_DTYPES)
                 raise ValueError(
@@ -625,6 +647,7 @@ class TorchSpyrePlatform(CpuPlatform):
                     f"Spyre does not support quantization ({quantization}) with "
                     f"{torch.bfloat16}: the FP8 linear kernel produces float16 only, and "
                     "this model requires bfloat16. Run the unquantized checkpoint."
+                    + cls._gemma4_text_backbone_hint(vllm_config.model_config)
                 )
 
             # Pad attention head_dim up to a stick-aligned size on the native path.
@@ -668,6 +691,7 @@ class TorchSpyrePlatform(CpuPlatform):
                 f"{parallel_config.tensor_parallel_size}): torch-spyre's all_reduce is "
                 f"float16-only, and this model requires bfloat16. Run it at "
                 f"tensor_parallel_size=1."
+                + cls._gemma4_text_backbone_hint(vllm_config.model_config)
             )
 
         # Clamp CPU threading env vars before workers fork so they inherit the

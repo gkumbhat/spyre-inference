@@ -27,6 +27,29 @@ llm = LLM(
 
 See the [Examples](../examples/offline_inference/torch_spyre_inference.md) page for more usage patterns.
 
+## Gemma-4: text-only use of a vision checkpoint
+
+Every Gemma-4 repository carries a `vision_config`, so `google/gemma-4-31B` and
+`google/gemma-4-26B-A4B` load as `Gemma4ForConditionalGeneration` and run in bfloat16 —
+float16 overflows the vision tower's residual stream. torch-spyre's `all_reduce` is
+float16-only and its FP8 linear kernel produces float16, so a bfloat16 run is rejected
+with `tensor_parallel_size > 1` or with quantization.
+
+To use one of those repositories for text only, pin its decoder architecture — the run is
+then float16, and tensor parallelism and quantization work as they do for any other
+decoder:
+
+```python
+llm = LLM(
+    model="google/gemma-4-26B-A4B",
+    hf_overrides={"architectures": ["Gemma4ForCausalLM"]},
+    tensor_parallel_size=2,
+)
+```
+
+A repository with no vision tower gets that override by default, so this is only needed
+for the multimodal ones.
+
 ## Decoder compile buckets
 
 The body pads the packed token count to the next `compile_sizes` bucket, and warmup

@@ -209,6 +209,7 @@ def _gemma4_rope_cos_sin(
     position_ids: torch.Tensor,
     padded_head_dim: int,
     dtype: torch.dtype,
+    attention_scaling: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """`[bsz, seq, 1, padded_head_dim]` cos and signed-sin tables for `_apply_rope`.
 
@@ -217,11 +218,14 @@ def _gemma4_rope_cos_sin(
     head as `[X, Y, zeros | X, Y, zeros]`, so one first-half/second-half swap serves both
     axes at once: each axis's angle is duplicated into both blocks, with `rotate_half`'s
     sign flip baked into `sin`.
+
+    `attention_scaling` (stock applies it to the whole table) scales the real lanes only;
+    the padded ones stay an exact identity rotation.
     """
     positions = position_ids.to("cpu").clamp(min=0).float()
     angles = positions[..., None] * inv_freq.to("cpu").float()  # [bsz, seq, 2, quarter]
-    cos_axis = angles.cos()
-    sin_axis = angles.sin()
+    cos_axis = angles.cos() * attention_scaling
+    sin_axis = angles.sin() * attention_scaling
     bsz, seq_len, _, quarter = cos_axis.shape
     half = padded_head_dim // 2
     cos_half = torch.ones(bsz, seq_len, half)
@@ -237,22 +241,27 @@ def _gemma4_rope_cos_sin(
     return cos_full.to(dtype), sin_full.to(dtype)
 
 
-def _fp32_inv_freq(rotary_emb, config) -> torch.Tensor:
-    """Rope frequencies in fp32, recomputed rather than read off the module buffer.
+def _fp32_inv_freq(rotary_emb, config) -> tuple[torch.Tensor, float]:
+    """Rope frequencies in fp32 plus the initializer's attention scaling, recomputed rather
+    than read off the module buffer.
 
     `model.to(bfloat16)` downcasts `inv_freq`, and these frequencies span 1.0 down to
     ~1e-4 where bf16 costs real precision -- amplified because the angle is
     `position * inv_freq`. Upcasting the buffer cannot recover the lost bits.
+
+    The initializer is resolved off the rotary module before the global registry:
+    transformers renames this tower's rope type from `default` to `axial` after 5.16.1, and
+    the axial initializer is a class-local staticmethod absent from `ROPE_INIT_FUNCTIONS`.
     """
     params = getattr(config, "rope_parameters", None) or {}
     rope_type = params.get("rope_type", "default")
-    if rope_type == "default":
-        inv_freq, _ = type(rotary_emb).compute_default_rope_parameters(config)
-    else:
+    init_fn = getattr(rotary_emb, f"compute_{rope_type}_rope_parameters", None)
+    if init_fn is None:
         from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 
-        inv_freq, _ = ROPE_INIT_FUNCTIONS[rope_type](config, None)
-    return inv_freq.float()
+        init_fn = ROPE_INIT_FUNCTIONS[rope_type]
+    inv_freq, attention_scaling = init_fn(config)
+    return inv_freq.float(), float(attention_scaling)
 
 
 # Permutation matrices for `_apply_rope`, keyed by (dim, dtype, device).
@@ -468,8 +477,9 @@ def patch_vision_encoder() -> None:
         device = inputs_embeds.device
         dtype = inputs_embeds.dtype
 
+        inv_freq, attention_scaling = _fp32_inv_freq(self.rotary_emb, config)
         cos, sin = _gemma4_rope_cos_sin(
-            _fp32_inv_freq(self.rotary_emb, config), pixel_position_ids, padded_head_dim, dtype
+            inv_freq, pixel_position_ids, padded_head_dim, dtype, attention_scaling
         )
         cos = convert(cos, device=device)
         sin = convert(sin, device=device)
