@@ -181,8 +181,14 @@ _warmup_complete = False
 
 
 def mark_warmup_complete() -> None:
-    """Arm the late-compile warning, once warmup has claimed full variant coverage."""
-    global _warmup_complete
+    """Arm the late-compile warning, once warmup has claimed full variant coverage.
+
+    Syncs the graph counter too. Warmup's last compiles are the pooler's, which run
+    after the final attention kernel call, so nothing else would account for them --
+    and the first real request would then report them as compiled outside warmup.
+    """
+    global _warmup_complete, _last_graph_count
+    _last_graph_count = counters["stats"]["unique_graphs"]
     _warmup_complete = True
 
 

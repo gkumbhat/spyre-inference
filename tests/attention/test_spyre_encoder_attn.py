@@ -21,6 +21,7 @@ from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import AttentionSpec, EncoderOnlyAttentionSpec
 
+from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionMetadataBuilder,
     SpyrePagedKVCache,
@@ -277,7 +278,7 @@ def test_alignment_units_for_rounds_up_to_powers_of_two():
 
 
 def test_encoder_mask_cuts_at_the_boundary_block():
-    mask = encoder_mask(3 * ENCODER_LEN_ALIGNMENT, 100, torch.float32, torch.device("cpu"), {})
+    mask = encoder_mask(3 * ENCODER_LEN_ALIGNMENT, 100, torch.float32)
     masked = torch.finfo(torch.float32).min
     # Head and query axes stay 1 and broadcast: an encoder mask depends only on
     # the KV column, so it need not be materialised per head.
@@ -290,8 +291,8 @@ def test_encoder_mask_cuts_at_the_boundary_block():
     assert torch.equal(mask[..., 128:], torch.full_like(mask[..., 128:], masked))
 
 
-def test_encoder_mask_single_block_skips_the_cat():
-    mask = encoder_mask(ENCODER_LEN_ALIGNMENT, 64, torch.float32, torch.device("cpu"), {})
+def test_encoder_mask_at_one_alignment_unit_is_a_single_row():
+    mask = encoder_mask(ENCODER_LEN_ALIGNMENT, 64, torch.float32)
     assert mask.shape == (1, 1, 1, ENCODER_LEN_ALIGNMENT)
 
 
@@ -316,7 +317,7 @@ def test_dense_attn_kernel_never_calls_arange(monkeypatch):
     q_rows = torch.randn(extent, num_heads, head_size, dtype=torch.float32)
     k_rows = torch.randn(extent, num_kv_heads, head_size, dtype=torch.float32)
     v_rows = torch.randn(extent, num_kv_heads, head_size, dtype=torch.float32)
-    mask = encoder_mask(extent, length, q_rows.dtype, q_rows.device, {})
+    mask = convert(encoder_mask(extent, length, q_rows.dtype), q_rows.device)
 
     real_arange = torch.arange
     calls = {"n": 0}
@@ -364,14 +365,13 @@ def _dense_attn(
     num_heads, head_size = query.shape[1], query.shape[2]
     num_kv_heads = key.shape[1]
     index_dtype = encoder_index_dtype(query.device)
-    tile_cache: dict = {}
     attn_fn = _create_dense_attn_kernel(num_heads, num_kv_heads, head_size)
     out = torch.zeros_like(query)
     start = 0
     for length in query_lens:
         extent = _alignment_units_for(length) * ENCODER_LEN_ALIGNMENT
         row_index = encoder_row_table(start, length, extent, index_dtype)
-        mask = encoder_mask(extent, length, query.dtype, query.device, tile_cache)
+        mask = convert(encoder_mask(extent, length, query.dtype), query.device)
         q_rows, k_rows, v_rows = _encoder_gather_kernel(query, key, value, row_index)
         attn = attn_fn(q_rows, k_rows, v_rows, mask, scale)
         out.index_copy_(0, row_index, attn)

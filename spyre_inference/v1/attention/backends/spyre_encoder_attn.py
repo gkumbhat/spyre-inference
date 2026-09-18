@@ -249,56 +249,22 @@ def encoder_row_table(start: int, query_len: int, extent: int, dtype: torch.dtyp
     return torch.arange(extent, dtype=dtype).clamp(max=query_len - 1) + start
 
 
-def _const_tile(
-    masked: bool,
-    dtype: torch.dtype,
-    device: torch.device,
-    cache: dict | None,
-) -> torch.Tensor:
-    """Shared all-zero or all-masked 64-wide tile. Read-only: every mask aliases it."""
-    cache_key = (masked, dtype, str(device))
-    tile = None if cache is None else cache.get(cache_key)
-    if tile is None:
-        fill = torch.finfo(dtype).min if masked else 0.0
-        host = torch.full((1, 1, 1, ENCODER_LEN_ALIGNMENT), fill, dtype=dtype)
-        tile = convert(host, device)
-        if cache is not None:
-            cache[cache_key] = tile
-    return tile
-
-
-def encoder_mask(
-    extent: int,
-    kv_len: int,
-    dtype: torch.dtype,
-    device: torch.device,
-    cache: dict | None = None,
-) -> torch.Tensor:
-    """Additive mask [1, 1, 1, extent] for one sequence.
+def encoder_mask(extent: int, kv_len: int, dtype: torch.dtype) -> torch.Tensor:
+    """Additive mask ``[1, 1, 1, extent]`` for one sequence, on the host.
 
     The head and query axes are 1 and left to broadcast: an encoder mask depends
     only on the KV column, since every query row -- real or padding -- attends to
-    exactly the real keys. That also makes the mask ``num_heads`` times smaller
-    than a per-head one, which matters because it is rebuilt per request per step.
+    exactly the real keys.
 
-    Built by concatenating 64-wide tiles rather than materialising ``extent``
-    fresh elements: interior tiles (all real keys) and beyond-the-end tiles (all
-    padding) are shared constants handed out by reference from ``cache``, so only
-    the one tile straddling ``kv_len`` -- if any -- is request-specific.
+    Built whole on the host so a group's masks can be concatenated there and reach
+    the device in one ``convert``. Assembling it from cached device tiles instead
+    left an eager ``cat`` on the device, which torch-spyre compiled once per tile
+    pattern -- and warmup could not cover those, because it only ever built masks
+    with ``kv_len == extent`` (no partial tile) while real requests always have one.
     """
-    num_tiles = extent // ENCODER_LEN_ALIGNMENT
-    tiles: list[torch.Tensor] = []
-    for i in range(num_tiles):
-        lo = i * ENCODER_LEN_ALIGNMENT
-        if lo + ENCODER_LEN_ALIGNMENT <= kv_len:
-            tiles.append(_const_tile(False, dtype, device, cache))
-        elif lo >= kv_len:
-            tiles.append(_const_tile(True, dtype, device, cache))
-        else:
-            host = torch.full((1, 1, 1, ENCODER_LEN_ALIGNMENT), torch.finfo(dtype).min, dtype=dtype)
-            host[..., : kv_len - lo] = 0
-            tiles.append(convert(host, device))
-    return tiles[0] if num_tiles == 1 else torch.cat(tiles, dim=-1)
+    mask = torch.full((1, 1, 1, extent), torch.finfo(dtype).min, dtype=dtype)
+    mask[..., :kv_len] = 0
+    return mask
 
 
 def _host_pad_head_dim(x: torch.Tensor, padded: int) -> torch.Tensor:
@@ -368,10 +334,6 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         # Grouping only pays off through the compiled kernels; in eager mode the
         # per-request loop has no launch overhead to amortise.
         self._batched_attn = self._compile_attn and envs.SPYRE_ENCODER_BATCHED_ATTN
-        # Mask tiles are shape-only (depend only on kv_len's tile boundary,
-        # not on which request/layer/step), so one device copy each serves
-        # every sequence, layer and step.
-        self._const_tiles: dict[tuple, torch.Tensor] = {}
         self._warmed_buffers: set[int] = set()
         # A request's extent cannot exceed its own length, so warming past the
         # model length compiles the most expensive graphs for shapes no request
@@ -470,10 +432,10 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         max_extent = min(buffer_rows, self._max_extent)
         while extent <= max_extent:
             rows = convert(encoder_row_table(0, extent, extent, index_dtype), device)
-            mask = encoder_mask(extent, extent, dtype, device, self._const_tiles)
+            host_mask = encoder_mask(extent, extent, dtype)
+            mask = convert(host_mask, device)
             # The fused graph gathers internally, so warm it on the buffers, not
-            # on gathered rows. The standalone gather/attn/store still need
-            # warming for the exact-fill plan, which cannot use the fused graph.
+            # on gathered rows.
             self._run_fused(
                 output,
                 rows,
@@ -494,7 +456,7 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
                         torch.cat([encoder_row_table(0, extent, extent, index_dtype)] * group),
                         device,
                     )
-                    g_mask = torch.cat([mask] * group, dim=0)
+                    g_mask = convert(torch.cat([host_mask] * group, dim=0), device)
                     self._run_fused(
                         output,
                         g_rows,
@@ -549,12 +511,9 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
                 ),
                 # Concatenated, not stacked: member order along dim 0 is what the
                 # kernel's batch dim indexes.
-                mask=torch.cat(
-                    [
-                        encoder_mask(extent, m[2], query.dtype, device, self._const_tiles)
-                        for m in members
-                    ],
-                    dim=0,
+                mask=convert(
+                    torch.cat([encoder_mask(extent, m[2], query.dtype) for m in members], dim=0),
+                    device,
                 ),
             )
 
