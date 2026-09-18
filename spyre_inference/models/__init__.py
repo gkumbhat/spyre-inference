@@ -124,4 +124,3 @@ def install_decoder_model_patches() -> None:
     from spyre_inference.models import gemma4
 
     gemma4.install_spyre_patches()
-

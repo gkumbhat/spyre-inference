@@ -35,20 +35,21 @@ from spyre_inference.multimodal.clip import apply as apply_clip_patches
 
 
 def _fake_clip_model(hidden_size: int = 64, with_post_norm: bool = True):
-    torch.manual_seed(0)
+    g = torch.Generator(device="cpu")
+    g.manual_seed(0)
     text_model = types.SimpleNamespace(final_layer_norm=torch.nn.LayerNorm(hidden_size))
-    text_model.final_layer_norm.weight.data.normal_()
-    text_model.final_layer_norm.bias.data.normal_()
+    text_model.final_layer_norm.weight.data.normal_(generator=g)
+    text_model.final_layer_norm.bias.data.normal_(generator=g)
 
     vision_model = types.SimpleNamespace(
         pre_layrnorm=torch.nn.LayerNorm(hidden_size),
         post_layernorm=(torch.nn.LayerNorm(hidden_size) if with_post_norm else None),
     )
-    vision_model.pre_layrnorm.weight.data.normal_()
-    vision_model.pre_layrnorm.bias.data.normal_()
+    vision_model.pre_layrnorm.weight.data.normal_(generator=g)
+    vision_model.pre_layrnorm.bias.data.normal_(generator=g)
     if with_post_norm:
-        vision_model.post_layernorm.weight.data.normal_()
-        vision_model.post_layernorm.bias.data.normal_()
+        vision_model.post_layernorm.weight.data.normal_(generator=g)
+        vision_model.post_layernorm.bias.data.normal_(generator=g)
 
     return types.SimpleNamespace(text_model=text_model, vision_model=vision_model)
 
