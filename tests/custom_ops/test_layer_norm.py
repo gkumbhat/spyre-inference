@@ -126,6 +126,36 @@ def test_spyre_layer_norm_eager_mode_skips_torch_compile():
 
 
 @pytest.mark.layer_norm
+def test_spyre_layer_norm_fp32_accumulation_avoids_overflow():
+    """fp16 mean/var overflows to inf once |x - mean| > 256, zeroing the row via
+    rsqrt(inf). This test plants a ±400 outlier that triggers that path under a
+    naive fp16 accumulation; the fp32 path must return finite, correct values.
+    Runs on CPU so it needs no hardware."""
+    from spyre_inference.custom_ops.layer_norm import _layer_norm_kernel
+
+    hidden_size, eps = 128, 1e-5
+    weight = torch.ones(hidden_size, dtype=torch.float16)
+    bias = torch.zeros(hidden_size, dtype=torch.float16)
+
+    # Row with an extreme outlier: |x - mean| ≈ 400, far above the fp16 255-max
+    # for variance accumulation.
+    x = torch.zeros(1, hidden_size, dtype=torch.float16)
+    x[0, 0] = 400.0
+    x[0, 1] = -400.0
+
+    # A naive fp16 accumulation would produce var=inf → rsqrt(inf)=0 → zero row.
+    var_fp16 = (x - x.mean(dim=-1, keepdim=True)).pow(2).mean(dim=-1)
+    assert not torch.isfinite(var_fp16).all(), "precondition: fp16 var must overflow"
+
+    result = _layer_norm_kernel(x, weight, bias, eps)
+
+    assert torch.isfinite(result).all(), "fp32 accumulation must not produce inf/nan"
+    # The reference (F.layer_norm, also fp32 internally) must agree.
+    ref = torch.nn.functional.layer_norm(x, (hidden_size,), weight, bias, eps)
+    torch.testing.assert_close(result, ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.layer_norm
 def test_spyre_layer_norm_inline_inside_compiled_graph(default_vllm_config):
     """Called from inside an existing torch.compile region (STOCK_TORCH_COMPILE
     compiles one transformer block at a time), forward() must inline
