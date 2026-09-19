@@ -97,6 +97,7 @@ from spyre_inference.v1.pool import (
     copy_pooler_output_to_cpu,
     select_rows,
 )
+from spyre_inference.v1.sample.topk_topp_sampler import SpyreTopKTopPSampler
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
     SpyreShapeBucketer,
     logits_row_buckets,
@@ -260,21 +261,56 @@ def _block_sharing_defeated_by() -> str | None:
     return None
 
 
+## TODO: Remove this function when upgrading to vLLM 0.30.0
+def _is_decoder_attention_like(module: nn.Module) -> bool:
+    """Return whether a module participates in decoder KV-cache attention.
+
+    Native vLLM models own an ``Attention`` directly. The Transformers backend
+    instead retains an HF dispatcher with a ``layer_idx`` and the text config's
+    ``_attn_implementation`` set to ``vllm``. Those are the interface
+    contract, unlike the module's class name, and do not match vision encoders.
+    """
+    if isinstance(module, Attention):
+        return True
+    # Vision encoders retain their HF attention implementation (for example,
+    # ``sdpa``). Only text-decoder wrappers are configured to dispatch through
+    # vLLM's KV-cache attention implementation. Transformers may prefix the
+    # implementation with ``paged|`` when it enables its paged-cache wrapper.
+    # TODO: Drop the decoder-only restriction when
+    # test_spyre_compiled_pixtral_vision_attention_coarse_tile XPASSes.
+    implementation = getattr(getattr(module, "config", None), "_attn_implementation", "") or ""
+    return isinstance(getattr(module, "layer_idx", None), int) and "vllm" in implementation.split(
+        "|"
+    )
+
+
+_VISION_TOWER_NAME_PARTS = frozenset(("vision_encoder", "vision_tower", "vision_model", "visual"))
+
+
+def _is_vision_tower_path(qualname: str) -> bool:
+    """True for ``vision_encoder.transformer.layers`` and the HF / Qwen-VL spellings."""
+    return any(part in _VISION_TOWER_NAME_PARTS for part in qualname.split("."))
+
+
 def _repeated_block_lists(model: nn.Module) -> list[nn.ModuleList]:
     block_lists = []
-    for module in model.modules():
+    for qualname, module in model.named_modules():
         if not isinstance(module, nn.ModuleList):
+            continue
+        # Encoder-only towers stay eager even if a block's class name looks like
+        # attention (Qwen2_5_VLVisionAttention). Decoder lists are never named these.
+        if _is_vision_tower_path(qualname):
             continue
         blocks = [b for b in module if not isinstance(b, PPMissingLayer)]
         if not blocks:
             continue
         # nn.Module.modules() yields the module itself, so a list of bare Attention
         # layers (Zamba2's dpa_list) would match and "compile" one opaque call per entry.
-        if any(isinstance(b, Attention) for b in blocks):
+        if any(_is_decoder_attention_like(b) for b in blocks):
             continue
         # Hybrid Mamba+attention stacks (Granite 4.0, Jamba) mix classes in one list;
         # each class shares a forward code object, so compiles scale per class, not depth.
-        if any(isinstance(m, Attention) for b in blocks for m in b.modules()):
+        if any(_is_decoder_attention_like(m) for b in blocks for m in b.modules()):
             block_lists.append(module)
     return block_lists
 
@@ -305,6 +341,8 @@ class _SpyreModelWrapper:
         keep_outputs_on_device: bool = False,
         logits_row_buckets: list[int] | None = None,
         shape_bucketer: SpyreShapeBucketer | None = None,
+        *,
+        model_dtype: torch.dtype,
     ):
         # Use object.__setattr__ to avoid triggering __setattr__ override
         object.__setattr__(self, "_model", model)
@@ -312,6 +350,7 @@ class _SpyreModelWrapper:
         object.__setattr__(self, "_keep_outputs_on_device", keep_outputs_on_device)
         object.__setattr__(self, "_logits_row_buckets", logits_row_buckets or [])
         object.__setattr__(self, "_shape_bucketer", shape_bucketer)
+        object.__setattr__(self, "_model_dtype", model_dtype)
 
     def __call__(self, *args, **kwargs):
         # Convert integer tensor inputs to Spyre int64. Do not use int32:
@@ -366,12 +405,18 @@ class _SpyreModelWrapper:
 
         def _to_spyre_float(t):
             if isinstance(t, torch.Tensor) and t.is_floating_point():
-                return convert(t, dtype=torch.float16, device=self._spyre_device)
+                return convert(t, dtype=self._model_dtype, device=self._spyre_device)
             return t
 
         kwargs = tree_map(_to_spyre_float, kwargs)
-        out = self._model.embed_multimodal(**kwargs)
-        return out
+        # Vision towers run eager, so each Spyre op with a decomposition reaches it
+        # through torch-spyre's lazily-compiled PrivateUse1 kernel, which compiles
+        # without fullgraph. Decompositions built on for_each_tile (SDPA since
+        # torch-spyre#4550) emit a scan whose while_loop lowering reads the loop index
+        # with .item(); without fullgraph that needs capture_scalar_outputs, or the
+        # trace dies with DataDependentOutputException.
+        with torch._dynamo.config.patch(capture_scalar_outputs=True):
+            return self._model.embed_multimodal(**kwargs)
 
     def embed_input_ids(
         self,
@@ -468,7 +513,12 @@ class _SpyreModelWrapper:
         return getattr(self._model, name)
 
     def __setattr__(self, name, value):
-        setattr(self._model, name, value)
+        # `__init__` fills our `__dict__` via `object.__setattr__`, so a name in it is
+        # ours, not the model's.
+        if name in self.__dict__:
+            object.__setattr__(self, name, value)
+        else:
+            setattr(self._model, name, value)
 
 
 class TorchSpyreModelRunner(GPUModelRunner):
@@ -503,6 +553,11 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # int64 at the model boundary.
         # _make_buffer (overridden below) places float .gpu tensors on Spyre
         # regardless of self.device.
+
+        # Sort-free top-k path (see SpyreTopKTopPSampler).
+        self.sampler.topk_topp_sampler = SpyreTopKTopPSampler(
+            self.sampler.logprobs_mode, self.sampler.use_fp64_gumbel
+        )
 
         # Disable GPU-specific features (same as CPUModelRunner)
         self.use_cuda_graph = False
@@ -605,6 +660,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 else logits_row_buckets(bucketer.bucket_sizes, self.max_num_reqs)
             ),
             shape_bucketer=bucketer,
+            model_dtype=self._model_dtype(),
         )
 
     @staticmethod
@@ -1199,6 +1255,12 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
     # --- KV cache allocation ---
 
+    def _model_dtype(self) -> torch.dtype:
+        """The activation dtype the platform settled on (float16 unless bfloat16 was
+        asked for explicitly)."""
+        dtype = self.model_config.dtype
+        return dtype if isinstance(dtype, torch.dtype) else torch.float16
+
     def initialize_kv_cache_tensors(self, kv_cache_config, kernel_block_sizes):
         """Allocate KV cache as one dense paged tensor per layer on Spyre.
 
@@ -1287,14 +1349,14 @@ class TorchSpyreModelRunner(GPUModelRunner):
     ) -> SpyreCpuGpuBuffer:
         """Create a SpyreCpuGpuBuffer with float tensors on Spyre.
 
-        - Float dtypes: .cpu on CPU, .gpu on Spyre as float16
+        - Float dtypes: .cpu on CPU, .gpu on Spyre at the model dtype
         - Int/bool dtypes: .gpu aliased to .cpu (stays on CPU)
         """
         if dtype.is_floating_point:
             return SpyreCpuGpuBuffer(
                 *size,
                 cpu_dtype=dtype,
-                gpu_dtype=torch.float16,
+                gpu_dtype=self._model_dtype(),
                 device=self._spyre_device,
                 pin_memory=False,
                 with_numpy=numpy,
