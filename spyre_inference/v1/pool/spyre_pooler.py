@@ -34,7 +34,6 @@ from vllm.model_executor.layers.pooler.tokwise.poolers import TokenPooler
 from vllm.v1.outputs import PoolerOutput
 
 from spyre_inference.custom_ops.utils import convert
-from spyre_inference.v1.attention.backends.spyre_attn import note_unattributed_compiles
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
     default_encoder_len_buckets,
     next_bucket,
@@ -153,15 +152,11 @@ class SpyreCLSPool(CLSPool):
     """CLS via ``index_select`` (keeps upstream ``isinstance`` checks)."""
 
     def forward(self, hidden_states, pooling_metadata):
-        # Splits late compiles into "everything before the pooler" (the body)
-        # and the pooler's own, which the attention kernels cannot see.
-        note_unattributed_compiles("model body")
         cursor = pooling_metadata.get_pooling_cursor()
         if cursor.is_partial_prefill():
             raise RuntimeError("partial prefill is not supported with CLS pooling")
         idx, n_rows = pad_row_count_to_bucket(cursor_row_indices_cpu(cursor, last=False))
         pooled = select_rows(hidden_states, idx)
-        note_unattributed_compiles("pooler")
         return pooled[:n_rows] if pooled.shape[0] != n_rows else pooled
 
 

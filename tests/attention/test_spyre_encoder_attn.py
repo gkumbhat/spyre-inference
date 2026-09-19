@@ -16,6 +16,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+import torch.nn.functional as F
 from spyre_testing_plugin.pytest_plugin import spyre_available
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.attention.backend import CommonAttentionMetadata
@@ -30,9 +31,8 @@ from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
     ENCODER_LEN_ALIGNMENT,
     SpyreEncoderAttentionImpl,
     _alignment_units_for,
-    _create_dense_attn_kernel,
     _encoder_gather_kernel,
-    dense_sdpa_reference,
+    _encoder_sdpa_kernel,
     encoder_index_dtype,
     encoder_mask,
     encoder_row_table,
@@ -41,6 +41,43 @@ from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
 # extra `encoder_attention` mark so CI can split this into its own job
 # because these tests are pretty slow.
 pytestmark = [pytest.mark.attention, pytest.mark.encoder_attention]
+
+
+def _create_dense_attn_kernel(num_heads: int, num_kv_heads: int, head_size: int):
+    """Test helper: bind the non-tensor args the way a forward call would."""
+
+    def specialized_dense_attn_kernel(q_rows, k_rows, v_rows, mask, scale):
+        return _encoder_sdpa_kernel(
+            q_rows, k_rows, v_rows, mask, scale, 1, num_heads, num_kv_heads, head_size
+        )
+
+    return specialized_dense_attn_kernel
+
+
+def dense_sdpa_reference(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    query_lens: list[int],
+    scale: float,
+) -> torch.Tensor:
+    """Per-sequence eager SDPA on the packed list (probe / unit-test reference)."""
+    outs: list[torch.Tensor] = []
+    start = 0
+    for length in query_lens:
+        q = query[start : start + length]
+        k = key[start : start + length]
+        v = value[start : start + length]
+        qh = q.unsqueeze(0).transpose(1, 2)
+        kh = k.unsqueeze(0).transpose(1, 2)
+        vh = v.unsqueeze(0).transpose(1, 2)
+        kwargs: dict = {"is_causal": False, "scale": scale}
+        if q.shape[1] != k.shape[1]:
+            kwargs["enable_gqa"] = True
+        out = F.scaled_dot_product_attention(qh, kh, vh, **kwargs)
+        outs.append(out.transpose(1, 2).squeeze(0))
+        start += length
+    return torch.cat(outs, dim=0)
 
 
 @pytest.fixture()

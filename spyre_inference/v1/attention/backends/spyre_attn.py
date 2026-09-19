@@ -234,8 +234,8 @@ def _call_kernel(label: str, fn, *args):
     a single-tenant serving process; if it ever stops holding, the cost is a spurious
     warning, not a wrong result.
 
-    Every late compile is logged, not just the first: ``warning_once`` dedups on
-    the message, so it reported "at least one" as though it were exactly one.
+    Logged on every occurrence: ``warning_once`` dedups on the message, so it
+    reported "at least one" as though it were exactly one.
     """
     global _last_graph_count
     if not _warmup_complete:
@@ -247,15 +247,10 @@ def _call_kernel(label: str, fn, *args):
     if after != before:
         _late_compiles[label] = _late_compiles.get(label, 0) + (after - before)
         logger.warning(
-            "%s compiled outside warmup (+%d graph(s), %d total for this label) on %s. "
-            "Each costs a full Inductor compile mid-request.",
+            "%s compiled outside warmup (%d total for this label), which costs a full "
+            "Inductor compile mid-request. Re-run with TORCH_LOGS=recompiles for the guard.",
             label,
-            after - before,
             _late_compiles[label],
-            ", ".join(
-                "x".join(str(d) for d in a.shape) if isinstance(a, torch.Tensor) else repr(a)
-                for a in args
-            ),
         )
     return result
 

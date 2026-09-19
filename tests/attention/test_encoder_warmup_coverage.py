@@ -99,9 +99,7 @@ class TestWarmKernelsCoversTheBucket:
             extent *= 2
         assert seen_gathers == expected_extents
 
-    def test_store_rewarms_every_buffer_size_not_just_the_first_to_reach_an_extent(
-        self, monkeypatch
-    ):
+    def test_rewarms_every_buffer_size_not_just_the_first_to_reach_an_extent(self, monkeypatch):
         """Regression: store's own cache key includes ``buffer_rows`` (unlike
         attention's, which is keyed only on ``extent``), so it must be called for
         every ``(buffer_rows, extent)`` pair -- not skipped just because some
@@ -288,20 +286,6 @@ class TestWarmKernelsCoversTheBucket:
             assert _alignment_units_for(length) * ENCODER_LEN_ALIGNMENT in warmed_extents
             checked += 1
         assert checked > 20, "too few lengths checked -- test is near-vacuous"
-
-
-class TestWarmupComplete:
-    """``mark_warmup_complete`` gates the late-compile diagnostic, not correctness."""
-
-    def test_flag_round_trips(self):
-        saved = spyre_attn._warmup_complete
-        try:
-            spyre_attn._warmup_complete = False
-            assert not spyre_attn.is_warmup_complete()
-            spyre_attn.mark_warmup_complete()
-            assert spyre_attn.is_warmup_complete()
-        finally:
-            spyre_attn._warmup_complete = saved
 
 
 def test_call_kernel_warns_only_after_warmup_is_marked_complete(monkeypatch, caplog):

@@ -85,9 +85,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # per-seq loop either way. "0" forces the loop for all batch sizes.
     "SPYRE_BATCHED_DECODE": lambda: bool(int(os.getenv("SPYRE_BATCHED_DECODE", "1"))),
     # Batch encoder attention over requests that share a padded length, instead of
-    # one gather/attend/store per request. On by default: these kernels are
-    # dispatch-bound, so grouping is worth ~1.4x warm throughput for ~70s of extra
-    # warmup. Set to 0 to trade that back for the shorter startup.
+    # one gather/attend per request. On by default: these kernels are dispatch-bound,
+    # so grouping raises throughput at the cost of a longer warmup. Set to 0 to trade
+    # that back for the shorter startup.
     "SPYRE_ENCODER_BATCHED_ATTN": lambda: bool(int(os.getenv("SPYRE_ENCODER_BATCHED_ATTN", "1"))),
     # When "1", reuse compiled Spyre kernels across processes by caching them on
     # disk. Off by default. TORCHINDUCTOR_FORCE_DISABLE_CACHES=1 disables the cache
