@@ -225,7 +225,9 @@ def test_apply_config_sets_pooling_compile_sizes_from_token_cap():
     # A MagicMock here is truthy and would skip that path (#638).
     vllm_config.compilation_config.compile_sizes = []
     TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
-    assert vllm_config.compilation_config.compile_sizes == [64, 128, 256, 512]
+    # The ladder starts at ENCODER_MIN_BODY_BUCKET, not at one stick: each body
+    # bucket multiplies the attention warmup sweep, which is keyed on buffer_rows.
+    assert vllm_config.compilation_config.compile_sizes == [256, 512]
     assert vllm_config.scheduler_config.max_num_batched_tokens == 512
 
 
