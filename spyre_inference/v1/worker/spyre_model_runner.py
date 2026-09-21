@@ -464,10 +464,9 @@ class _SpyreModelWrapper:
 
         gpu_model_runner._preprocess calls this directly on `self.model`,
         bypassing __call__, so it needs its own CPU <-> Spyre boundary
-        conversion: input_ids and is_multimodal are CPU buffers, and
-        multimodal_embeddings come back from embed_multimodal already
-        converted to CPU, but the text embedding table (and the merge with
-        multimodal_embeddings) lives on Spyre.
+        conversion: input_ids and is_multimodal are CPU buffers, while the text
+        embedding table (and the merge with multimodal_embeddings) lives on
+        Spyre.
 
         Bucket the token count: this runs on the raw scheduled count, so at TP>1
         the vocab-parallel all_reduce is `num_tokens * hidden` for every distinct
@@ -475,7 +474,15 @@ class _SpyreModelWrapper:
         on CPU and trim after; padding inside a compiled collective corrupts
         output. `is_multimodal` is padded the same way so it still lines up with
         `input_ids` for the merge; the padded rows are never multimodal.
+
+        Only a merged result comes back on CPU: upstream copies what we return
+        into its persistent inputs_embeds buffer, and the merge's `torch.where`
+        output layout does not survive that d2d `copy_`. With no multimodal
+        embeddings there is no merge, so the text lookup stays on device instead
+        of paying a D2H that upstream's H2D immediately undoes -- which is every
+        decode step and every text-only prompt served by a multimodal model.
         """
+        has_mm = multimodal_embeddings is not None and len(multimodal_embeddings) > 0
         num_tokens = input_ids.shape[0]
         bucketer = self._shape_bucketer
         padded_tokens = bucketer.find_bucket(num_tokens) if bucketer is not None else None
@@ -496,13 +503,12 @@ class _SpyreModelWrapper:
         if padded_tokens is not None:
             # A plain prefix slice, not select_rows: the padding above always
             # appends at the end, so the real rows are always 0..num_tokens
-            # contiguously -- no gather needed, and this result has already been
-            # through the multimodal merge (a torch.where select), whose output
-            # layout select_rows's own compiled index_select does not accept.
+            # contiguously -- no gather needed, and a merged result's torch.where
+            # output layout select_rows's own compiled index_select does not accept.
             result = tree_map(
                 lambda t: t[:num_tokens] if isinstance(t, torch.Tensor) else t, result
             )
-        return tree_map(self._to_cpu, result)
+        return tree_map(self._to_cpu, result) if has_mm else result
 
     def __getattr__(self, name):
         return getattr(self._model, name)
