@@ -193,7 +193,12 @@ def mark_warmup_complete() -> None:
 
 
 def is_warmup_complete() -> bool:
-    """Whether ``mark_warmup_complete`` has run. For diagnostics, not control flow."""
+    """Whether ``mark_warmup_complete`` has run.
+
+    Load-bearing: the model runner builds encoder attention plans only once warmup is
+    done, so warmup traces the custom-op path and serving the traced one. Plans built
+    from warmup's synthetic seq lens warm graphs serving never uses.
+    """
     return _warmup_complete
 
 

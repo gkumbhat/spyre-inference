@@ -87,9 +87,11 @@ from spyre_inference.multimodal import apply_multimodal_patches
 from spyre_inference.v1.attention import attn_layer
 from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionImpl,
+    SpyreAttentionMetadata,
     SpyreAttentionMetadataBuilder,
     SpyrePagedKVCache,
     allocate_staging_buffers,
+    is_warmup_complete,
     mark_warmup_complete,
 )
 from spyre_inference.v1.pool import (
@@ -987,6 +989,50 @@ class TorchSpyreModelRunner(GPUModelRunner):
                     )
             self.attn_groups[kv_cache_group_id] = split_groups
 
+    def _build_attention_metadata(self, *args, **kwargs):
+        """Attach encoder attention plans to the metadata, off the traced path.
+
+        Upstream returns ``(per_layer_metadata, common_metadata)``; the plans hang off the
+        per-layer objects. Built here rather than in ``forward`` because the builder does a
+        D2H read and an H2D convert, which inside a traced region become graph nodes.
+        """
+        out = super()._build_attention_metadata(*args, **kwargs)
+        # Only for real batches. Warmup's dummy runs carry synthetic seq lens, so plans
+        # built from them warm graphs serving never uses -- measured as 435 clone-bearing
+        # kernels and a throughput regression below baseline. Warmup therefore traces the
+        # custom-op path, and serving the traced one.
+        if self.model_config.runner_type != "pooling" or not is_warmup_complete():
+            return out
+        from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
+            build_encoder_plans,
+        )
+
+        per_layer = out[0] if isinstance(out, tuple) else out
+        rows = kwargs.get("num_tokens_padded") or getattr(self, "_encoder_buffer_rows", None)
+        if rows is None:
+            return out
+        groups = per_layer if isinstance(per_layer, list) else [per_layer]
+        seen: set[int] = set()
+        for group in groups:
+            if not isinstance(group, dict):
+                continue
+            for md in group.values():
+                if id(md) in seen or not hasattr(md, "encoder_seq_plans"):
+                    continue
+                seen.add(id(md))
+                if md.encoder_seq_plans is None:
+                    encoder_md = cast(SpyreAttentionMetadata, md)
+                    encoder_md.encoder_seq_plans = build_encoder_plans(
+                        encoder_md,
+                        buffer_rows=int(rows),
+                        # self.device is CPU by design (see the class docstring); the
+                        # real device is _spyre_device.
+                        device=self._spyre_device,
+                        dtype=self._model_dtype(),
+                        batched=envs.SPYRE_ENCODER_BATCHED_ATTN,
+                    )
+        return out
+
     def _determine_batch_execution_and_padding(
         self,
         num_tokens: int,
@@ -1020,7 +1066,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
         """
         pad = self._spyre_bucket_batch_descriptor(num_tokens, num_reqs, num_scheduled_tokens_np)
         if pad is not None:
+            self._encoder_buffer_rows = pad.num_tokens
             return CUDAGraphMode.NONE, pad, False, None, None
+        self._encoder_buffer_rows = num_tokens
 
         return super()._determine_batch_execution_and_padding(
             num_tokens=num_tokens,

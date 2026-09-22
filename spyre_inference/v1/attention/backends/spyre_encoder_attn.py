@@ -236,6 +236,71 @@ def _host_pad_head_dim(x: torch.Tensor, padded: int) -> torch.Tensor:
     return convert(on_host, device) if device.type == "spyre" else on_host
 
 
+def build_encoder_plans(
+    attn_metadata: SpyreAttentionMetadata,
+    buffer_rows: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    batched: bool,
+) -> list[EncoderSeqPlan]:
+    """Row tables and masks for the step, one plan per group of equal extent.
+
+    Module-level and query-free so the model runner can call it before the model runs.
+    Inside a traced region its D2H reads and H2D converts would become graph nodes --
+    that is how the RoBERTa position offset ends up as a to_dtype_cpu fallback.
+    """
+    query_start_loc = attn_metadata.query_start_loc.cpu().tolist()
+    seq_lens = attn_metadata.seq_lens.cpu().tolist()
+    # The body may 1D-pad past num_actual_tokens; those rows are not a request.
+    num_tokens = attn_metadata.num_actual_tokens
+    index_dtype = encoder_index_dtype(device)
+
+    # (start, query_len, kv_len) keyed by extent, in arrival order.
+    by_extent: dict[int, list[tuple[int, int, int]]] = {}
+    for seq_idx in range(attn_metadata.num_seqs):
+        start = int(query_start_loc[seq_idx])
+        query_len = int(query_start_loc[seq_idx + 1]) - start
+        if start >= num_tokens or query_len <= 0:
+            continue
+        query_len = min(query_len, num_tokens - start)
+        kv_len = min(int(seq_lens[seq_idx]), query_len)
+        extent = _alignment_units_for(query_len) * ENCODER_LEN_ALIGNMENT
+        by_extent.setdefault(extent, []).append((start, query_len, kv_len))
+
+    def plan(members: list[tuple[int, int, int]], extent: int) -> EncoderSeqPlan:
+        return EncoderSeqPlan(
+            starts=[m[0] for m in members],
+            query_lens=[m[1] for m in members],
+            extent=extent,
+            row_table=convert(
+                torch.cat([encoder_row_table(m[0], m[1], extent, index_dtype) for m in members]),
+                device,
+            ),
+            # Concatenated, not stacked: member order along dim 0 is what the
+            # kernel's batch dim indexes.
+            mask=convert(
+                torch.cat([encoder_mask(extent, m[2], dtype) for m in members], dim=0),
+                device,
+            ),
+        )
+
+    plans: list[EncoderSeqPlan] = []
+    for extent, members in sorted(by_extent.items()):
+        if not batched:
+            plans.extend(plan([m], extent) for m in members)
+            continue
+        # Descending power-of-two chunks rather than padding up to one: padding a
+        # group up to the next power of two would attend phantom sequences. The cap
+        # keeps each chunk's row count on the ladder warmup covers.
+        cap = 1 << (max(1, buffer_rows // extent).bit_length() - 1)
+        offset = 0
+        while offset < len(members):
+            chunk = min(1 << ((len(members) - offset).bit_length() - 1), cap)
+            plans.append(plan(members[offset : offset + chunk], extent))
+            offset += chunk
+    return plans
+
+
 class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
     """Bidirectional encoder self-attention (no KV cache).
 
@@ -394,66 +459,62 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
                     group *= 2
             extent *= 2
 
+    def forward_traced(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        output: torch.Tensor,
+        attn_metadata: SpyreAttentionMetadata,
+    ) -> torch.Tensor:
+        """Attention as plain ops, for tracing into the caller's block graph.
+
+        The custom-op path costs more than the attention it wraps: torch-spyre brackets
+        every opaque FallbackKernel with LX dump/restore clones, which profile larger than
+        the attention itself, and the opaque node also stops the block's qkv
+        from fusing with its o_proj/FFN. Tracing the same math into the enclosing graph
+        removes both, and keeps LX bracketing on for the decoder, whose nested compiled
+        kernel genuinely needs it (see mark_lx_safe's contract).
+
+        Requires ``encoder_seq_plans`` to be precomputed by the model runner: building
+        them here would trace a D2H read and an H2D convert into the graph.
+        """
+        plans = attn_metadata.encoder_seq_plans
+        assert plans is not None, "encoder_seq_plans must be built before the model runs"
+        # From the tensors, as forward() does: a sub-stick head dim is padded upstream.
+        num_heads, num_kv_heads = query.shape[1], key.shape[1]
+        head_size = query.shape[2]
+        for plan in plans:
+            # Uncompiled on purpose: a nested torch.compile would reintroduce the
+            # boundary this path exists to remove.
+            q_rows, k_rows, v_rows = _encoder_gather_kernel(query, key, value, plan.row_table)
+            attn = _encoder_sdpa_kernel(
+                q_rows,
+                k_rows,
+                v_rows,
+                plan.mask,
+                self.scale,
+                plan.group,
+                num_heads,
+                num_kv_heads,
+                head_size,
+            )
+            output.index_copy_(0, plan.row_table, attn)
+        return output
+
     def _build_plans(
         self,
         attn_metadata: SpyreAttentionMetadata,
         query: torch.Tensor,
     ) -> list[EncoderSeqPlan]:
-        """Row tables and masks for the step, one plan per group of equal extent."""
-        query_start_loc = attn_metadata.query_start_loc.cpu().tolist()
-        seq_lens = attn_metadata.seq_lens.cpu().tolist()
-        # The body may 1D-pad past num_actual_tokens; those rows are not a request.
-        num_tokens = attn_metadata.num_actual_tokens
-        buffer_rows = query.shape[0]
-        device = query.device
-        index_dtype = encoder_index_dtype(device)
-
-        # (start, query_len, kv_len) keyed by extent, in arrival order.
-        by_extent: dict[int, list[tuple[int, int, int]]] = {}
-        for seq_idx in range(attn_metadata.num_seqs):
-            start = int(query_start_loc[seq_idx])
-            query_len = int(query_start_loc[seq_idx + 1]) - start
-            if start >= num_tokens or query_len <= 0:
-                continue
-            query_len = min(query_len, num_tokens - start)
-            kv_len = min(int(seq_lens[seq_idx]), query_len)
-            extent = _alignment_units_for(query_len) * ENCODER_LEN_ALIGNMENT
-            by_extent.setdefault(extent, []).append((start, query_len, kv_len))
-
-        def plan(members: list[tuple[int, int, int]], extent: int) -> EncoderSeqPlan:
-            return EncoderSeqPlan(
-                starts=[m[0] for m in members],
-                query_lens=[m[1] for m in members],
-                extent=extent,
-                row_table=convert(
-                    torch.cat(
-                        [encoder_row_table(m[0], m[1], extent, index_dtype) for m in members]
-                    ),
-                    device,
-                ),
-                # Concatenated, not stacked: member order along dim 0 is what the
-                # kernel's batch dim indexes.
-                mask=convert(
-                    torch.cat([encoder_mask(extent, m[2], query.dtype) for m in members], dim=0),
-                    device,
-                ),
-            )
-
-        plans: list[EncoderSeqPlan] = []
-        for extent, members in sorted(by_extent.items()):
-            if not self._batched_attn:
-                plans.extend(plan([m], extent) for m in members)
-                continue
-            # Descending power-of-two chunks rather than padding up to one: padding a
-            # group up to the next power of two would attend phantom sequences. The cap
-            # keeps each chunk's row count on the ladder warmup covers.
-            cap = 1 << (max(1, buffer_rows // extent).bit_length() - 1)
-            offset = 0
-            while offset < len(members):
-                chunk = min(1 << ((len(members) - offset).bit_length() - 1), cap)
-                plans.append(plan(members[offset : offset + chunk], extent))
-                offset += chunk
-        return plans
+        """Kept for the custom-op path, which only has the query tensor to size from."""
+        return build_encoder_plans(
+            attn_metadata,
+            buffer_rows=query.shape[0],
+            device=query.device,
+            dtype=query.dtype,
+            batched=self._batched_attn,
+        )
 
     def forward(  # ty: ignore[invalid-method-override]
         self,

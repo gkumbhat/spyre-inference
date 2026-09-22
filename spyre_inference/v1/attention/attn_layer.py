@@ -27,9 +27,14 @@ from typing import cast
 
 import torch
 from vllm.logger import init_logger
-from vllm.model_executor.layers.attention.attention import Attention
+from vllm.model_executor.layers.attention.attention import (
+    Attention,
+    get_attention_context,
+)
 from vllm.utils.torch_utils import _encode_layer_name
 from vllm.v1.attention.backend import AttentionType
+
+_STICK_ELEMS = 64
 
 logger = init_logger(__name__)
 
@@ -133,6 +138,24 @@ def _spyre_attention_forward(
         q_in, out_buf = buffers
         q_in[:rows] = query
 
+    # Encoder-only: run attention as plain ops in this graph instead of behind the
+    # opaque custom op. torch-spyre brackets every opaque FallbackKernel with LX
+    # dump/restore clones, measured at roughly a tenth of a step, and the opaque node
+    # keeps qkv from fusing with o_proj/FFN. Gated on a stick-aligned head dim, since the
+    # sub-stick path needs forward()'s host padding, and on precomputed plans.
+    if (
+        self.attn_type in _ENCODER_ATTN_TYPES
+        and buffers is None
+        and self.head_size % _STICK_ELEMS == 0
+    ):
+        _attn_md = get_attention_context(_encode_layer_name(self.layer_name))[0]
+        if getattr(_attn_md, "encoder_seq_plans", None) is None:
+            # Warmup dummy runs carry no metadata, so they keep the custom-op path.
+            _attn_md = None
+        if _attn_md is not None:
+            self.impl.forward_traced(query, key, value, out_buf, _attn_md)
+            return output.view(-1, hidden_size)
+
     torch.ops.vllm.unified_attention_with_output(
         q_in,  # ty: ignore[invalid-argument-type]
         key,  # ty: ignore[invalid-argument-type]
@@ -144,6 +167,9 @@ def _spyre_attention_forward(
     if buffers is not None:
         output.copy_(out_buf[:rows])
     return output.view(-1, hidden_size)
+
+
+_ENCODER_ATTN_TYPES = (AttentionType.ENCODER, AttentionType.ENCODER_ONLY)
 
 
 def _can_split(layer: Attention) -> bool:
