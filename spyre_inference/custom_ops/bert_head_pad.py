@@ -12,8 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Pads BertSelfAttention/BertAttention to a stick-aligned head_dim at load time.
-"""
+"""Pads BertSelfAttention/BertAttention to a stick-aligned head_dim at load time."""
 
 from __future__ import annotations
 
