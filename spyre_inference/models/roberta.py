@@ -21,7 +21,7 @@ position offset, which runs on CPU (SDSC cannot schedule integer add).
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 from vllm.logger import init_logger
@@ -131,9 +131,38 @@ class SpyreRobertaEmbedding(SpyreTokenTypeEmbedding, RobertaEmbedding):
         embeddings = (
             inputs_embeds
             + self.spyre_token_type_embeddings(input_ids)
-            + self.position_embeddings(offset_roberta_position_ids(position_ids, self.padding_idx))
+            # Raw positions: fold_roberta_position_offset has sliced the table by
+            # padding_idx + 1 after load, so row i now holds what row i + padding_idx + 1
+            # held. That removes the per-step D2H -> int64 add -> H2D entirely.
+            + self.position_embeddings(position_ids)
         )
         return self.LayerNorm(embeddings)
+
+
+def fold_roberta_position_offset(model: torch.nn.Module) -> None:
+    """Slice every RoBERTa position table by ``padding_idx + 1``, once, after load.
+
+    RoBERTa reserves rows ``0..padding_idx`` of ``position_embeddings`` and starts real
+    positions at ``padding_idx + 1``. Applying that offset per step costs a D2H, an add
+    the device cannot schedule in int32, and an H2D back. Dropping the reserved rows
+    instead makes ``forward`` a plain gather on the positions vLLM already supplies.
+
+    Idempotent: a folded table no longer carries the reserved rows, so the marker stops
+    it being sliced twice.
+    """
+    for module in model.modules():
+        if not isinstance(module, SpyreRobertaEmbedding):
+            continue
+        if getattr(module, "_spyre_position_offset_folded", False):
+            continue
+        emb = module.position_embeddings
+        drop = int(module.padding_idx) + 1
+        # cast: nn.Module.__getattr__ hides the parameter's type from the checker.
+        with torch.no_grad():
+            kept = cast(torch.Tensor, emb.weight)[drop:].clone()
+        emb.weight = torch.nn.Parameter(kept, requires_grad=False)
+        emb.num_embeddings = kept.shape[0]
+        module._spyre_position_offset_folded = True
 
 
 class SpyreRobertaEmbeddingMixin:

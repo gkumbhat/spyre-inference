@@ -83,6 +83,7 @@ from spyre_inference.custom_ops.mlp_pad import (
 )
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.models.mistral import reset_llama4_scale_cache
+from spyre_inference.models.roberta import fold_roberta_position_offset
 from spyre_inference.multimodal import apply_multimodal_patches
 from spyre_inference.v1.attention import attn_layer
 from spyre_inference.v1.attention.backends.spyre_attn import (
@@ -655,6 +656,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         verify_padded_intermediate_size(self.model, self.model_config.hf_text_config)
         fix_padded_rope(self.model, self.model_config.hf_config)
         fix_padded_attention_scale(self.model, self.model_config.hf_config)
+        fold_roberta_position_offset(self.model)
 
         # Keep Attention module buffers (_k_scale, _v_scale, etc.) on CPU.
         # Note: This _apply cannot reside in SpyreAttentionImpl, as it is not
