@@ -70,6 +70,7 @@ from vllm.v1.worker.cpu_model_runner import _torch_cuda_wrapper
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from spyre_inference import envs
+from spyre_inference.custom_ops.bert_head_pad import install_bert_head_pad
 from spyre_inference.custom_ops.head_pad import (
     fix_padded_attention_scale,
     fix_padded_rope,
@@ -627,6 +628,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # as they stream in, when the platform overrode head_dim (e.g. head_size=64).
         # Must run before load_model builds+loads the (now 128-wide) params.
         install_padded_head_dim(self.model_config)
+        install_bert_head_pad(self.model_config)
         install_head_pad_weight_loader(model_loader, self.model_config.hf_config)
         install_mlp_pad_weight_loader(model_loader, self.model_config.hf_text_config)
 
