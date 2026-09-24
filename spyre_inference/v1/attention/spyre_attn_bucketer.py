@@ -178,12 +178,8 @@ class SpyreAttnBucketer:
         # exceed max_model_len even when max_num_batched_tokens is larger (unlike
         # a decoder's chunked-prefill step). Without this cap, warmup could record
         # a query bucket with no matching num_blocks bucket, crashing with
-        # "num_blocks=N exceeds the largest recorded bucket". The cap uses the
-        # same stick-aligned rounding as the encoder shape ladder
-        # (spyre_shape_bucketer._align_up_pow2): a decoder-typed pooling model
-        # (e.g. CLIP's text tower) has its query padded up to that ladder's top
-        # rectangle width, which exceeds the raw max_model_len whenever that
-        # isn't itself a power-of-two multiple of the stick alignment.
+        # "num_blocks=N exceeds the largest recorded bucket". Stick-aligned via
+        # _align_up_pow2 to match the encoder shape ladder's padding (CLIP: 77 -> 128).
         if vllm_config.model_config.runner_type == "pooling":
             max_batched = min(max_batched, _align_up_pow2(max_model_len))
 

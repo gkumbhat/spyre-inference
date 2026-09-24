@@ -123,12 +123,8 @@ class TestPoolingQueryBucketCap:
     with "num_blocks=N exceeds the largest recorded bucket" (CLIP's text tower:
     max_model_len=77, max_num_batched_tokens much larger).
 
-    The cap itself must be stick-aligned the same way the encoder shape ladder
-    pads a request (spyre_shape_bucketer._align_up_pow2): a decoder-typed
-    pooling model's query is padded up to that ladder's top rectangle width,
-    which exceeds the raw max_model_len whenever max_model_len isn't itself a
-    power-of-two multiple of the stick alignment. CLIP's text tower
-    (max_model_len=77) pads to 128, not 77."""
+    Stick-aligned the same way the encoder shape ladder pads a request
+    (_align_up_pow2): CLIP's max_model_len=77 pads to 128, not 77."""
 
     def test_pooling_caps_query_buckets_at_stick_aligned_max_model_len(self):
         b = SpyreAttnBucketer(
@@ -141,10 +137,7 @@ class TestPoolingQueryBucketCap:
         assert b.find_blocks_bucket(largest_query_blocks) is not None
 
     def test_pooling_query_bucket_covers_clip_text_tower_padded_length(self):
-        """Regression test: CLIP's text tower (max_model_len=77) is padded to a
-        128-wide encoder rectangle, so a dispatched query_len=128 must round
-        onto a real bucket instead of raising "no query bucket for
-        query_len=128" during warmup, as it did before this cap was aligned."""
+        """CLIP's max_model_len=77 pads to query_len=128; that must round onto a bucket."""
         b = SpyreAttnBucketer(
             make_config(max_model_len=77, max_num_batched_tokens=512, runner_type="pooling")
         )
