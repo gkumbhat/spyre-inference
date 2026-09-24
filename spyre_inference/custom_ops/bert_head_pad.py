@@ -12,22 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Load-time head_dim padding for vLLM's BertSelfAttention / BertAttention.
-
-BERT/RoBERTa has no RoPE, so a sub-stick head_size (e.g. 32) doesn't hit the
-RoPE-restickify failure ``head_pad.py`` pads for -- it hits the encoder attention
-backend's per-step host round trip instead (``spyre_encoder_attn.py``'s
-``_host_pad_head_dim``). Padding Q/K/V/O once at load removes that cost.
-
-``head_pad.py``'s property-shim doesn't work here: ``BertSelfAttention.__init__``
-asserts ``head_dim * num_heads == hidden_size`` right after computing it, which a
-substituted value fails, and its ``Attention`` layer registers itself globally by
-``prefix`` at construction, so building an unpadded throwaway first and replacing it
-raises ``ValueError: Duplicate layer name``. So ``BertSelfAttention.__init__`` is
-reimplemented here to build ``qkv_proj``/``self.attn`` at the padded width directly,
-keeping the attention scale at the true head_dim. ``BertAttention``'s extra
-sub-module, ``BertSelfOutput.dense``, isn't sized from ``head_dim`` at all and has no
-such registry, so it's just called through then rebuilt.
+"""Pads BertSelfAttention/BertAttention to a stick-aligned head_dim at load time.
 """
 
 from __future__ import annotations
