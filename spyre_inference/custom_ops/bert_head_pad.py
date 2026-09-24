@@ -23,6 +23,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import EncoderOnlyAttention
 from vllm.model_executor.layers.linear import QKVParallelLinear, RowParallelLinear
 from vllm.model_executor.models.bert import BertAttention, BertSelfAttention
+from vllm.utils.math_utils import cdiv
 
 from spyre_inference.custom_ops.head_pad import head_padding_active
 
@@ -33,10 +34,6 @@ logger = init_logger(__name__)
 _STICK = 64
 
 _PATCHED_ATTR = "_spyre_bert_head_pad_patched"
-
-
-def _round_up_to_stick(n: int) -> int:
-    return ((n + _STICK - 1) // _STICK) * _STICK
 
 
 def install_bert_head_pad(model_config) -> None:
@@ -71,7 +68,7 @@ def install_bert_head_pad(model_config) -> None:
         self.total_num_kv_heads = self.total_num_heads
         orig_head_dim = self.hidden_size // self.total_num_heads
         assert orig_head_dim * self.total_num_heads == self.hidden_size
-        self.head_dim = _round_up_to_stick(orig_head_dim)
+        self.head_dim = cdiv(orig_head_dim, _STICK) * _STICK
 
         self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
 
