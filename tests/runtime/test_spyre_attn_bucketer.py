@@ -121,17 +121,34 @@ class TestPoolingQueryBucketCap:
     """Pooling's query_len can't exceed max_model_len; without this cap, warmup
     could record a query bucket with no matching num_blocks bucket, crashing
     with "num_blocks=N exceeds the largest recorded bucket" (CLIP's text tower:
-    max_model_len=77, max_num_batched_tokens much larger)."""
+    max_model_len=77, max_num_batched_tokens much larger).
 
-    def test_pooling_caps_query_buckets_at_max_model_len(self):
+    The cap itself must be stick-aligned the same way the encoder shape ladder
+    pads a request (spyre_shape_bucketer._align_up_pow2): a decoder-typed
+    pooling model's query is padded up to that ladder's top rectangle width,
+    which exceeds the raw max_model_len whenever max_model_len isn't itself a
+    power-of-two multiple of the stick alignment. CLIP's text tower
+    (max_model_len=77) pads to 128, not 77."""
+
+    def test_pooling_caps_query_buckets_at_stick_aligned_max_model_len(self):
         b = SpyreAttnBucketer(
             make_config(max_model_len=77, max_num_batched_tokens=2048, runner_type="pooling")
         )
-        assert b.query_buckets[-1] == 77
+        assert b.query_buckets[-1] == 128
         # The largest recorded query bucket must round onto a real num_blocks
         # bucket -- this is what crashed for CLIP.
         largest_query_blocks = -(-b.query_buckets[-1] // b.block_size)
         assert b.find_blocks_bucket(largest_query_blocks) is not None
+
+    def test_pooling_query_bucket_covers_clip_text_tower_padded_length(self):
+        """Regression test: CLIP's text tower (max_model_len=77) is padded to a
+        128-wide encoder rectangle, so a dispatched query_len=128 must round
+        onto a real bucket instead of raising "no query bucket for
+        query_len=128" during warmup, as it did before this cap was aligned."""
+        b = SpyreAttnBucketer(
+            make_config(max_model_len=77, max_num_batched_tokens=512, runner_type="pooling")
+        )
+        assert b.find_query_bucket(128) == 128
 
     def test_generate_is_unaffected(self):
         b = SpyreAttnBucketer(
