@@ -80,10 +80,8 @@ def _spyre_merge_multimodal_embeddings(
     scattered = convert(scattered_cpu, device=inputs_embeds.device)
     mask = convert(is_multimodal_cpu, device=inputs_embeds.device).unsqueeze(-1)
     merged = torch.where(mask, scattered, inputs_embeds)
-    # torch.where's output gets the shape-canonical, non-row-major layout regardless
-    # of its operands', which vLLM's persistent inputs_embeds.gpu can't restickify
-    # from (torch-spyre has no cross-layout D2D copy_; see eager.py's
-    # _normalize_result_layout for the same limitation). Round-trip to fix the layout.
+    # Upstream's copy into inputs_embeds.gpu is a single row on a one-token step, which
+    # torch-spyre cannot restickify from the merge's own layout (torch-spyre#4883).
     return convert(convert(merged, device="cpu"), device=inputs_embeds.device, row_major=True)
 
 
