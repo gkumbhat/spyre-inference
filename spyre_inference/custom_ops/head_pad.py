@@ -14,14 +14,14 @@
 
 """Native-path attention head padding to a stick-aligned head_dim.
 
-A head_dim whose half is not a multiple of the 64-element fp16 stick (e.g.
-head_size=64) cannot restickify after RoPE, so the KV write-back fails to lower
-on Spyre. ``TorchSpyrePlatform._maybe_pad_head_dim`` overrides ``head_dim`` to a
-128-multiple before the model is built (sizing QKV/o_proj/Attention/KV-cache/RoPE
-at the padded width); the passes here fill the padded region on load (including the
-QK-norm weights of models that normalize over head_dim) and restore the two things
-the width override would otherwise corrupt — the RoPE frequencies and the attention
-scale.
+A head_dim that is not a multiple of the 64-element fp16 stick cannot lower on Spyre,
+and on the Transformers backend neither can one whose half isn't (its RoPE views a head
+as two halves). ``TorchSpyrePlatform._maybe_pad_head_dim`` overrides ``head_dim`` to the
+next 64-multiple (128-multiple for RoPE on the Transformers backend) before the model is
+built (sizing QKV/o_proj/Attention/KV-cache/RoPE at the padded width); the passes here
+fill the padded region on load (including the QK-norm weights of models that normalize
+over head_dim) and restore the two things the width override would otherwise corrupt —
+the RoPE frequencies and the attention scale.
 
 Padding is interleaved (RoPE-compatible) for Q/K and end-of-head for V/O, and the
 rotation cache keeps the original frequencies. The Transformers backend shares the

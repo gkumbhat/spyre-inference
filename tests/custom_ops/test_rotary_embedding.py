@@ -49,10 +49,9 @@ GEMMA4_ROPE_PARAMS = {
 # stick-aligned for both (512->256, 256->128).
 GEMMA4_HEAD_SIZES = [512, 256]
 
-# head_size values with a stick-aligned 2x2 inner dim (128->64, 256->128). On the native
-# path the platform pads head_dim to a 128-multiple before RoPE is built, so SpyreRoPE
-# only ever sees stick-aligned inners.
-HEAD_SIZES = [128, 256]
+# 128 and 256 have a stick-aligned 2x2 inner dim (64, 128); 64 has a sub-stick half (32)
+# and takes the split-free path.
+HEAD_SIZES = [64, 128, 256]
 
 
 def _make_qk(num_tokens, num_q_heads, num_kv_heads, head_size, flatten):

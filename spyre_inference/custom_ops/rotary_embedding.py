@@ -25,6 +25,10 @@ forward (host chunk/stack/view then device transfer) segfaults libsenlib during 
 
 The cache is flattened to 2D and placed rows-outermost (see ``place_row_gathered``).
 
+A head whose half is not stick-aligned (head_size=64) uses ``_rotate_neox_split_free``
+instead: the 2x2 form views each head as two halves, which cannot restickify when a
+half is narrower than a stick.
+
 Only neox-style full rotary is supported; other configs raise ``NotImplementedError``.
 """
 
@@ -68,6 +72,33 @@ def _rotate_neox_2x2(
     return out.flatten(-2).view(x.shape)
 
 
+def _rotate_half_matrix(head_size: int, dtype: torch.dtype) -> torch.Tensor:
+    """``x @ R == cat(-x[half:], x[:half])``, neox ``rotate_half`` as a signed permutation."""
+    half = head_size // 2
+    idx = torch.arange(half)
+    r = torch.zeros(head_size, head_size, dtype=dtype)
+    r[idx + half, idx] = -1.0
+    r[idx, idx + half] = 1.0
+    return r
+
+
+def _rotate_neox_split_free(
+    x: torch.Tensor,
+    cos_sin: torch.Tensor,
+    rotate_half: torch.Tensor,
+    head_size: int,
+) -> torch.Tensor:
+    """Full neox RoPE as ``x * cos + rotate_half(x) * sin``, viewing only whole heads.
+
+    ``x`` is [T, H*head_size] or [T, H, head_size]; ``cos_sin`` is [T, 2, head_size].
+    """
+    num_tokens = x.shape[0]
+    heads = x.view(num_tokens, -1, head_size)
+    cos, sin = cos_sin[:, 0].unsqueeze(1), cos_sin[:, 1].unsqueeze(1)
+    rotated = (heads.reshape(-1, head_size) @ rotate_half).view(heads.shape)
+    return (heads * cos + rotated * sin).view(x.shape)
+
+
 class _SpyreRotaryMixin:
     """Spyre RoPE wiring shared by the base and llama3 OOT classes.
 
@@ -87,8 +118,14 @@ class _SpyreRotaryMixin:
                 f"rotary_dim={self.rotary_dim}, head_size={self.head_size}."
             )
         self._padded_inner = self.rotary_dim // 2
+        self._split_free = self._padded_inner % 64 != 0
         self._rotation_cache: torch.Tensor | None = None
         self._device_rotation_cache: torch.Tensor | None = None
+        self._rotate_half = (
+            _rotate_half_matrix(self.head_size, self.cos_sin_cache.dtype)
+            if self._split_free
+            else None
+        )
 
     def _apply(self, fn, recurse=True):
         # Skip super()._apply: cos_sin_cache is intentionally CPU-pinned and this module
@@ -97,6 +134,8 @@ class _SpyreRotaryMixin:
         self._device_rotation_cache = place_row_gathered(
             self._get_device_rotation_cache(), fn, "RoPE rotation cache"
         )
+        if self._rotate_half is not None:
+            self._rotate_half = fn(self._rotate_half)
         return self
 
     def _get_rotation_cache(self) -> torch.Tensor:
@@ -122,9 +161,15 @@ class _SpyreRotaryMixin:
     def _get_device_rotation_cache(self) -> torch.Tensor:
         """Device-resident rotation cache, flattened to 2D ``[max_pos, 4 * padded]`` so
         it can be stickified with the position axis outermost, and gathered on-device via
-        ``index_select`` (single-row gather has a kernel since torch-spyre#3418)."""
+        ``index_select`` (single-row gather has a kernel since torch-spyre#3418). The
+        split-free path stores ``[cos | cos | sin | sin]`` instead."""
         if self._device_rotation_cache is None:
-            self._device_rotation_cache = self._get_rotation_cache().flatten(1)
+            rot = self._get_rotation_cache()
+            if self._split_free:
+                cos, sin = rot[:, 0, 0], rot[:, 1, 0]
+                self._device_rotation_cache = torch.cat([cos, cos, sin, sin], dim=-1)
+            else:
+                self._device_rotation_cache = rot.flatten(1)
         return self._device_rotation_cache
 
     def forward_oot(
@@ -135,6 +180,16 @@ class _SpyreRotaryMixin:
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         # Cache was primed in _apply before compile, so only the index_select is traced.
         cache = self._get_device_rotation_cache()
+        rotate_half = self._rotate_half
+        if rotate_half is not None:
+            cos_sin = cache.index_select(0, positions.flatten()).view(-1, 2, self.head_size)
+            out_query = _rotate_neox_split_free(query, cos_sin, rotate_half, self.head_size)
+            out_key = (
+                _rotate_neox_split_free(key, cos_sin, rotate_half, self.head_size)
+                if key is not None
+                else None
+            )
+            return out_query, out_key
         rot = cache.index_select(0, positions.flatten()).view(-1, 2, 2, self._padded_inner)
         out_query = _rotate_neox_2x2(query, rot, self.head_size)
         out_key = _rotate_neox_2x2(key, rot, self.head_size) if key is not None else None
