@@ -114,7 +114,6 @@ from spyre_inference.v1.pool.spyre_pooler import (
     _iter_modules,
     _mean_pool_fp32_reduce,
     _mean_pool_mask_mul,
-    pad_row_count_to_bucket,
 )
 from spyre_inference.v1.sample.topk_topp_sampler import SpyreTopKTopPSampler
 from spyre_inference.v1.worker import compile_guard
@@ -1341,7 +1340,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
         to a power of two (``pad_row_count_to_bucket``), so this sweep is short.
 
         ``SpyreMeanPool``'s reduce kernels specialize on the same row width and
-        had the same gap, uncovered until now.
+        had the same gap. ``SpyreSequencePooler`` defers CLS/LAST/MEAN's trim to
+        after the classifier/embed head runs, so the head sees this same bucket
+        width rather than the real row count -- warming it here, at ``log2(max_num_seqs)``
+        widths, covers it instead of needing one compile per real row count.
         """
         if not self._pooling_on_spyre:
             return
@@ -1364,19 +1366,12 @@ class TorchSpyreModelRunner(GPUModelRunner):
         width = 1
         while width <= limit:
             if width <= rows:
-                select_rows(hidden_states, torch.zeros(width, dtype=torch.int64))
+                # SpyreSequencePooler defers CLS/LAST/MEAN's trim to after the
+                # head, so the head sees this same bucket width too -- warm it
+                # here instead of at every real row count.
+                pooled = select_rows(hidden_states, torch.zeros(width, dtype=torch.int64))
                 if mean_pooling:
                     self._warm_mean_pool_kernels(hidden_states, width)
-            width *= 2
-        # SpyreCLSPool/SpyreLastPool slice their padded gather back to the real row
-        # count, which changes the device layout the classifier/embed heads guard
-        # on -- so warming needs that same gather-then-slice, not a freshly
-        # allocated tensor.
-        if classifier_heads or embed_heads:
-            for real_width in range(1, min(self.scheduler_config.max_num_seqs, rows) + 1):
-                idx, n_rows = pad_row_count_to_bucket(torch.zeros(real_width, dtype=torch.int64))
-                pooled = select_rows(hidden_states, idx)
-                pooled = pooled[:n_rows] if pooled.shape[0] != n_rows else pooled
                 for head in classifier_heads:
                     logits = head.classifier(pooled)
                     if head.activation is not None:
@@ -1385,6 +1380,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
                     embeddings = head.projector(pooled) if head.projector is not None else pooled
                     if head.activation is not None:
                         head.activation(embeddings)
+            width *= 2
         for token_pooler in token_poolers:
             self._warm_token_pool_widths(token_pooler, hidden_states)
 

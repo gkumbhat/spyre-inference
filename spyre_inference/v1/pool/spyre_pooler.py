@@ -169,22 +169,36 @@ class SpyreCLSPool(CLSPool):
     ``i * extent``) and skips the unpad gather.
     """
 
+    def __init__(self, defer_trim: bool = False) -> None:
+        super().__init__()
+        # Only a SpyreSequencePooler that will trim afterwards may set this;
+        # see SpyreAllPool's identical note.
+        self.defer_trim = defer_trim
+
     def forward(self, hidden_states, pooling_metadata):
         cursor = pooling_metadata.get_pooling_cursor()
         if cursor.is_partial_prefill():
             raise RuntimeError("partial prefill is not supported with CLS pooling")
         idx, n_rows = pad_row_count_to_bucket(cursor.first_token_indices_gpu)
         pooled = select_rows(hidden_states, idx)
+        if self.defer_trim:
+            return pooled
         return pooled[:n_rows] if pooled.shape[0] != n_rows else pooled
 
 
 class SpyreLastPool(LastPool):
     """LAST via ``index_select``."""
 
+    def __init__(self, defer_trim: bool = False) -> None:
+        super().__init__()
+        self.defer_trim = defer_trim
+
     def forward(self, hidden_states, pooling_metadata):
         cursor = pooling_metadata.get_pooling_cursor()
         idx, n_rows = pad_row_count_to_bucket(cursor_row_indices_cpu(cursor, last=True))
         pooled = select_rows(hidden_states, idx)
+        if self.defer_trim:
+            return pooled
         return pooled[:n_rows] if pooled.shape[0] != n_rows else pooled
 
 
@@ -231,6 +245,10 @@ class SpyreMeanPool(MeanPool):
     crosses back -- no full D2H of ``hidden_states``.
     """
 
+    def __init__(self, defer_trim: bool = False) -> None:
+        super().__init__()
+        self.defer_trim = defer_trim
+
     def forward(self, hidden_states, pooling_metadata):
         cursor = pooling_metadata.get_pooling_cursor()
         prompt_lens = cursor.prompt_lens_cpu.to(torch.int64)
@@ -255,13 +273,39 @@ class SpyreMeanPool(MeanPool):
             cols.unsqueeze(0) < (bucket_starts + bucket_lens).unsqueeze(1)
         )
         mask = convert(indicator.to(torch.float16), hidden_states.device)
+        # clamp(min=1) makes a zero-length segment pool to 0 rather than upstream's
+        # NaN (0/0); fine since pooling requests always have at least one token.
         lens = convert(
             bucket_lens.clamp(min=1).to(torch.float32).unsqueeze(1), hidden_states.device
         )
 
         prod = _mean_pool_mask_mul(mask, hidden_states).clone()
         pooled = _mean_pool_fp32_reduce(prod, lens)
+        if self.defer_trim:
+            return pooled
         return pooled[:n_rows] if pooled.shape[0] != n_rows else pooled
+
+
+class SpyreSequencePooler(SequencePooler):
+    """Keeps CLS/LAST/MEAN's bucketed row count through the head; trims after.
+
+    SpyreCLSPool/SpyreLastPool/SpyreMeanPool pad their row count to a power of
+    two so index_select/the reduce kernels specialize on a handful of widths
+    instead of one per real row count (see ``pad_row_count_to_bucket``).
+    Slicing right after pooling throws that away: the head (classifier matmul,
+    embed activation) then sees the real row count again and re-specializes on
+    it too. Deferring the slice to after the head keeps it on the same handful
+    of bucket widths, the same trade ``SpyreTokenPooler`` makes for token-level
+    pooling.
+    """
+
+    def forward(self, hidden_states, pooling_metadata):
+        pooled_data = self.pooling(hidden_states, pooling_metadata)
+        pooled_data = self.head(pooled_data, pooling_metadata)
+        n_rows = len(pooling_metadata.pooling_params)
+        if len(pooled_data) != n_rows:
+            pooled_data = pooled_data[:n_rows]
+        return pooled_data
 
 
 class SpyreDispatchPooler(DispatchPooler):
@@ -511,7 +555,7 @@ class SpyreClassifierLinear(nn.Linear):
         return spyre_linear_t(input, weight, self.bias, pad_rows=True)
 
 
-@torch.compile(dynamic=False)
+@torch.compile(backend="inductor", dynamic=False)
 def _roberta_classifier_head_kernel(
     x: torch.Tensor,
     dense_wt: torch.Tensor,
@@ -707,6 +751,13 @@ def patch_pooler_for_spyre(
             num_patched += 1
         elif isinstance(pooling, SequencePoolingMethod):
             unsupported.append(type(pooling).__name__)
+        # Bucketing the pool is only safe when something trims afterwards, so
+        # the two are switched on together and never independently (mirrors
+        # SpyreAllPool/SpyreTokenPooler below).
+        pooling_types = SpyreCLSPool | SpyreLastPool | SpyreMeanPool
+        if isinstance(pooler.pooling, pooling_types) and type(pooler) is SequencePooler:
+            pooler.__class__ = SpyreSequencePooler
+            pooler.pooling.defer_trim = True
     elif isinstance(pooler, TokenPooler):
         pooling = pooler.pooling
         if isinstance(pooling, SpyreAllPool):
