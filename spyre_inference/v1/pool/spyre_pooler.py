@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Sequence
 from typing import cast
 
@@ -301,11 +302,16 @@ class SpyreSequencePooler(SequencePooler):
 
     def forward(self, hidden_states, pooling_metadata):
         pooled_data = self.pooling(hidden_states, pooling_metadata)
-        pooled_data = self.head(pooled_data, pooling_metadata)
-        n_rows = len(pooling_metadata.pooling_params)
+        params = pooling_metadata.pooling_params
+        n_rows = len(params)
+        head_metadata = pooling_metadata
         if len(pooled_data) != n_rows:
-            pooled_data = pooled_data[:n_rows]
-        return pooled_data
+            # Upstream heads require one pooling param per row. Pad rows repeat the
+            # last request's row, so they take its param too.
+            head_metadata = copy.copy(pooling_metadata)
+            head_metadata.pooling_params = params + params[-1:] * (len(pooled_data) - n_rows)
+        pooled_data = self.head(pooled_data, head_metadata)
+        return pooled_data[:n_rows] if len(pooled_data) != n_rows else pooled_data
 
 
 class SpyreDispatchPooler(DispatchPooler):
