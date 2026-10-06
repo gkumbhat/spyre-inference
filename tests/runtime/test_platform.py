@@ -488,13 +488,13 @@ def test_pad_head_dim_pads_hf_text_config_under_any_sub_config_name():
     ``get_text_config()`` may resolve from e.g. ``llm_config``, not only ``text_config``."""
     from spyre_inference.platform import TorchSpyrePlatform
 
-    vllm_config, text, mc = _fake_pad_config(rope_parameters={"rope_type": "default"})
+    vllm_config, text, mc = _fake_pad_config(head_dim=96, rope_parameters={"rope_type": "default"})
     mc.hf_config = SimpleNamespace(llm_config=text)
 
     TorchSpyrePlatform._maybe_pad_head_dim(vllm_config)
 
     assert text.head_dim == 128
-    assert text._spyre_orig_head_dim == 64
+    assert text._spyre_orig_head_dim == 96
 
 
 def _defaults_config(enforce_eager: bool, mode) -> VllmConfig:
