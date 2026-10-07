@@ -1339,12 +1339,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
         once the attention kernels were covered. The poolers round their row count
         to a power of two (``pad_row_count_to_bucket``), so this sweep is short.
 
-        ``SpyreMeanPool``'s rectangle reduce specializes on ``(extent, rows)``, so it is
-        warmed once per declared rectangle at each of these widths. ``SpyreSequencePooler``
-        defers CLS/LAST/MEAN's trim to after the classifier/embed head runs, so the head
-        sees this same bucket width rather than the real row count -- warming it here,
-        at ``log2(max_num_seqs)`` widths, covers it instead of needing one compile per
-        real row count.
+        ``SpyreSequencePooler`` trims only after the classifier/embed head, so the head
+        sees these same bucket widths and is warmed at each. ``SpyreMeanPool``'s
+        rectangle reduce specializes on ``(extent, rows)`` and is warmed per declared
+        rectangle.
         """
         if not self._pooling_on_spyre:
             return
@@ -1376,9 +1374,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 for width in widths
             }
         for width in sorted(set(widths) | {lanes for _, lanes in grid_shapes}):
-            # SpyreSequencePooler defers CLS/LAST/MEAN's trim to after the head, so
-            # the head sees this same bucket width too -- warm it here instead of at
-            # every real row count.
             pooled = select_rows(hidden_states, torch.zeros(width, dtype=torch.int64))
             for head in classifier_heads:
                 logits = head.classifier(pooled)

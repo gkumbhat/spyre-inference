@@ -226,26 +226,21 @@ def _mean_pool_grid_reduce(prod: torch.Tensor, lens: torch.Tensor, extent: int) 
     return (grid.to(torch.float32).sum(dim=1) / lens).to(prod.dtype)
 
 
-# Flags a mid-request recompile below, which otherwise just adds latency silently.
 compile_guard.watch(_mean_pool_row_mask_mul, "mean-pool rectangle row mask")
 compile_guard.watch(_mean_pool_grid_reduce, "mean-pool rectangle fp32 sum")
 
 
 class SpyreMeanPool(MeanPool):
-    """MEAN on device for a rectangle; one packed D2H and the upstream reduce otherwise.
+    """MEAN per rectangle lane on device; one packed D2H and the upstream reduce otherwise.
 
     On the rectangular path the runner leaves ``hidden_states`` as the grid (lane ``i``
-    = sequence ``i``) and sets ``cursor.spyre_grid_extent``, so a per-lane reduce needs
-    no more than the body buffer's own size, whatever the request count. It keeps the
-    accumulation in fp32 with torch-spyre#2619's fp16->fp32->sum->fp16 round trip
-    inside one graph: a raw device fp32 sum is unsafe to move or cast
-    (torch-spyre#2971), and an fp16-accumulator matmul loses precision over a deep
-    reduction.
+    = sequence ``i``) and sets ``cursor.spyre_grid_extent``, so each lane reduces in
+    place. The sum is torch-spyre#2619's fp16->fp32->sum->fp16 round trip inside one
+    graph: a raw device fp32 sum is unsafe to move or cast (torch-spyre#2971), and an
+    fp16-accumulator matmul loses precision over a deep reduction.
 
-    Anywhere else (ragged steps, mixed-task batches) there is no grid, and an on-device
-    reduce over the packed buffer needs a ``[rows, T, H]`` product that grows with the
-    request count. Copying ``[T, H]`` to the host for ``MeanPool`` costs less memory
-    and, measured, less time.
+    Off the rectangular path (ragged steps, mixed-task batches) there is no grid, so
+    the buffer goes to the host for ``MeanPool``.
     """
 
     def __init__(self, defer_trim: bool = False) -> None:
@@ -261,8 +256,8 @@ class SpyreMeanPool(MeanPool):
 
         if hidden_states.device.type != "spyre" or extent is None:
             # Upstream MeanPool assumes hidden_states.shape[0] == sum(prompt_lens). Crop
-            # the trailing encoder pad after the D2H: on device that would be a
-            # real-length gather, one torch.compile specialization per prompt length.
+            # the trailing encoder pad after the D2H; on device it would be a
+            # real-length gather, specialized per prompt length.
             hidden_states = convert(hidden_states, "cpu")
             total = int(prompt_lens.sum().item()) if num_seqs else 0
             if hidden_states.shape[0] > total:
@@ -293,16 +288,11 @@ class SpyreMeanPool(MeanPool):
 
 
 class SpyreSequencePooler(SequencePooler):
-    """Keeps CLS/LAST/MEAN's bucketed row count through the head; trims after.
+    """Runs the head on CLS/LAST/MEAN's bucket-padded rows; trims to the real count after.
 
-    SpyreCLSPool/SpyreLastPool/SpyreMeanPool pad their row count to a power of
-    two so index_select/the reduce kernels specialize on a handful of widths
-    instead of one per real row count (see ``pad_row_count_to_bucket``).
-    Slicing right after pooling throws that away: the head (classifier matmul,
-    embed activation) then sees the real row count again and re-specializes on
-    it too. Deferring the slice to after the head keeps it on the same handful
-    of bucket widths, the same trade ``SpyreTokenPooler`` makes for token-level
-    pooling.
+    The poolers pad their row count to a power of two (``pad_row_count_to_bucket``).
+    Trimming before the head would hand it the real count instead, so it would
+    specialize per request count. Same trade as ``SpyreTokenPooler``.
     """
 
     def forward(self, hidden_states, pooling_metadata):
