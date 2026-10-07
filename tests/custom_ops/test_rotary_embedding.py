@@ -115,6 +115,35 @@ def test_rotation_math_matches_reference_cpu(default_vllm_config, head_size):
 
 
 @pytest.mark.rotary
+@pytest.mark.parametrize("flatten", [True, False])
+def test_split_free_rotation_matches_reference_cpu(default_vllm_config, flatten):
+    """CPU-only: head_size=64 takes the split-free path; its cache layout, rotate_half
+    matrix and _rotate_neox_split_free match forward_native without a Spyre device."""
+    from vllm.model_executor.layers.rotary_embedding import get_rope
+    from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
+
+    from spyre_inference.custom_ops.rotary_embedding import _rotate_neox_split_free
+
+    head_size = 64
+    torch.manual_seed(11)
+    max_position, num_tokens = 2048, 32
+    rope = get_rope(head_size, max_position, is_neox_style=True, dtype=torch.float16)
+    assert rope._rotate_half is not None
+
+    positions = torch.randint(0, max_position, (num_tokens,), dtype=torch.long)
+    query, key = _make_qk(num_tokens, 8, 2, head_size, flatten)
+
+    cos_sin = rope._get_device_rotation_cache().index_select(0, positions)
+    cos_sin = cos_sin.view(-1, 2, head_size).to(torch.float16)
+    actual_query = _rotate_neox_split_free(query, cos_sin, rope._rotate_half, head_size)
+    actual_key = _rotate_neox_split_free(key, cos_sin, rope._rotate_half, head_size)
+
+    expected_query, expected_key = RotaryEmbedding.forward_native(rope, positions, query, key)
+    torch.testing.assert_close(actual_query.float(), expected_query.float(), atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(actual_key.float(), expected_key.float(), atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.rotary
 @pytest.mark.parametrize("head_size", HEAD_SIZES)
 @pytest.mark.parametrize("num_q_heads,num_kv_heads", [(4, 4), (8, 2)])
 @pytest.mark.parametrize("flatten", [True, False])

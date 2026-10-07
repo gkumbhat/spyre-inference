@@ -69,13 +69,15 @@ _PADDED_REFERENCE_TOKEN_IDS = [32, 111, 99, 104, 32]
 
 
 @pytest.mark.uses_subprocess
-def test_padded_head_dim_and_intermediate_size_generate() -> None:
+@pytest.mark.parametrize("enforce_eager", [True, False], ids=["eager", "compiled"])
+def test_padded_head_dim_and_intermediate_size_generate(enforce_eager: bool) -> None:
     """Loading the model fires both pads; greedy decode matches the unpadded
-    reference token ids."""
+    reference token ids. head_dim 64 takes the split-free RoPE path, so the compiled
+    case traces it into a block graph."""
     llm = LLM(
         model="qwrt/Swedish0.1M",
         dtype="float16",
-        enforce_eager=True,
+        enforce_eager=enforce_eager,
         max_model_len=128,
         max_num_seqs=1,
     )
