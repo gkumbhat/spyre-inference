@@ -50,6 +50,9 @@ from vllm.model_executor.layers.rotary_embedding.yarn_scaling_rope import (
 
 from .utils import place_row_gathered
 
+# One Spyre stick of fp16 elements.
+_STICK = 64
+
 logger = init_logger(__name__)
 
 
@@ -120,12 +123,12 @@ class _SpyreRotaryMixin:
                 f"rotary_dim={self.rotary_dim}, head_size={self.head_size}."
             )
         self._padded_inner = self.rotary_dim // 2
-        self._split_free = self._padded_inner % 64 != 0
         self._rotation_cache: torch.Tensor | None = None
         self._device_rotation_cache: torch.Tensor | None = None
+        # Set only for the split-free path, i.e. when a half head is sub-stick.
         self._rotate_half = (
             _rotate_half_matrix(self.head_size, self.cos_sin_cache.dtype)
-            if self._split_free
+            if self._padded_inner % _STICK != 0
             else None
         )
 
@@ -167,7 +170,7 @@ class _SpyreRotaryMixin:
         split-free path stores ``[cos | cos | sin | sin]`` instead."""
         if self._device_rotation_cache is None:
             rot = self._get_rotation_cache()
-            if self._split_free:
+            if self._rotate_half is not None:
                 cos, sin = rot[:, 0, 0], rot[:, 1, 0]
                 self._device_rotation_cache = torch.cat([cos, cos, sin, sin], dim=-1)
             else:

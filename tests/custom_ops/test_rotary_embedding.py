@@ -49,9 +49,10 @@ GEMMA4_ROPE_PARAMS = {
 # stick-aligned for both (512->256, 256->128).
 GEMMA4_HEAD_SIZES = [512, 256]
 
-# 128 and 256 have a stick-aligned 2x2 inner dim (64, 128); 64 has a sub-stick half (32)
-# and takes the split-free path.
-HEAD_SIZES = [64, 128, 256]
+# 2x2 inner dim stick-aligned (64, 128): the CPU tests that call _rotate_neox_2x2 directly.
+ALIGNED_HEAD_SIZES = [128, 256]
+# 64 adds a sub-stick half (32), which forward_oot routes to the split-free path.
+HEAD_SIZES = [64, *ALIGNED_HEAD_SIZES]
 
 
 def _make_qk(num_tokens, num_q_heads, num_kv_heads, head_size, flatten):
@@ -85,7 +86,7 @@ def test_llama3_rotary_oot_registration(default_vllm_config):
 
 
 @pytest.mark.rotary
-@pytest.mark.parametrize("head_size", HEAD_SIZES)
+@pytest.mark.parametrize("head_size", ALIGNED_HEAD_SIZES)
 def test_rotation_math_matches_reference_cpu(default_vllm_config, head_size):
     """CPU-only: host gather + _rotate_neox_2x2 match forward_native without a
     Spyre device, so the core rotation formula is validated on dev laptops where the
@@ -387,7 +388,7 @@ def test_yarn_rotary_oot_registration(default_vllm_config):
     ],
     ids=["factor4_defaults", "factor2_defaults", "factor8_custom_params"],
 )
-@pytest.mark.parametrize("head_size", HEAD_SIZES)
+@pytest.mark.parametrize("head_size", ALIGNED_HEAD_SIZES)
 def test_yarn_rotation_math_matches_reference_cpu(default_vllm_config, yarn_params, head_size):
     """CPU-only: host gather + _rotate_neox_2x2 match forward_native for YaRN,
     validating that the scaled cos/sin cache produced by YaRN is correctly transformed
