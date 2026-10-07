@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Spyre pooler: CLS/LAST via index_select, MEAN via a two-kernel device fp32 sum, L2 via rsqrt."""
+"""Spyre pooler: CLS/LAST via index_select, MEAN per rectangle lane or on host, L2 via rsqrt."""
 
 from __future__ import annotations
 
@@ -204,46 +204,48 @@ class SpyreLastPool(LastPool):
 
 
 @torch.compile(backend="inductor", dynamic=False)
-def _mean_pool_mask_mul(indicator: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
-    """``[rows, T]`` 0/1 mask times ``[T, H]`` hidden states, broadcast to ``[rows, T, H]``.
+def _mean_pool_row_mask_mul(hidden_states: torch.Tensor, row_mask: torch.Tensor) -> torch.Tensor:
+    """``[T, H]`` hidden states times a ``[T, 1]`` 0/1 mask, zeroing each lane's pad rows.
 
-    Chaining ``_mean_pool_fp32_reduce`` directly onto this op's output crashes
-    the backend compiler (``dbo-opt`` failure), even on shapes the reduce alone
-    compiles fine for -- ``.contiguous()`` forces a real materialized boundary
-    between the two kernels.
+    Chaining the reduce directly onto this product crashes the backend compiler
+    (``dbo-opt``), so ``.contiguous()`` and the caller's ``.clone()`` keep a real
+    boundary between the two kernels. The mask is per row, not ``[lanes, extent]``:
+    the latter, broadcast across the hidden (stick) dim after a lane ``view``, has no
+    restickify on Spyre.
     """
-    return (indicator.unsqueeze(-1) * hidden_states.unsqueeze(0)).contiguous()
+    return (hidden_states * row_mask).contiguous()
 
 
 @torch.compile(backend="inductor", dynamic=False)
-def _mean_pool_fp32_reduce(prod: torch.Tensor, lens: torch.Tensor) -> torch.Tensor:
-    """fp32 round-trip sum (torch-spyre#2619): upcast, sum, divide, downcast in one graph.
+def _mean_pool_grid_reduce(prod: torch.Tensor, lens: torch.Tensor, extent: int) -> torch.Tensor:
+    """fp32 round-trip mean (torch-spyre#2619) of the first ``len(lens)`` grid lanes.
 
-    fp16 in, fp16 out, with the accumulation happening in fp32 in between; see
-    ``SpyreMeanPool`` for why that round-trip is needed instead of a plain
-    device fp32 sum or an fp16-accumulator matmul.
+    fp16 in, fp16 out, accumulating in fp32 in between; see ``SpyreMeanPool``.
     """
-    total = prod.to(torch.float32).sum(dim=1)
-    return (total / lens).to(prod.dtype)
+    grid = prod.view(-1, extent, prod.shape[-1])[: lens.shape[0]]
+    return (grid.to(torch.float32).sum(dim=1) / lens).to(prod.dtype)
 
 
 # Flags a mid-request recompile below, which otherwise just adds latency silently.
-compile_guard.watch(_mean_pool_mask_mul, "mean-pool masked multiply")
-compile_guard.watch(_mean_pool_fp32_reduce, "mean-pool fp32 round-trip sum")
+compile_guard.watch(_mean_pool_row_mask_mul, "mean-pool rectangle row mask")
+compile_guard.watch(_mean_pool_grid_reduce, "mean-pool rectangle fp32 sum")
 
 
 class SpyreMeanPool(MeanPool):
-    """MEAN via a two-kernel on-device fp32 sum; CPU fallback is upstream unchanged.
+    """MEAN on device for a rectangle; one packed D2H and the upstream reduce otherwise.
 
-    A raw device fp32 sum is unsafe to move or cast directly (torch-spyre#2971:
-    fp32 lives staggered on Spyre). A fp16 mask @ hidden_states matmul avoids
-    that but loses precision over a deep reduction, since the matmul
-    accumulator is fp16. torch-spyre#2619's fp16->fp32->sum->fp16 round-trip
-    keeps the accumulation in fp32 instead, split across
-    ``_mean_pool_mask_mul`` / ``_mean_pool_fp32_reduce`` above with a real
-    ``.clone()`` between them. Only the small ``[rows, T]`` mask and
-    ``[rows, 1]`` lengths cross onto the device, and the small pooled result
-    crosses back -- no full D2H of ``hidden_states``.
+    On the rectangular path the runner leaves ``hidden_states`` as the grid (lane ``i``
+    = sequence ``i``) and sets ``cursor.spyre_grid_extent``, so a per-lane reduce needs
+    no more than the body buffer's own size, whatever the request count. It keeps the
+    accumulation in fp32 with torch-spyre#2619's fp16->fp32->sum->fp16 round trip
+    inside one graph: a raw device fp32 sum is unsafe to move or cast
+    (torch-spyre#2971), and an fp16-accumulator matmul loses precision over a deep
+    reduction.
+
+    Anywhere else (ragged steps, mixed-task batches) there is no grid, and an on-device
+    reduce over the packed buffer needs a ``[rows, T, H]`` product that grows with the
+    request count. Copying ``[T, H]`` to the host for ``MeanPool`` costs less memory
+    and, measured, less time.
     """
 
     def __init__(self, defer_trim: bool = False) -> None:
@@ -253,35 +255,38 @@ class SpyreMeanPool(MeanPool):
     def forward(self, hidden_states, pooling_metadata):
         cursor = pooling_metadata.get_pooling_cursor()
         prompt_lens = cursor.prompt_lens_cpu.to(torch.int64)
+        num_seqs = prompt_lens.numel()
+        row_idx, n_rows = pad_row_count_to_bucket(torch.arange(num_seqs, dtype=torch.int64))
+        extent = getattr(cursor, "spyre_grid_extent", None)
 
-        if hidden_states.device.type != "spyre":
-            # Upstream MeanPool assumes hidden_states.shape[0] == sum(prompt_lens);
-            # crop trailing encoder pad on the host before delegating.
-            total = int(prompt_lens.sum().item()) if prompt_lens.numel() else 0
+        if hidden_states.device.type != "spyre" or extent is None:
+            # Upstream MeanPool assumes hidden_states.shape[0] == sum(prompt_lens). Crop
+            # the trailing encoder pad after the D2H: on device that would be a
+            # real-length gather, one torch.compile specialization per prompt length.
+            hidden_states = convert(hidden_states, "cpu")
+            total = int(prompt_lens.sum().item()) if num_seqs else 0
             if hidden_states.shape[0] > total:
                 hidden_states = hidden_states[:total]
-            return super().forward(hidden_states, pooling_metadata)
+            pooled = super().forward(hidden_states, pooling_metadata)
+            # Pad on the host too, so a device head still sees only bucket widths.
+            return pooled[row_idx] if self.defer_trim and num_seqs else pooled
 
-        num_seqs = prompt_lens.numel()
-        ends = torch.cumsum(prompt_lens, dim=0)
-        starts = ends - prompt_lens
-
-        row_idx, n_rows = pad_row_count_to_bucket(torch.arange(num_seqs, dtype=torch.int64))
-        bucket_starts, bucket_lens = starts[row_idx], prompt_lens[row_idx]
-
-        cols = torch.arange(hidden_states.shape[0], dtype=torch.int64)
-        indicator = (cols.unsqueeze(0) >= bucket_starts.unsqueeze(1)) & (
-            cols.unsqueeze(0) < (bucket_starts + bucket_lens).unsqueeze(1)
-        )
-        mask = convert(indicator.to(torch.float16), hidden_states.device)
+        device = hidden_states.device
+        lanes = hidden_states.shape[0] // extent
+        # A non-power-of-two grid can be narrower than the bucket; lanes past the real
+        # count are dropped by the trim either way.
+        bucket_lens = prompt_lens[row_idx][:lanes]
+        lane_lens = torch.zeros(lanes, dtype=torch.int64)
+        lane_lens[:num_seqs] = prompt_lens
+        cols = torch.arange(extent, dtype=torch.int64)
+        row_mask = (cols.unsqueeze(0) < lane_lens.unsqueeze(1)).reshape(-1, 1)
+        mask = convert(row_mask.to(torch.float16), device)
         # clamp(min=1) makes a zero-length segment pool to 0 rather than upstream's
         # NaN (0/0); fine since pooling requests always have at least one token.
-        lens = convert(
-            bucket_lens.clamp(min=1).to(torch.float32).unsqueeze(1), hidden_states.device
-        )
+        lens = convert(bucket_lens.clamp(min=1).to(torch.float32).unsqueeze(1), device)
 
-        prod = _mean_pool_mask_mul(mask, hidden_states).clone()
-        pooled = _mean_pool_fp32_reduce(prod, lens)
+        prod = _mean_pool_row_mask_mul(hidden_states, mask).clone()
+        pooled = _mean_pool_grid_reduce(prod, lens, extent)
         if self.defer_trim:
             return pooled
         return pooled[:n_rows] if pooled.shape[0] != n_rows else pooled
@@ -794,11 +799,10 @@ def configure_pooling_for_spyre(
 ) -> bool:
     """Patch CLS/LAST/MEAN/token AllPool. True if hidden states stay on Spyre.
 
-    CLS/LAST gather on device. MEAN reduces on device too, via a two-kernel
-    fp32 round-trip sum (torch-spyre#2619) rather than a host reduce or a
-    fp16-accumulator matmul -- see ``SpyreMeanPool``. Classifier / reranker
-    heads are downcast to fp16 (no native fp32 matmul, torch-spyre#1794).
-    False if the pooling method is unknown.
+    CLS/LAST gather on device. MEAN reduces each rectangle lane on device and
+    falls back to a host reduce off the rectangular path -- see ``SpyreMeanPool``.
+    Classifier / reranker heads are downcast to fp16 (no native fp32 matmul,
+    torch-spyre#1794). False if the pooling method is unknown.
 
     ``len_ladder`` is ``encoder_len_ladder``: the declared padded prompt lengths (powers
     of two from one stick to ``max_model_len``), which are the only per-request widths

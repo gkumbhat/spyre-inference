@@ -112,8 +112,8 @@ from spyre_inference.v1.pool.spyre_pooler import (
     SpyreMeanPool,
     SpyreRobertaClassificationHead,
     _iter_modules,
-    _mean_pool_fp32_reduce,
-    _mean_pool_mask_mul,
+    _mean_pool_grid_reduce,
+    _mean_pool_row_mask_mul,
 )
 from spyre_inference.v1.sample.topk_topp_sampler import SpyreTopKTopPSampler
 from spyre_inference.v1.worker import compile_guard
@@ -680,8 +680,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
             if isinstance(module, SpyreConv2d):
                 module.process_weights_after_loading()
 
-        # CLS/LAST gather on Spyre. MEAN reduces on Spyre too (two-kernel fp32
-        # round-trip sum). FP32 linear heads stay on CPU.
+        # CLS/LAST gather on Spyre. MEAN reduces each rectangle lane on Spyre and
+        # falls back to the host elsewhere. FP32 linear heads stay on CPU.
         self._pooling_on_spyre = False
         if self.model_config.runner_type == "pooling":
             self._pooling_on_spyre = configure_pooling_for_spyre(
@@ -1339,11 +1339,12 @@ class TorchSpyreModelRunner(GPUModelRunner):
         once the attention kernels were covered. The poolers round their row count
         to a power of two (``pad_row_count_to_bucket``), so this sweep is short.
 
-        ``SpyreMeanPool``'s reduce kernels specialize on the same row width and
-        had the same gap. ``SpyreSequencePooler`` defers CLS/LAST/MEAN's trim to
-        after the classifier/embed head runs, so the head sees this same bucket
-        width rather than the real row count -- warming it here, at ``log2(max_num_seqs)``
-        widths, covers it instead of needing one compile per real row count.
+        ``SpyreMeanPool``'s rectangle reduce specializes on ``(extent, rows)``, so it is
+        warmed once per declared rectangle at each of these widths. ``SpyreSequencePooler``
+        defers CLS/LAST/MEAN's trim to after the classifier/embed head runs, so the head
+        sees this same bucket width rather than the real row count -- warming it here,
+        at ``log2(max_num_seqs)`` widths, covers it instead of needing one compile per
+        real row count.
         """
         if not self._pooling_on_spyre:
             return
@@ -1363,35 +1364,39 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Up to the power of two at or above the limit, which is not itself always one:
         # 6 sequences round up to 8 rows, so stopping at the limit misses that width.
         limit = 1 << max(0, self.scheduler_config.max_num_seqs - 1).bit_length()
-        width = 1
-        while width <= limit:
-            if width <= rows:
-                # SpyreSequencePooler defers CLS/LAST/MEAN's trim to after the
-                # head, so the head sees this same bucket width too -- warm it
-                # here instead of at every real row count.
-                pooled = select_rows(hidden_states, torch.zeros(width, dtype=torch.int64))
-                if mean_pooling:
-                    self._warm_mean_pool_kernels(hidden_states, width)
-                for head in classifier_heads:
-                    logits = head.classifier(pooled)
-                    if head.activation is not None:
-                        head.activation(logits)
-                for head in embed_heads:
-                    embeddings = head.projector(pooled) if head.projector is not None else pooled
-                    if head.activation is not None:
-                        head.activation(embeddings)
-            width *= 2
+        widths = [1 << i for i in range(limit.bit_length()) if 1 << i <= rows]
+        # MEAN on a rectangle reduces its first min(bucket, lanes) lanes; a grid with a
+        # non-power-of-two lane count hands the head that count instead of the bucket.
+        grid_shapes: set[tuple[int, int]] = set()
+        if mean_pooling:
+            grid_shapes = {
+                (extent, min(width, lanes))
+                for extent, lanes in self._encoder_rectangles
+                if extent * lanes == rows
+                for width in widths
+            }
+        for width in sorted(set(widths) | {lanes for _, lanes in grid_shapes}):
+            # SpyreSequencePooler defers CLS/LAST/MEAN's trim to after the head, so
+            # the head sees this same bucket width too -- warm it here instead of at
+            # every real row count.
+            pooled = select_rows(hidden_states, torch.zeros(width, dtype=torch.int64))
+            for head in classifier_heads:
+                logits = head.classifier(pooled)
+                if head.activation is not None:
+                    head.activation(logits)
+            for head in embed_heads:
+                embeddings = head.projector(pooled) if head.projector is not None else pooled
+                if head.activation is not None:
+                    head.activation(embeddings)
+        if grid_shapes:
+            device = hidden_states.device
+            mask = convert(torch.zeros(rows, 1, dtype=torch.float16), device)
+            prod = _mean_pool_row_mask_mul(hidden_states, mask).clone()
+            for extent, lanes in grid_shapes:
+                lens = convert(torch.ones(lanes, 1, dtype=torch.float32), device)
+                _mean_pool_grid_reduce(prod, lens, extent)
         for token_pooler in token_poolers:
             self._warm_token_pool_widths(token_pooler, hidden_states)
-
-    def _warm_mean_pool_kernels(self, hidden_states: torch.Tensor, width: int) -> None:
-        """Compile ``SpyreMeanPool``'s reduce kernels, mirroring its mask/lens construction."""
-        device = hidden_states.device
-        t = hidden_states.shape[0]
-        mask = convert(torch.zeros(width, t, dtype=torch.float16), device)
-        lens = convert(torch.ones(width, 1, dtype=torch.float32), device)
-        prod = _mean_pool_mask_mul(mask, hidden_states).clone()
-        _mean_pool_fp32_reduce(prod, lens)
 
     def _warm_token_pool_widths(
         self, token_pooler: SpyreTokenPooler, hidden_states: torch.Tensor
@@ -1607,34 +1612,35 @@ class TorchSpyreModelRunner(GPUModelRunner):
             return out
         return (out[0], out[1], offset_host_positions(positions, delta), *out[3:])
 
-    def _rectangular_cls(self, pooling_metadata: PoolingMetadata) -> bool:
-        """True when this rectangular step's only task gathers the CLS row.
+    def _rectangular_pooling(
+        self, pooling_metadata: PoolingMetadata
+    ) -> SpyreCLSPool | SpyreMeanPool | None:
+        """This rectangular step's pooling method, when it can read the grid directly.
 
-        LAST and MEAN address packed rows, so they still take the unpad gather.
-        A mixed-task batch does too: one hidden-state layout has to serve every
-        task in the step.
+        CLS takes each lane's first row and MEAN reduces each lane, so both skip the
+        unpad gather. LAST addresses packed rows, so it still takes it. A mixed-task
+        batch does too: one hidden-state layout has to serve every task in the step.
         """
         grid = self._encoder_grid
         if grid is None:
-            return False
+            return None
         tasks = list(pooling_metadata.tasks)
         if len(set(tasks)) != 1:
-            return False
+            return None
         pooler = cast(VllmModelForPooling, self.model).pooler
         sub = pooler
         if isinstance(pooler, SpyreDispatchPooler):
             sub = pooler.poolers_by_task.get(tasks[0])
             if sub is None:
-                return False
-        if isinstance(sub, SequencePooler):
-            pooling = sub.pooling
-        else:
-            pooling = sub
-        if not isinstance(pooling, SpyreCLSPool):
-            return False
+                return None
+        pooling = sub.pooling if isinstance(sub, SequencePooler) else sub
+        if not isinstance(pooling, SpyreCLSPool | SpyreMeanPool):
+            return None
         cursor = pooling_metadata.get_pooling_cursor()
         counts = cursor.num_scheduled_tokens_cpu if cursor is not None else None
-        return counts is not None and int(counts.numel()) == len(grid[2])
+        if counts is None or int(counts.numel()) != len(grid[2]):
+            return None
+        return pooling
 
     def _encoder_pad_token_id(self) -> int:
         """Pad id for batch-pad filler tokens; their outputs are masked and dropped."""
@@ -1734,15 +1740,19 @@ class TorchSpyreModelRunner(GPUModelRunner):
         )
 
         hidden_states = convert(hidden_states, self._spyre_device)
-        # CLS on a rectangle already has its row at ``seq_idx * extent``. Skipping
-        # the unpad gather leaves LAST/MEAN on the packed layout they index.
-        # ``first_token_indices_gpu`` stays a host tensor, like the rest of the cursor.
+        # CLS on a rectangle already has its row at ``seq_idx * extent``, and MEAN
+        # reduces each lane in place, so both skip the unpad gather. LAST stays on
+        # the packed layout it indexes. ``first_token_indices_gpu`` stays a host
+        # tensor, like the rest of the cursor.
         grid = self._encoder_grid
-        if grid is not None and self._rectangular_cls(pooling_metadata):
+        rect_pooling = self._rectangular_pooling(pooling_metadata)
+        if grid is not None and isinstance(rect_pooling, SpyreCLSPool):
             extent, _width, query_lens = grid
             pooling_metadata.get_pooling_cursor().first_token_indices_gpu = torch.tensor(
                 encoder_cls_rows(len(query_lens), extent), dtype=torch.int64
             )
+        elif grid is not None and isinstance(rect_pooling, SpyreMeanPool):
+            pooling_metadata.get_pooling_cursor().spyre_grid_extent = grid[0]
         else:
             # Not a crop: the row count stays the buffer's. On the rectangular path
             # this re-compacts the grid to the packed order the cursor addresses; on
