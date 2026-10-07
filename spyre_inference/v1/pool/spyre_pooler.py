@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import copy
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import cast
 
 import torch
@@ -42,6 +43,7 @@ from vllm.model_executor.layers.pooler.tokwise.methods import AllPool
 from vllm.model_executor.layers.pooler.tokwise.poolers import TokenPooler
 from vllm.model_executor.models.roberta import RobertaClassificationHead
 from vllm.v1.outputs import PoolerOutput
+from vllm.v1.pool.metadata import PoolingCursor
 
 from spyre_inference.custom_ops.linear import _PAD_ROWS, spyre_linear_t
 from spyre_inference.custom_ops.utils import convert
@@ -230,11 +232,18 @@ compile_guard.watch(_mean_pool_row_mask_mul, "mean-pool rectangle row mask")
 compile_guard.watch(_mean_pool_grid_reduce, "mean-pool rectangle fp32 sum")
 
 
+@dataclass
+class SpyrePoolingCursor(PoolingCursor):
+    """``PoolingCursor`` plus the rectangle extent; set only on a rectangular MEAN step."""
+
+    spyre_grid_extent: int | None = None
+
+
 class SpyreMeanPool(MeanPool):
     """MEAN per rectangle lane on device; one packed D2H and the upstream reduce otherwise.
 
     On the rectangular path the runner leaves ``hidden_states`` as the grid (lane ``i``
-    = sequence ``i``) and sets ``cursor.spyre_grid_extent``, so each lane reduces in
+    = sequence ``i``) and hands over a ``SpyrePoolingCursor``, so each lane reduces in
     place. The sum is torch-spyre#2619's fp16->fp32->sum->fp16 round trip inside one
     graph: a raw device fp32 sum is unsafe to move or cast (torch-spyre#2971), and an
     fp16-accumulator matmul loses precision over a deep reduction.

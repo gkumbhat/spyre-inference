@@ -107,6 +107,7 @@ from spyre_inference.v1.pool.spyre_pooler import (
     SpyreDispatchPooler,
     SpyreEmbeddingPoolerHead,
     SpyreMeanPool,
+    SpyrePoolingCursor,
     SpyreRobertaClassificationHead,
     _iter_modules,
     _mean_pool_grid_reduce,
@@ -1746,7 +1747,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 encoder_cls_rows(len(query_lens), extent), dtype=torch.int64
             )
         elif grid is not None and isinstance(rect_pooling, SpyreMeanPool):
-            pooling_metadata.get_pooling_cursor().spyre_grid_extent = grid[0]
+            cursor = pooling_metadata.get_pooling_cursor()
+            pooling_metadata.pooling_cursor = SpyrePoolingCursor(
+                **vars(cursor), spyre_grid_extent=grid[0]
+            )
         else:
             # Not a crop: the row count stays the buffer's. On the rectangular path
             # this re-compacts the grid to the packed order the cursor addresses; on
