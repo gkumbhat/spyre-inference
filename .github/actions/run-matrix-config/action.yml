@@ -45,7 +45,7 @@ inputs:
     description: Unique per-job-attempt slot (e.g. strategy.job-index, or retry-<index>) used to scope the inductor cache dir and the coverage-data artifact name
     required: true
   retry:
-    description: When 'true' (called from the pod-level retry job), adds "(pod-level retry)" to log/report names and overwrites the first attempt's JUnit artifact
+    description: When 'true' (called from the pod-level retry job), adds "(pod-level retry)" to log/report names and overwrites the first attempt's JUnit artifact, keeping its failures as result.prior_* properties
     required: false
     default: 'false'
   use_prebaked_image:
@@ -76,6 +76,10 @@ inputs:
     required: false
     default: ''
   artifactory_rpm_path:
+    required: false
+    default: ''
+  hf_token:
+    description: HF token for the public-model cache step (empty on fork PRs, which then download anonymously)
     required: false
     default: ''
 
@@ -149,9 +153,8 @@ runs:
     - name: Activate the freshly-built venv
       if: ${{ inputs.use_prebaked_image != 'true' }}
       shell: bash
-      # Ephemeral -dev-image runners inherit a stale $VIRTUAL_ENV at /home/senuser/.venv (an ancestor of the checkout); repoint AND remove it so `uv run --active` (Makefile:153) can't find or use anything but the venv just built here.
+      # ibm-aiu-setup.sh re-activates the image's baked /home/senuser/.venv ($VIRTUAL_ENV) in every `make` recipe shell, so the test shell targets the project .venv the Makefile repoints to (see AIU_SETUP_CMD), not this value. This repoint still steers the non-recipe uv steps (HF cache) that don't source the profile.
       run: |
-        rm -rf /home/senuser/.venv
         echo "VIRTUAL_ENV=${GITHUB_WORKSPACE}/.venv" >> "$GITHUB_ENV"
         echo "${GITHUB_WORKSPACE}/.venv/bin" >> "$GITHUB_PATH"
 
@@ -164,6 +167,8 @@ runs:
       shell: bash
       env:
         HF_HUB_OFFLINE: '0'
+        # Scoped to this step: test steps stay offline and token-free.
+        HF_TOKEN: ${{ inputs.hf_token }}
       run: uv run .github/cache_config/manage_cache.py --public
 
     # cache_dir() defaults to one path shared by every pod on this PVC-mounted runner pool; a fixed path let one job's compile reuse (stale XPASS/wrong-output) or race another concurrent job's, so scope it per matrix job instead of clearing the shared one.
@@ -234,8 +239,18 @@ runs:
         # the declared set.
         export SPYRE_TEST_TIERS="${RAW_TEST_TYPES}"
         echo "Declared SPYRE_TEST_TIERS=${SPYRE_TEST_TIERS:-<unset, falling back to ${SPYRE_TEST_TIER}>}"
-        timeout --signal=TERM --kill-after=1m 90m \
-          make ${{ inputs.test_target }} COVERAGE=1 JUNIT_XML=junit-${{ inputs.test_target }}.xml
+        # Tee the test output to PID 1's stdout so the Cloud Logs fluent-bit DaemonSet
+        # (which only reads pod stdout via /var/log/containers) captures it; a plain run:
+        # step's output is intercepted by the runner agent and never reaches pod stdout.
+        # pipefail preserves test failures; without writable PID 1 stdout, use ordinary step output.
+        set -o pipefail
+        if [[ -w /proc/1/fd/1 ]]; then
+          timeout --signal=TERM --kill-after=1m 90m \
+            make ${{ inputs.test_target }} COVERAGE=1 JUNIT_XML=junit-${{ inputs.test_target }}.xml 2>&1 | tee /proc/1/fd/1
+        else
+          timeout --signal=TERM --kill-after=1m 90m \
+            make ${{ inputs.test_target }} COVERAGE=1 JUNIT_XML=junit-${{ inputs.test_target }}.xml
+        fi
         echo "tests done"
 
     # Raw per-process data files; their host/pid suffixes are unique across jobs, so the fan-in's `make coverage` combines them without a per-job step. if-no-files-found=ignore covers configs that measured nothing.
@@ -259,14 +274,10 @@ runs:
         if-no-files-found: ignore
         retention-days: 14
 
-    # Consumed by the test-report fan-in (_test_matrix.yaml) and the ClickHouse
-    # ingest (push-to-clickhouse.yaml); no per-leg dorny publish -- the fan-in is
-    # the one aggregate report. overwrite: a pod-level retry replaces its failed
-    # first attempt's file.
     # The arch this leg ran on, for the workflow_run ingest: it is pinned to x86_64, so it
     # cannot read the test host's arch, and arch is hashed into run_id -- a wrong value mints
-    # an id that joins to nothing. Rides beside the XML rather than as a case tag, which
-    # would fold arch into test_case_id and split one test per platform.
+    # an id that joins to nothing. The sidecar supplies the ingest's leg arch;
+    # platform__ case tags carry run context and are excluded from test_case_id.
     - name: Record leg arch for the ingest
       if: always()
       shell: bash
@@ -274,6 +285,53 @@ runs:
         LEG_ARCH: ${{ inputs.leg_arch }}
       run: printf '%s' "${LEG_ARCH:-$(uname -m)}" > "leg-arch-${{ inputs.test_target }}.txt"
 
+    # The overwrite below would erase the first attempt's failures, so they are kept on the
+    # retry's report as result.prior_* properties (result.retried=pod marks every case).
+    - name: Download the first attempt's JUnit results
+      if: ${{ always() && inputs.retry == 'true' }}
+      continue-on-error: true
+      uses: actions/download-artifact@v4
+      with:
+        name: junit-${{ inputs.test_target }}
+        path: ${{ runner.temp }}/replaced-junit
+
+    - name: Mark the retry's JUnit results
+      if: ${{ always() && inputs.retry == 'true' }}
+      shell: bash
+      env:
+        CFG: ${{ inputs.cfg }}
+        NEW_XML: junit-${{ inputs.test_target }}.xml
+        REPLACED_XML: ${{ runner.temp }}/replaced-junit/junit-${{ inputs.test_target }}.xml
+        # Stdlib-only, so fetched by path rather than installed; @main, like the ingest that reads its marks.
+        MARK_RETRIED_URL: https://raw.githubusercontent.com/torch-spyre/torch-spyre/main/extensions/clickhouse-ingest/spyre_clickhouse_ingest/mark_retried.py
+      run: |
+        warn() {
+          echo "::warning::$1"
+          echo "- :warning: ${CFG}: $1" >> "$GITHUB_STEP_SUMMARY"
+        }
+        if [[ ! -f "$NEW_XML" ]]; then
+          # Without this the overwriting upload would carry only the leg-arch file.
+          if [[ -f "$REPLACED_XML" ]]; then
+            cp "$REPLACED_XML" "$NEW_XML"
+            warn "retry wrote no JUnit XML; re-uploading the first attempt's report"
+          fi
+          exit 0
+        fi
+        args=("$NEW_XML")
+        if [[ -f "$REPLACED_XML" ]]; then
+          args+=("$REPLACED_XML")
+        else
+          warn "first attempt left no JUnit XML; marking the retry without prior outcomes"
+        fi
+        helper="${RUNNER_TEMP}/mark_retried.py"
+        curl -fsSL --retry 3 -o "$helper" "$MARK_RETRIED_URL" \
+          && python3 -I "$helper" pod "${args[@]}" \
+          || warn "could not mark $NEW_XML as retried; uploading it unmarked"
+
+    # Consumed by the test-report fan-in (_test_matrix.yaml) and the ClickHouse
+    # ingest (push-to-clickhouse.yaml); no per-leg dorny publish -- the fan-in is
+    # the one aggregate report. overwrite: a pod-level retry replaces its first
+    # attempt's file.
     - name: Upload JUnit results
       if: always()
       uses: actions/upload-artifact@v4

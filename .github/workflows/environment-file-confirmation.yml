@@ -13,7 +13,8 @@ permissions:
   checks: write
   contents: read
   issues: write
-  pull-requests: read
+  # PR comments use the issues API but require pull-request write permission.
+  pull-requests: write
 
 # queue: max so a newer run (even a skipped ordinary comment) cannot evict a
 # pending one.
@@ -179,8 +180,8 @@ jobs:
               return accepted;
             };
 
-            // A check is keyed by commit, so it must hold for every open PR
-            // that shares the head commit, not just the one that triggered us.
+            // Also check open PRs sharing this head commit and base branch
+            // for unconfirmed environment-file changes.
             const otherBlockers = async (pull) => {
               const openPulls = await github.paginate(github.rest.pulls.list, {
                 owner,

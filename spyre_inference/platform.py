@@ -47,9 +47,10 @@ else:
 
 logger = init_logger(__name__)
 
-# Dtypes torch-spyre can run. float16 is the default and the validated one; bfloat16 is
-# accepted only when asked for explicitly. Both are 2 bytes wide, so every
-# stick-alignment constant in this plugin holds for either.
+# Dtypes torch-spyre can run. float16 is the validated one; bfloat16 passes this check, but
+# apply_config_platform_defaults overwrites every model's dtype with float16, an explicit
+# --dtype bfloat16 included, so only a config edited after construction reaches it. Both are
+# 2 bytes wide, so every stick-alignment constant in this plugin holds for either.
 _SUPPORTED_DTYPES = frozenset({torch.float16, torch.bfloat16})
 
 
@@ -338,8 +339,8 @@ class TorchSpyrePlatform(CpuPlatform):
                 )
 
         # In check_and_update_config we assert the dtype is one Spyre supports.
-        # This must be set here as the default, otherwise all usage (including test fixtures) would
-        # require setting the dtype.
+        # Set here so no usage (test fixtures included) has to pass a dtype. Unconditional: it
+        # replaces whatever the user asked for, bfloat16 included.
         vllm_config.model_config.dtype = torch.float16
 
     @classmethod
@@ -480,7 +481,8 @@ class TorchSpyrePlatform(CpuPlatform):
 
         model_config = vllm_config.model_config
         hf_config = model_config.hf_config
-        target_cfg = getattr(hf_config, "text_config", None) or hf_config
+        # The config the runner's padding passes read, so both agree on the text part.
+        target_cfg = model_config.hf_text_config
         num_heads = getattr(target_cfg, "num_attention_heads", None)
         hidden_size = getattr(target_cfg, "hidden_size", None)
         if num_heads is None or hidden_size is None:
@@ -767,6 +769,12 @@ class TorchSpyrePlatform(CpuPlatform):
         # a single group drawing from the single global BlockPool.
         # Pooling / encoder-only models have no KV cache — do not size one.
         cache_config = vllm_config.cache_config
+        # Prefix caching on a zero-group config makes vLLM pick HybridKVCacheCoordinator,
+        # which asserts it has ≥2 attention groups.
+        if cls._is_pooling_model(vllm_config) and cache_config.enable_prefix_caching:
+            logger.info("Disabling prefix caching: pooling/encoder-only model has no KV cache.")
+            cache_config.enable_prefix_caching = False
+
         if vllm_config.model_config is not None and cache_config.num_gpu_blocks_override is None:
             if cls._is_pooling_model(vllm_config):
                 logger.info(
