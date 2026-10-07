@@ -20,8 +20,8 @@ as two halves). ``TorchSpyrePlatform._maybe_pad_head_dim`` overrides ``head_dim`
 next 64-multiple (128-multiple for RoPE on the Transformers backend) before the model is
 built (sizing QKV/o_proj/Attention/KV-cache/RoPE at the padded width); the passes here
 fill the padded region on load (including the QK-norm weights of models that normalize
-over head_dim) and restore the two things the width override would otherwise corrupt —
-the RoPE frequencies and the attention scale.
+over head_dim), restore the RoPE frequencies and attention scale, and compensate QK-norm
+epsilon for the wider reduction.
 
 Padding is interleaved (RoPE-compatible) for Q/K and end-of-head for V/O, and the
 rotation cache keeps the original frequencies. The Transformers backend shares the
