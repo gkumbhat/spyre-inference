@@ -61,8 +61,8 @@ def _rotate_neox_2x2(
     """Apply full neox RoPE via per-token 2x2 rotation matrices.
 
     ``x`` is [T, H*head_size] or [T, H, head_size]; ``rot`` is [T, 2, 2, head_size // 2].
-    The inner dim head_size // 2 is stick-aligned (the platform pads head_dim to a
-    128-multiple before RoPE is built), so the split-half pairing is a pure view.
+    The inner dim head_size // 2 is stick-aligned (a head whose half isn't takes
+    ``_rotate_neox_split_free``), so the split-half pairing is a pure view.
     Returns the rotated tensor with ``x``'s shape.
     """
     num_tokens = x.shape[0]
@@ -102,10 +102,11 @@ def _rotate_neox_split_free(
 class _SpyreRotaryMixin:
     """Spyre RoPE wiring shared by the OOT rotary classes.
 
-    Runs the 2x2 rotation on Spyre for supported configs; unsupported configs raise
-    ``NotImplementedError`` at construction. The rotation cache is derived lazily on CPU
-    from the base ``cos_sin_cache`` (inheriting all rope-scaling variants), and ``_apply``
-    places a copy on the device when the module moves there.
+    Runs the 2x2 (or, for a sub-stick half, split-free) rotation on Spyre for supported
+    configs; unsupported configs raise ``NotImplementedError`` at construction. The
+    rotation cache is derived lazily on CPU from the base ``cos_sin_cache`` (inheriting
+    all rope-scaling variants), and ``_apply`` places a copy on the device when the
+    module moves there.
     """
 
     def __init__(self, *args, **kwargs):
@@ -145,7 +146,7 @@ class _SpyreRotaryMixin:
         _padded_inner when a padded head injected a narrower original-frequency cache."""
         if self._rotation_cache is None:
             # Derive inner from the cache actually present, not rotary_dim: when a
-            # head is padded (head_size=64 -> 128), fix_padded_rope injects the
+            # head is padded (e.g. head_size=96 -> 128), fix_padded_rope injects the
             # original narrower cos_sin_cache so the real frequencies survive; the
             # trailing dims are then zero-padded to _padded_inner (harmless because
             # the matching x pair dims are zero from weight padding).
