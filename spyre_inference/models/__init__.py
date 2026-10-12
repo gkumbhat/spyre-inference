@@ -23,9 +23,11 @@ architecture, so an architecture this deployment never serves costs nothing.
 
 from __future__ import annotations
 
+import importlib
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    import torch
     from vllm.engine.arg_utils import EngineArgs
 
 # vLLM modules whose every architecture needs the same adaptation: these are the
@@ -102,6 +104,31 @@ def register_models() -> None:
 
     for arch, model_cls in models.items():
         ModelRegistry.register_model(arch, model_cls)
+
+
+def check_spyre_model(model: torch.nn.Module, architecture: str) -> None:
+    """Fail if ``architecture`` has a Spyre adaptation that ``model`` was not built as.
+
+    vLLM caches the class it resolves per process, so an architecture it looks up
+    before ``register_models`` has run keeps the unadapted vLLM class, and builds it
+    without an error of its own. A worker looks a multimodal architecture up that early
+    (for its multimodal cache), so this is what a ``VLLM_PLUGINS`` allowlist leaving out
+    the general plugin produces.
+
+    Raises:
+        RuntimeError: if ``model`` is not an instance of the Spyre class.
+    """
+    target = spyre_models().get(architecture)
+    if target is None:
+        return
+    module_name, _, cls_name = target.partition(":")
+    spyre_cls = getattr(importlib.import_module(module_name), cls_name)
+    if not isinstance(model, spyre_cls):
+        raise RuntimeError(
+            f"{architecture} was built as {type(model).__name__}, not {cls_name}: vLLM "
+            "resolved it before the Spyre model adaptations were registered. Make sure "
+            "VLLM_PLUGINS allows the spyre_inference general plugin."
+        )
 
 
 def apply_prelaunch_overrides(engine_args: EngineArgs) -> None:
