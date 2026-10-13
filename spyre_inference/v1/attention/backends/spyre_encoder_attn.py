@@ -102,8 +102,10 @@ def encoder_row_table(start: int, query_len: int, extent: int, dtype: torch.dtyp
     ``INT32_ELEMS_PER_STICK``, so the table is stick-aligned with no extra pad.
 
     The clamp makes the scatter write one destination row repeatedly. That is benign
-    -- the mask depends only on the KV column, so every duplicate lane carries the
-    same value -- but ``index_copy_`` with duplicate indices is formally undefined in
+    -- every duplicate lane attends exactly the real keys, as the last real row does
+    (a key-pad mask depends only on the KV column, and a causal row past the last real
+    one still sees all of them), so each carries the same value -- but ``index_copy_``
+    with duplicate indices is formally undefined in
     PyTorch, so ``build_encoder_plan`` asserts the intent rather than leaving it
     implicit.
     """
@@ -360,7 +362,8 @@ class EncoderRectPlan:
     extent: int
     width: int
     mask: torch.Tensor
-    """``[width, 1, 1, extent]`` additive key-pad, already on the device."""
+    """``[width, 1, 1, extent]`` additive key-pad (``[width, 1, extent, extent]`` when
+    causal), already on the device."""
     query_lens: list[int]
     """Real length per request. The runner uses it to lay out the grid and, when
     packed-order pooling is needed, to compact hidden states afterwards. The ragged
@@ -809,7 +812,8 @@ _ORIG_ATTENTION_FORWARD = Attention.forward
 
 
 class EncoderGrid:
-    """This step's ``[width, 1, 1, extent]`` mask, or ``None`` off the rectangular path.
+    """This step's ``[width, 1, 1, extent]`` mask (``[width, 1, extent, extent]`` when
+    causal), or ``None`` off the rectangular path.
 
     ``(width, extent)`` is read from the mask's *shape*, not off the step's plan: ``view``
     needs both as trace-time ints, and the plan is a fresh object every step, so Dynamo

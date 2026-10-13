@@ -37,7 +37,7 @@ from vllm.v1.attention.selector import get_attn_backend
 
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.pool.spyre_pooler import select_rows
-from spyre_inference.v1.worker.spyre_shape_bucketer import expand_packed_embeds_to_encoder_grid
+from spyre_inference.v1.worker.spyre_shape_bucketer import encoder_dense_row_indices
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -165,8 +165,12 @@ class SpyreCLIPEmbeddingModel(CLIPEmbeddingModel):
         self._spyre_has_text_tokens = True
 
     def embed_input_ids(self, input_ids, multimodal_embeddings=None, *, is_multimodal=None):
-        self._spyre_mm_token_mask = is_multimodal if _has_mm(multimodal_embeddings) else None
-        self._spyre_has_text_tokens = has_text_tokens(multimodal_embeddings, is_multimodal)
+        mask = None
+        if _has_mm(multimodal_embeddings) and is_multimodal is not None:
+            # The one host copy per step: the runner's hook and the merge both read it.
+            mask = convert(is_multimodal, device="cpu")
+        self._spyre_mm_token_mask = mask
+        self._spyre_has_text_tokens = has_text_tokens(multimodal_embeddings, mask)
         return super().embed_input_ids(
             input_ids, multimodal_embeddings, is_multimodal=is_multimodal
         )
@@ -192,14 +196,13 @@ class SpyreCLIPEmbeddingModel(CLIPEmbeddingModel):
         mask = self._spyre_mm_token_mask
         if mask is None:
             return
-        mask = convert(mask, device="cpu")[:num_tokens]
+        mask = mask[:num_tokens]
         self._spyre_has_text_tokens = bool((~mask).any())
         if grid is not None:
             extent, width, query_lens = grid
-            grid_mask = expand_packed_embeds_to_encoder_grid(
-                mask.unsqueeze(-1), query_lens, width, extent
-            )
-            mask = grid_mask.squeeze(-1)
+            grid_mask = torch.zeros(width * extent, dtype=torch.bool)
+            grid_mask[encoder_dense_row_indices(query_lens, extent)] = mask
+            mask = grid_mask
         self._spyre_mm_token_mask = mask
 
     def get_image_features(self, pixel_values, feature_select_strategy=None):

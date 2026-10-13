@@ -1171,6 +1171,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
             EncoderRectPlan,
             build_encoder_plan,
+            encoder_inline_active,
             publish_encoder_grid,
         )
 
@@ -1187,6 +1188,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         groups = per_layer if isinstance(per_layer, list) else [per_layer]
         plan = None
         seen: set[int] = set()
+        causal: set[bool] = set()
         for group in groups:
             if not isinstance(group, dict):
                 continue
@@ -1194,8 +1196,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 if id(md) in seen or not hasattr(md, "encoder_plan"):
                     continue
                 seen.add(id(md))
+                encoder_md = cast(SpyreAttentionMetadata, md)
+                causal.add(encoder_md.apply_causal_mask)
                 if md.encoder_plan is None:
-                    encoder_md = cast(SpyreAttentionMetadata, md)
                     plan = self._forced_encoder_plan(encoder_md) or build_encoder_plan(
                         encoder_md,
                         rectangles=rectangles,
@@ -1212,6 +1215,13 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 else:
                     plan = md.encoder_plan
 
+        # The traced rectangle reads one published mask in every inlined layer, so groups
+        # that differ in causality cannot share it.
+        if isinstance(plan, EncoderRectPlan) and encoder_inline_active() and len(causal) > 1:
+            raise NotImplementedError(
+                "Encoder attention groups mix causal and bidirectional masks; the traced "
+                "rectangle path publishes one mask for all of them."
+            )
         # A rectangle's mask shape is how a traced forward reads the grid; the ragged path
         # publishes nothing and so stays opaque.
         publish_encoder_grid(plan)
