@@ -121,12 +121,12 @@ from spyre_inference.v1.worker import compile_guard
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
     SpyreShapeBucketer,
     encoder_cls_rows,
+    encoder_grid_source_rows,
     encoder_group_shapes,
     encoder_group_width_caps,
     encoder_len_ladder,
     encoder_rectangles,
     encoder_shape_tables,
-    expand_packed_embeds_to_encoder_grid,
     expand_packed_to_encoder_grid,
     expand_packed_token_types,
     logits_row_buckets,
@@ -894,7 +894,12 @@ class TorchSpyreModelRunner(GPUModelRunner):
         while the rectangular path is opaque. With the rectangular path traced into the
         block graph, ``_warm_encoder_inline_paths`` gives each rectangle its own dummy and
         forces one onto the ragged path, which is what reaches the impl.
-        Eager pooling: one short dummy, then ``mark_warmed_up()``.
+        Eager pooling: one short dummy, then ``mark_warmed_up()``. It does not run the
+        vision tower: those blocks crash while the tower is still eager, and a
+        text-only load would die at startup.
+        Compiled pooling with a vision tower also runs ``embed_multimodal`` at every
+        image-batch width up to ``mm_max_items_per_batch``; profile_run only traces
+        the widest one, and the tower stays eager.
         Upstream dummy skips encoder attention unless ``force_attention=True``.
         """
         is_pooling = self.model_config.runner_type == "pooling"
@@ -919,6 +924,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
                         self._warm_pooler_row_widths(hidden_states)
                         self._warm_encoder_unpack(hidden_states)
                     self._warm_encoder_inline_paths()
+                    self._warm_encoder_embed_gather()
                     self.spyre_shape_bucketer.mark_warmed_up()
                 if self._spyre_kv_caches:
                     # A decoder-type text tower (e.g. CLIP's) has a real KV cache;
@@ -926,6 +932,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
                     # the dummy-batch seq_lens bug. No-op for encoder-only pooling
                     # models (BERT/RoBERTa), which never get a KV cache.
                     self._record_attention_graphs()
+                # CLIP's vision tower is eager and profile_run only traces the widest
+                # image batch, so every narrower width would compile on the first request.
+                self._warmup_multimodal_encoder()
             logger.info("Warmup done in %.3fs.", time.time() - t0)
             return
 
@@ -939,6 +948,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
             with _set_spyre_compilation_settings(self.vllm_config):
                 self._dummy_run(num_tokens)
                 self._warmup_input_embedding(num_tokens)
+                # No vision warmup here. enforce_eager reaches this branch, and the
+                # eager vision blocks crash. A text load would otherwise die in
+                # embed_multimodal before the first prompt.
             if is_pooling and self.spyre_shape_bucketer is not None:
                 self.spyre_shape_bucketer.mark_warmed_up()
             logger.info("Warmup done in %.3fs.", time.time() - t0)
@@ -996,6 +1008,41 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # int32 to match upstream's `input_ids` buffer; 0 is an id every vocab holds.
         model.embed_input_ids(torch.zeros(num_tokens, dtype=torch.int32))
         logger.info_once("Warming the input embedding through embed_input_ids.")
+
+    @torch.inference_mode()
+    def _warmup_multimodal_encoder(self) -> None:
+        """Compile an eager vision tower at every image-batch width it can see.
+
+        Pooling warmup traces the text body only. ``profile_run`` calls
+        ``embed_multimodal`` once, at ``mm_max_items_per_batch``, so the first
+        real request at each narrower width pays a full compile. CLIP's
+        ``vision_model`` stays out of block compile, and ``SpyreConv2d`` is a
+        separate graph per batch, so each width has to run here
+        (spyre-inference#1182).
+
+        Generative VLMs are left alone: enumerating their tower would dominate
+        startup, and this is the pooling-encoder gap the tail latency comes from.
+        """
+        if self.model_config.runner_type != "pooling" or not self.supports_mm_inputs:
+            return
+        mm_budget = getattr(self, "mm_budget", None)
+        max_items = getattr(mm_budget, "mm_max_items_per_batch", None)
+        model = cast(_SpyreModelWrapper, self.model)
+        if not max_items or not hasattr(model, "embed_multimodal"):
+            return
+
+        widths = [(modality, int(n)) for modality, n in max_items.items() if int(n) >= 1]
+        if not widths:
+            return
+        logger.info(
+            "Warming multimodal encoder batch widths: %s.",
+            ", ".join(f"{modality} 1..{n}" for modality, n in widths),
+        )
+        t0 = time.time()
+        for modality, n_max in widths:
+            for n in range(1, n_max + 1):
+                model.embed_multimodal(**self._get_mm_dummy_batch(modality, n))
+        logger.info("Multimodal encoder warmup done in %.3fs.", time.time() - t0)
 
     @torch.inference_mode()
     def _record_attention_graphs(self) -> None:
@@ -1493,6 +1540,25 @@ class TorchSpyreModelRunner(GPUModelRunner):
             return
         select_rows(hidden_states, torch.zeros(hidden_states.shape[0], dtype=torch.int64))
 
+    @torch.inference_mode()
+    def _warm_encoder_embed_gather(self) -> None:
+        """Compile ``_preprocess``'s embeddings-to-grid gather once per rectangle.
+
+        Only a multimodal pooling model (e.g. CLIP) reaches it, and ``_dummy_run`` hands
+        the model its own ``inputs_embeds`` without going through ``_preprocess``.
+        """
+        buffer = getattr(self, "inputs_embeds", None)
+        if (
+            not self.supports_mm_inputs
+            or not self._pooling_on_spyre
+            or not self._encoder_rectangles
+            or buffer is None
+        ):
+            return
+        body = buffer.gpu[: self._encoder_budget]
+        for extent, width in self._encoder_rectangles:
+            select_rows(body, torch.zeros(width * extent, dtype=torch.int64))
+
     def _unpad_encoder_hidden(
         self, hidden_states: torch.Tensor, num_scheduled_tokens: int
     ) -> torch.Tensor:
@@ -1532,8 +1598,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
         pad count, so the interior per-sequence padding a rectangle needs has to
         happen here. The `input_ids` path packs only integer tensors (tens of KB),
         avoiding a per-layer activation gather. Multimodal pooling with only
-        `inputs_embeds` instead copies the floating-point embeddings to CPU,
-        expands them there and converts the grid back to the original device.
+        `inputs_embeds` instead gathers the embeddings into the grid on the device,
+        with an index built on the host, so they never round-trip through the host.
 
         On the packed path, absolute-position RoBERTa still offsets positions here
         before the embedding gather. ``query_start_loc`` and ``seq_lens`` keep the
@@ -1584,11 +1650,13 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 position_offset=position_offset,
             )
             grid_ids = None
-            grid_embeds = convert(
-                expand_packed_embeds_to_encoder_grid(
-                    inputs_embeds[:num_tokens].cpu(), query_lens, width, extent
+            # Gathered from the whole body buffer, not a `[:num_tokens]` slice: the
+            # gather specialises on its source's row count, which then stays fixed.
+            grid_embeds = select_rows(
+                inputs_embeds,
+                torch.tensor(
+                    encoder_grid_source_rows(query_lens, width, extent), dtype=torch.int64
                 ),
-                inputs_embeds.device,
             )
             assert grid_embeds.shape[0] == width * extent, (grid_embeds.shape[0], width * extent)
 
@@ -1709,7 +1777,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             prompt_token_ids=dummy_token_ids,
             prompt_token_ids_cpu=dummy_token_ids.cpu(),
             pooling_params=[dummy_pooling_params] * num_reqs,
-            pooling_states=[PoolingStates() for i in range(num_reqs)],
+            pooling_states=[PoolingStates() for _ in range(num_reqs)],
         )
         dummy_metadata.build_pooling_cursor(
             num_scheduled_tokens_np,
