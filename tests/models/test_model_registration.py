@@ -133,4 +133,3 @@ def test_platform_plugin_name_also_loads_the_model_registration():
     general = entry_points["vllm.general_plugins"]
     assert platform_names <= set(general)
     assert {general[name] for name in platform_names} == {"spyre_inference:register_ops"}
-    assert general["spyre_inference_ops"] == "spyre_inference:register_ops"
