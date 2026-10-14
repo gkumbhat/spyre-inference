@@ -653,16 +653,17 @@ def main():
 
     # Run serve benchmarks (after latency/throughput to avoid port conflicts)
     if "serve" in bench_types:
-        passed, failed = run_serve_benchmarks_from_file(
-            config_file=configs_dir / "serve-tests.yaml",
-            results_dir=results_dir,
-            spyre_devices=args.spyre_devices,
-            aiu_world_size=args.aiu_world_size,
-            models=models,
-            tps=tps,
-        )
-        total_passed += passed
-        total_failed += failed
+        for serve_config in ("serve-tests.yaml", "multimodal-serve-tests.yaml"):
+            passed, failed = run_serve_benchmarks_from_file(
+                config_file=configs_dir / serve_config,
+                results_dir=results_dir,
+                spyre_devices=args.spyre_devices,
+                aiu_world_size=args.aiu_world_size,
+                models=models,
+                tps=tps,
+            )
+            total_passed += passed
+            total_failed += failed
 
     # Summary
     log.info("=== Benchmark Summary ===")
