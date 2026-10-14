@@ -30,6 +30,6 @@ tests:
     server_parameters:
       model: mistralai/Ministral-3-14B-Instruct-2512-BF16
 
-  - test_name: serve_gemma4-26b-a4b_tp4_mm_random
+  - test_name: serve_gemma4-26b-a4b-it_tp4_mm_random
     server_parameters:
-      model: google/gemma-4-26B-A4B
+      model: google/gemma-4-26B-A4B-it
