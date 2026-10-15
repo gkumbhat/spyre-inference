@@ -34,16 +34,19 @@ logger = init_logger(__name__)
 
 
 def _layouts_supported(x: torch.Tensor, weight: torch.Tensor) -> bool:
-    """Whether the layout tuples below apply: one image, in-channels within a stick,
-    out-channels a whole number of sticks.
+    """Whether this call is a vision patch embed: in-channels within a stick,
+    out-channels a whole number of sticks. Batch size doesn't matter -- the
+    compiled call below takes whatever batch it's given, tiled (one image) or
+    not (e.g. a granite-vision tile batch).
 
-    True for a Pixtral patch embed, not for convs in general — and this class is
-    registered OOT for *every* `Conv2dLayer`, so fall back rather than assert.
+    True for a Pixtral/granite-vision patch embed, not for convs in general —
+    and this class is registered OOT for *every* `Conv2dLayer`, so fall back
+    rather than assert.
     """
     if x.dim() != 4 or weight.dim() != 4:
         return False
-    b, c = x.shape[0], x.shape[1]
-    return b == 1 and c <= 64 and weight.shape[0] % 64 == 0
+    c = x.shape[1]
+    return c <= 64 and weight.shape[0] % 64 == 0
 
 
 def _weight_layout(weight: torch.Tensor):
@@ -126,8 +129,8 @@ class SpyreConv2d(CompileOutermost, Conv2dLayer):
             return self._forward_conv(x)
         if not _layouts_supported(x, self.weight):
             logger.warning_once(
-                "Spyre conv2d: shape %s (weight %s) outside the tiled-layout "
-                "assumptions (batch 1, in_channels <= 64, out_channels %% 64 == 0); "
+                "Spyre conv2d: shape %s (weight %s) outside the patch-embed "
+                "assumptions (in_channels <= 64, out_channels %% 64 == 0); "
                 "falling back to F.conv2d without them.",
                 tuple(x.shape),
                 tuple(self.weight.shape),
