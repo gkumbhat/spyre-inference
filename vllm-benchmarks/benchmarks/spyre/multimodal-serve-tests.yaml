@@ -15,7 +15,6 @@ defaults:
     backend: openai-chat
     endpoint: /v1/chat/completions
     ignore-eos: true
-    tokenizer-mode: hf
     percentile-metrics: ttft,tpot,itl,e2el
     metric-percentiles: 99,100
     max-concurrency: 4
