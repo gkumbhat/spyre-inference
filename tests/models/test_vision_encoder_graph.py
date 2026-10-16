@@ -585,3 +585,48 @@ def test_compiled_merge_through_the_wrapper_on_spyre(monkeypatch, num_tokens):
     want = convert(convert(want, device="spyre"), device="cpu")
     assert got.shape == (num_tokens, hidden)
     assert torch.equal(got, want)
+
+
+def test_overrides_accept_everything_upstream_passes():
+    """Upstream calls these with keywords that grow across vLLM releases (``axis_keys`` in
+    0.31); an override that misses one fails at warmup."""
+    import inspect
+
+    from vllm.model_executor.models.interfaces import SupportsEncoderCudaGraph
+    from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
+
+    def params(fn):
+        return set(inspect.signature(fn).parameters)
+
+    for name in ("_capture_budget_graph", "_run_budget_graph"):
+        upstream = getattr(EncoderCudaGraphManager, name)
+        assert params(upstream) <= params(getattr(SpyreEncoderGraphManager, name)), name
+    for name, upstream in vars(SupportsEncoderCudaGraph).items():
+        ours = getattr(SpyreVisionEncoderMixin, name, None)
+        if callable(upstream) and callable(ours) and not name.startswith("__"):
+            assert params(upstream) <= params(ours), name
+
+
+def test_capture_axes_are_rejected():
+    model = _FakeVisionModel()
+    config = model.get_encoder_cudagraph_config()
+    model.get_encoder_cudagraph_config = lambda: dataclasses.replace(
+        config, capture_axes=(("a", "b"),)
+    )
+    with pytest.raises(NotImplementedError, match="capture_axes"):
+        _manager(model)
+
+
+def test_eager_path_respects_the_items_per_call_cap():
+    """Without the manager (enforce_eager), embed_multimodal splits the step's items at the
+    cap itself, so no call carries more items than the layout can tell apart."""
+    model = _FakeVisionModel()
+    type(model).vision_max_items_per_call = 2
+    try:
+        outputs = model.embed_multimodal(tokens=[5, 10, 15, 20, 25])
+    finally:
+        del type(model).vision_max_items_per_call
+    assert len(model.forward_patches) == 3
+    assert [o.shape[0] for o in outputs] == [5, 10, 15, 20, 25]
+    for i, out in enumerate(outputs):
+        torch.testing.assert_close(out, torch.full_like(out, float(i + 1)))

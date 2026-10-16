@@ -84,6 +84,30 @@ def blocks_marked_compilable(blocks: Iterable[nn.Module]) -> bool:
     return all(getattr(b, _BLOCK_COMPILABLE_ATTR, False) for b in blocks)
 
 
+# Attribute under which a `cu_seqlens` tensor caches its block-diagonal mask.
+_CU_MASK_ATTR = "_spyre_block_diag_mask"
+
+
+def block_diagonal_mask(cu_seqlens: torch.Tensor, seq: int) -> torch.Tensor:
+    """Bool `[seq, seq]` keep-mask from packed boundaries `[0, len0, len0+len1, ...]`.
+
+    Built on CPU and cached on `cu_seqlens`, which a tower builds once per forward and
+    passes to every layer, so only the first layer reads the (device) boundaries back.
+    Keyed on its version, so an in-place repartition rebuilds; an inference tensor has
+    none, and vLLM never repartitions one in place.
+    """
+    key = (seq, None if cu_seqlens.is_inference() else cu_seqlens._version)
+    cached = getattr(cu_seqlens, _CU_MASK_ATTR, None)
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    bounds = convert(cu_seqlens, "cpu").to(torch.int64).tolist()
+    m = torch.zeros(seq, seq, dtype=torch.bool)
+    for start, end in zip(bounds[:-1], bounds[1:]):
+        m[start:end, start:end] = True
+    setattr(cu_seqlens, _CU_MASK_ATTR, (key, m))
+    return m
+
+
 # Attribute under which a source mask caches its padded counterpart `(key, padded)`.
 _MASK_ATTR = "_spyre_padded_mask"
 
@@ -110,13 +134,12 @@ def _padded_attn_mask(
     neg_inf = torch.finfo(dtype).min
     m = torch.zeros(b, 1, seq_pad, seq_pad, dtype=dtype)
     m[:, :, :, seq:] = neg_inf  # padded keys never attended
+    if mask.dtype != torch.bool:
+        raise TypeError(f"an unpadded mask has to be a bool keep-mask, got {mask.dtype}")
     mc = convert(mask, "cpu")
-    if mc.dtype == torch.bool:
-        m[:, :, :seq, :seq] = torch.zeros(seq, seq, dtype=dtype).masked_fill(
-            ~mc.reshape(seq, seq), neg_inf
-        )
-    else:
-        m[:, :, :seq, :seq] = mc.to(dtype).reshape(seq, seq)
+    m[:, :, :seq, :seq] = torch.zeros(seq, seq, dtype=dtype).masked_fill(
+        ~mc.reshape(seq, seq), neg_inf
+    )
 
     m = convert(m, device)
     setattr(mask, _MASK_ATTR, (key, m))

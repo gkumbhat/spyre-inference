@@ -14,9 +14,9 @@
 
 """HF-format Pixtral (Mistral3, `PixtralHFVisionModel`) vision-tower workarounds for Spyre.
 
-Native Mistral-format Pixtral is adapted by `models.pixtral` instead. Until this tower
-moves to `SpyreVisionEncoderMixin` too, it keeps the patches from the shared Pixtral
-module that reach it: the CPU block mask, the default-layout norm and the xformers guard.
+Native Mistral-format Pixtral is adapted by `models.pixtral` instead. The tower's attention
+runs through vLLM's `MMEncoderAttention`, which `custom_ops/vit_attn.py` replaces; what is
+left here is the default-layout norm after the patch conv.
 """
 
 from __future__ import annotations
@@ -28,37 +28,6 @@ from vllm.logger import init_logger
 from spyre_inference.custom_ops.utils import convert
 
 logger = init_logger(__name__)
-
-
-def patch_block_attention_mask() -> None:
-    """Build Pixtral's block-diagonal vision mask on CPU.
-
-    Upstream zeroes one `[start:end, start:end]` sub-block per image on
-    `patch_embeds.device`; with N images those are strided sub-block writes, which are
-    not stick-safe.
-    """
-    try:
-        from transformers.models.pixtral import modeling_pixtral
-    except ImportError:
-        return
-
-    orig = getattr(modeling_pixtral, "generate_block_attention_mask", None)
-    if orig is None or getattr(orig, "_spyre_patched", False):
-        return
-
-    def _cpu_mask(patch_embeds_list, tensor):
-        if tensor.device.type != "spyre":
-            return orig(patch_embeds_list, tensor)
-        # Only `dtype` and the two leading dims are read off `tensor`, so a CPU stand-in
-        # gives an identical mask without a D2H of patch_embeds.
-        stand_in = torch.empty((tensor.shape[0], tensor.shape[1]), dtype=tensor.dtype)
-        return orig(patch_embeds_list, stand_in)
-
-    _cpu_mask._spyre_patched = True
-    # vLLM imports this symbol inside the function body, so patching the module
-    # attribute is picked up at call time.
-    modeling_pixtral.generate_block_attention_mask = _cpu_mask  # ty: ignore[invalid-assignment]
-    logger.info("Spyre: Pixtral block attention mask built on CPU (N-image sub-block writes).")
 
 
 class _DefaultLayoutNorm(nn.Module):
@@ -93,13 +62,4 @@ def patch_pre_transformer_norm(model: nn.Module) -> None:
 def apply(model: torch.nn.Module, device: torch.device) -> None:
     """Install the HF-format Pixtral tower workarounds. `device` is unused; it stays for the
     `apply(model, device)` contract the sibling architecture modules share."""
-    from vllm.model_executor.models import pixtral
-
-    # True whenever xformers merely imports: upstream only disables it on CUDA B200.
-    if getattr(pixtral, "USE_XFORMERS_OPS", False):
-        raise RuntimeError(
-            "xformers is installed; Pixtral on Spyre needs the non-xformers mask path. "
-            "Uninstall xformers in this environment."
-        )
-    patch_block_attention_mask()
     patch_pre_transformer_norm(model)

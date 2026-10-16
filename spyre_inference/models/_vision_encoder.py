@@ -270,6 +270,7 @@ class SpyreVisionEncoderMixin:
         device: torch.device,
         dtype: torch.dtype,
         path: str = "default",
+        axis_keys: tuple | None = None,
     ) -> EncoderCudaGraphCaptureInputs:
         """Padding-filled host buffers at one budget's size, to compile that budget. The manager
         keeps them as staging buffers; only the shape matters."""
@@ -367,10 +368,21 @@ class SpyreVisionEncoderMixin:
         if not tokens:
             return ()
         dest: list[torch.Tensor | None] = [None] * len(tokens)
-        output = self.encoder_eager_forward(kwargs)
-        self.postprocess_encoder_output(
-            {"default": output}, list(range(len(tokens))), tokens, dest, batch_mm_kwargs=kwargs
-        )
+        # The manager caps items per call when compiled; without it the cap applies here.
+        cap = self.vision_max_items_per_call or len(tokens)
+        for start in range(0, len(tokens), cap):
+            indices = list(range(start, min(start + cap, len(tokens))))
+            batch = (
+                kwargs
+                if len(indices) == len(tokens)
+                else self.select_encoder_cudagraph_items(  # ty: ignore[unresolved-attribute]
+                    kwargs, indices
+                )
+            )
+            output = self.encoder_eager_forward(batch)
+            self.postprocess_encoder_output(
+                {"default": output}, indices, tokens, dest, batch_mm_kwargs=batch
+            )
         return tuple(t for t in dest if t is not None)
 
     def embed_input_ids(

@@ -14,23 +14,14 @@
 
 """Tests for `spyre_inference/multimodal/pixtral_hf.py` and its dispatch."""
 
+import inspect
+
 import pytest
 import torch
 
 pixtral = pytest.importorskip("vllm.model_executor.models.pixtral")
-modeling_pixtral = pytest.importorskip("transformers.models.pixtral.modeling_pixtral")
 
 HIDDEN_SIZE = 256
-
-
-@pytest.fixture(autouse=True)
-def restore_block_mask(monkeypatch):
-    """The mask patch mutates the shared transformers module; undo it after each test."""
-    monkeypatch.setattr(
-        modeling_pixtral,
-        "generate_block_attention_mask",
-        modeling_pixtral.generate_block_attention_mask,
-    )
 
 
 class PixtralHFVisionModel(torch.nn.Module):
@@ -53,20 +44,17 @@ def test_hf_tower_is_dispatched_to_its_patches():
 
     model = _model()
     apply_multimodal_patches(model, torch.device("cpu"))
-
     assert isinstance(model.vision_tower.ln_pre, _DefaultLayoutNorm)
-    assert modeling_pixtral.generate_block_attention_mask._spyre_patched is True
 
 
-def test_patches_are_idempotent():
+def test_patch_is_idempotent():
     from spyre_inference.multimodal import pixtral_hf
 
     model = _model()
     pixtral_hf.apply(model, torch.device("cpu"))
-    norm, mask = model.vision_tower.ln_pre, modeling_pixtral.generate_block_attention_mask
+    norm = model.vision_tower.ln_pre
     pixtral_hf.apply(model, torch.device("cpu"))
     assert model.vision_tower.ln_pre is norm
-    assert modeling_pixtral.generate_block_attention_mask is mask
 
 
 def test_pre_transformer_norm_patch_is_transparent_on_cpu():
@@ -79,32 +67,18 @@ def test_pre_transformer_norm_patch_is_transparent_on_cpu():
     torch.testing.assert_close(model.vision_tower.ln_pre(x), expected)
 
 
-@pytest.mark.parametrize("patch_embeds_list", [[16], [16, 16], [9, 16, 25]])
-def test_cpu_block_mask_matches_upstream(patch_embeds_list):
-    """A CPU tensor takes the pass-through branch; the device branch only swaps in a CPU
-    stand-in of the same shape and dtype."""
-    from spyre_inference.multimodal.pixtral_hf import patch_block_attention_mask
-
-    seq = sum(patch_embeds_list)
-    embeds = torch.zeros(1, seq, 8, dtype=torch.float16)
-    want = modeling_pixtral.generate_block_attention_mask(patch_embeds_list, embeds)
-    patch_block_attention_mask()
-    got = modeling_pixtral.generate_block_attention_mask(patch_embeds_list, embeds)
-    assert torch.equal(got, want)
-
-
-def test_apply_rejects_an_xformers_install(monkeypatch):
-    """With xformers importable, upstream hands the tower a `BlockDiagonalMask` and the
-    mask patch silently stops applying; fail at patch time, not inside the SDPA."""
-    from spyre_inference.multimodal import pixtral_hf
-
-    monkeypatch.setattr(pixtral, "USE_XFORMERS_OPS", True, raising=False)
-    with pytest.raises(RuntimeError, match="xformers"):
-        pixtral_hf.apply(_model(), torch.device("cpu"))
+def test_hf_tower_attention_goes_through_mm_encoder_attention():
+    """The tower's mask and attention live in `MMEncoderAttention`, which Spyre replaces out
+    of tree, so nothing here patches them; if upstream builds its own mask again, it needs a
+    Spyre path."""
+    source = inspect.getsource(pixtral)
+    assert "generate_block_attention_mask" not in source
+    assert "self.attn = MMEncoderAttention(" in inspect.getsource(pixtral.PixtralHFAttention)
+    assert "ln_pre" in inspect.getsource(pixtral.PixtralHFVisionModel)
 
 
 def test_native_pixtral_is_not_patched():
-    """The mixin model adapts its own tower; the shared transformers mask stays upstream's."""
+    """The mixin model adapts its own tower."""
     from spyre_inference.models._vision_encoder import SpyreVisionEncoderMixin
     from spyre_inference.multimodal import apply_multimodal_patches
 
@@ -113,6 +87,6 @@ def test_native_pixtral_is_not_patched():
 
     model = _Native()
     model.vision_tower = PixtralHFVisionModel()
-    orig = modeling_pixtral.generate_block_attention_mask
+    norm = model.vision_tower.ln_pre
     apply_multimodal_patches(model, torch.device("cpu"))
-    assert modeling_pixtral.generate_block_attention_mask is orig
+    assert model.vision_tower.ln_pre is norm

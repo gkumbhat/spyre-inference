@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import bisect
 import time
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Any, cast
 
 import numpy as np
@@ -194,17 +194,73 @@ def _compute_slot_mapping_impl(
         slot_mapping[num_tokens:max_num_tokens] = PAD_ID
 
 
-class _FuncWrapper:
-    """Mimics Triton's grid-launch syntax: kernel[(grid,)](...) → kernel(...)."""
+class _SlotMappingKernelShim:
+    """Drop-in for vLLM's Triton ``ComputeSlotMappingKernel``, which Spyre cannot run:
+    calls go to the pure-PyTorch impl and warmup registration is a no-op."""
 
-    def __init__(self, func):
-        self.func = func
+    def __call__(
+        self,
+        num_reqs: int,
+        num_tokens: int,
+        max_num_tokens: int,
+        query_start_loc: torch.Tensor,
+        positions: torch.Tensor,
+        block_table: torch.Tensor,
+        block_table_stride: int,
+        block_size: int,
+        slot_mapping: torch.Tensor,
+        KV_CACHE_BLOCK_SIZE: int | None = None,
+        BLOCKS_PER_KV_BLOCK: int = 1,
+        TOTAL_CP_WORLD_SIZE: int = 1,
+        TOTAL_CP_RANK: int = 0,
+        CP_KV_CACHE_INTERLEAVE_SIZE: int = 1,
+    ) -> None:
+        _compute_slot_mapping_impl(
+            num_tokens,
+            max_num_tokens,
+            query_start_loc,
+            positions,
+            block_table,
+            block_table_stride,
+            block_size,
+            slot_mapping,
+            KV_CACHE_BLOCK_SIZE=KV_CACHE_BLOCK_SIZE,
+            BLOCKS_PER_KV_BLOCK=BLOCKS_PER_KV_BLOCK,
+            TOTAL_CP_WORLD_SIZE=TOTAL_CP_WORLD_SIZE,
+            TOTAL_CP_RANK=TOTAL_CP_RANK,
+            CP_KV_CACHE_INTERLEAVE_SIZE=CP_KV_CACHE_INTERLEAVE_SIZE,
+        )
 
-    def __getitem__(self, grid):
-        return self.func
+    def register_warmup(self, *args, **kwargs) -> None:
+        pass
 
 
-_compute_slot_mapping_kernel = _FuncWrapper(_compute_slot_mapping_impl)
+_compute_slot_mapping_kernel = _SlotMappingKernelShim()
+
+# The module attribute in vllm.v1.worker.block_table that both launches the
+# slot-mapping kernel and receives its warmup registration.
+_SLOT_MAPPING_KERNEL_ATTR = "_COMPUTE_SLOT_MAPPING_KERNEL"
+
+
+def _patch_compute_slot_mapping() -> None:
+    """Swap vLLM's slot-mapping kernel instance for our shim before any BlockTable exists.
+
+    The attribute is checked first: vLLM has moved this kernel before, and assigning a
+    name nothing reads would leave the Triton placeholder in place until the first
+    decode step.
+    """
+    from vllm.v1.worker import block_table
+
+    if not hasattr(block_table, _SLOT_MAPPING_KERNEL_ATTR):
+        raise RuntimeError(
+            f"Cannot find vLLM's slot-mapping kernel to patch: "
+            f"block_table.{_SLOT_MAPPING_KERNEL_ATTR} does not exist. vLLM has moved it; "
+            f"update _SlotMappingKernelShim and _patch_compute_slot_mapping for the "
+            f"new launch site. Leaving the patch unapplied would defer the failure to "
+            f"the first decode step."
+        )
+
+    setattr(block_table, _SLOT_MAPPING_KERNEL_ATTR, _compute_slot_mapping_kernel)
 
 
 class SpyreCpuGpuBuffer(CpuGpuBuffer):
@@ -291,7 +347,6 @@ def _block_sharing_defeated_by() -> str | None:
     return None
 
 
-## TODO: Remove this function when upgrading to vLLM 0.30.0
 def _is_decoder_attention_like(module: nn.Module) -> bool:
     """Return whether a module participates in decoder KV-cache attention.
 
@@ -299,6 +354,8 @@ def _is_decoder_attention_like(module: nn.Module) -> bool:
     instead retains an HF dispatcher with a ``layer_idx`` and the text config's
     ``_attn_implementation`` set to ``vllm``. Those are the interface
     contract, unlike the module's class name, and do not match vision encoders.
+    The backend also attaches its vLLM layer as ``.attn``, but for an MLA model that
+    is an ``MLAAttention``, which is not an ``Attention``, so the check stays.
     """
     if isinstance(module, Attention):
         return True
@@ -650,13 +707,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # GPUModelRunner uses @triton.jit which is mocked on non-GPU platforms.
         # The upstream CPU backend uses a C++ kernel (torch.ops._C) as its
         # fallback, but we don't have _C.abi3.so with VLLM_TARGET_DEVICE=empty.
-        from vllm.v1.worker import block_table
-
-        # Deliberately swap the Triton JITFunction for the grid-launch-compatible
-        # _FuncWrapper; the type mismatch is the point of the patch.
-        block_table._compute_slot_mapping_kernel = (  # ty: ignore[invalid-assignment]
-            _compute_slot_mapping_kernel
-        )
+        _patch_compute_slot_mapping()
 
     def load_model(self, load_dummy_weights: bool = False) -> None:
         """Load weights on CPU, move Spyre layers to device, compile, and wrap."""
@@ -1057,8 +1108,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             return
         model = cast(_SpyreModelWrapper, self.model)
         # int32 to match upstream's `input_ids` buffer; 0 is an id every vocab holds.
-        input_ids = torch.zeros(num_tokens, dtype=torch.int32)
-        model.embed_input_ids(input_ids)
+        model.embed_input_ids(torch.zeros(num_tokens, dtype=torch.int32))
         logger.info_once("Warming the input embedding through embed_input_ids.")
 
     @torch.inference_mode()
@@ -1840,13 +1890,21 @@ class TorchSpyreModelRunner(GPUModelRunner):
         dtype = self.model_config.dtype
         return dtype if isinstance(dtype, torch.dtype) else torch.float16
 
-    def initialize_kv_cache_tensors(self, kv_cache_config, kernel_block_sizes):
+    def initialize_kv_cache_tensors(
+        self,
+        kv_cache_config,
+        kernel_block_sizes,
+        kv_cache_allocation_context: AbstractContextManager | None = None,
+    ):
         """Allocate KV cache as one dense paged tensor per layer on Spyre.
 
         Each layer gets its own SpyrePagedKVCache(k_pages, v_pages), in the shape and
         device layout its attention impl's `allocate_pages` chooses. The attention kernel
         selects a page by indexing with a one-element device tensor, so the page read is
         a real indirect access.
+
+        ``kernel_block_sizes`` is ignored: the backend accepts any 64-multiple, so the
+        kernel block size always equals the manager's.
         """
         from vllm.v1.worker.utils import bind_kv_cache
 
@@ -1869,18 +1927,22 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # SpyrePagedKVCache — see the suppression on `bind_kv_cache(...)` below.
         kv_caches: dict[str, SpyrePagedKVCache] = {}
 
-        for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-            # All layers in `shared_by` use the same spec by construction.
-            spec = spec_by_layer[kv_cache_tensor.shared_by[0]]
-            num_blocks = kv_cache_tensor.size // spec.page_size_bytes
-
-            # The layout belongs to the backend; a layer without an impl (fixture
-            # stubs) gets the token-major default.
-            impl = getattr(static_ctx.get(kv_cache_tensor.shared_by[0]), "impl", None)
-            impl_cls = type(impl) if isinstance(impl, SpyreAttentionImpl) else SpyreAttentionImpl
-            page_cache = impl_cls.allocate_pages(num_blocks, spec, self._spyre_device)
-            for layer_name in kv_cache_tensor.shared_by:
-                kv_caches[layer_name] = page_cache
+        with kv_cache_allocation_context or nullcontext():
+            # A KVCacheTensor lists several layers; sharing one page buffer among them
+            # would let each layer's KV write clobber the others'.
+            num_blocks = kv_cache_config.num_blocks
+            for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
+                for layer_name in kv_cache_tensor.layers:
+                    spec = spec_by_layer[layer_name]
+                    # The layout belongs to the backend; a layer without an impl (fixture
+                    # stubs) gets the token-major default.
+                    impl = getattr(static_ctx.get(layer_name), "impl", None)
+                    impl_cls = (
+                        type(impl) if isinstance(impl, SpyreAttentionImpl) else SpyreAttentionImpl
+                    )
+                    kv_caches[layer_name] = impl_cls.allocate_pages(
+                        num_blocks, spec, self._spyre_device
+                    )
 
         for layer_name, target in self.shared_kv_cache_layers.items():
             kv_caches[layer_name] = kv_caches[target]
@@ -1905,9 +1967,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # (and any other non_blocking copies) before the runner consumes
         # Spyre tensors. torch.spyre is registered by torch-spyre autoload.
         torch.spyre.synchronize(self._spyre_device)
-
-    def get_dp_padding(self, num_tokens: int) -> tuple[int, torch.Tensor | None]:
-        return 0, None
 
     def get_model(self) -> nn.Module:
         # Return the unwrapped model for isinstance checks

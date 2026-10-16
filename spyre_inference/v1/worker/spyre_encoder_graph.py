@@ -51,6 +51,9 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
         model: SpyreVisionEncoderMixin,
     ) -> None:
         super().__init__(vllm_config, device, dtype, cast("SupportsEncoderCudaGraph", model))
+        # One graph set per budget: upstream's extra capture axes are not supported.
+        if self._capture_axes:
+            raise NotImplementedError("encoder capture_axes are not supported on Spyre.")
         # Tensor parallelism only: the encoder runs on the decoder's ranks.
         if self.use_dp:
             raise NotImplementedError(
@@ -83,7 +86,9 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
             )
         self._staging: dict[str, dict[int, dict[str, torch.Tensor]]] = {}
 
-    def _capture_budget_graph(self, token_budget: int, path: str = "default") -> None:
+    def _capture_budget_graph(
+        self, token_budget: int, path: str = "default", axis_keys: tuple = ()
+    ) -> None:
         """Compile the encoder at this budget, keeping its host buffers for replay."""
         values = self.model.prepare_encoder_cudagraph_capture_inputs(
             token_budget,
@@ -104,6 +109,7 @@ class SpyreEncoderGraphManager(EncoderCudaGraphManager):
         mm_kwargs: dict[str, Any],
         token_budget: int,
         path: str = "default",
+        axis_keys: tuple = (),
     ) -> torch.Tensor | None:
         """Run one packed batch through the budget's compiled graphs; ``None`` if uncompiled."""
         staging = self._staging.get(path, {}).get(token_budget)

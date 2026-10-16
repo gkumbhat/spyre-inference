@@ -50,6 +50,7 @@ class SpyreBucketManager(ModelCudaGraphManager):
         uniform_token_count: int | None,
         num_active_loras: int,
         max_query_len: int | None = None,
+        num_ubatches: int = 1,
     ) -> BatchExecutionDescriptor:
         return BatchExecutionDescriptor(
             cg_mode=CUDAGraphMode.NONE,

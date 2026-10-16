@@ -114,10 +114,11 @@ def _spyre_model(args, dtype=torch.float16):
     model.config = SimpleNamespace(text_config=SimpleNamespace(hidden_size=args.hidden_size))
     for name, mod in _upstream_modules(args).items():
         setattr(model, name, mod)
-    attn_state = [layer.attention.state_dict() for layer in model.vision_encoder.transformer.layers]
+    # The Spyre blocks replace upstream's whole, so they get the same seeded weights back.
+    states = [layer.state_dict() for layer in model.vision_encoder.transformer.layers]
     model._init_spyre_vision(prefix="")
-    for layer, state in zip(model.vision_encoder.transformer.layers, attn_state, strict=True):
-        layer.attention.load_state_dict(state)
+    for layer, state in zip(model.vision_encoder.transformer.layers, states, strict=True):
+        layer.load_state_dict(state)
     # The loader's finish steps, in its order: per-layer first, then the model hook.
     _finish_weight_loading(model)
     model.process_weights_after_loading()
@@ -210,10 +211,16 @@ def test_rope_tables_match_upstream_complex_rope():
 
 
 def test_upstream_tower_contract_is_unchanged():
-    """``SpyrePixtralAttention`` keeps upstream's call contract; diff it on a vLLM bump."""
-    params = list(inspect.signature(pixtral.Attention.forward).parameters)
-    assert params == ["self", "x", "mask", "freqs_cis"]
-    assert "mask=mask, freqs_cis=freqs_cis" in inspect.getsource(pixtral.TransformerBlock.forward)
+    """What the Spyre blocks still take from upstream's: the constructors, the submodules the
+    residual path calls and the attention's projections. Diff it on a vLLM bump."""
+    for cls in (pixtral.TransformerBlock, pixtral.Attention):
+        params = list(inspect.signature(cls.__init__).parameters)
+        assert params == ["self", "args", "quant_config", "prefix", "disable_tp"], cls
+    block = pixtral.TransformerBlock(_args(), disable_tp=True)
+    for name in ("attention", "attention_norm", "feed_forward", "ffn_norm"):
+        assert hasattr(block, name), f"upstream TransformerBlock no longer has {name}"
+    for name in ("qkv_proj", "o_proj", "n_heads", "head_dim"):
+        assert hasattr(block.attention, name), f"upstream Attention no longer has {name}"
     init_src = inspect.getsource(pixtral.PixtralForConditionalGeneration.__init__)
     for name in (
         "vision_encoder",

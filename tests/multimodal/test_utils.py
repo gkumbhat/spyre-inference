@@ -184,7 +184,8 @@ def test_padded_mask_is_released_with_its_source_mask():
 
 @pytest.mark.parametrize("seq,seq_pad", [(64, 64), (67, 128)])
 def test_padded_keys_are_masked_off(seq, seq_pad):
-    source = torch.zeros(seq, seq, dtype=torch.float16)
+    """A full-attention bool keep-mask adds no masking: only the padded keys are cut."""
+    source = torch.ones(seq, seq, dtype=torch.bool)
     m = utils._padded_attn_mask(source, 1, seq, seq_pad, torch.float16, torch.device("cpu"))
     assert m.shape == (1, 1, seq_pad, seq_pad)
     assert (m[:, :, :, seq:] == torch.finfo(torch.float16).min).all()
@@ -199,3 +200,103 @@ def test_padded_sdpa_refuses_a_padded_mask_at_another_dtype():
 
     with pytest.raises(TypeError, match="float32"):
         padded_sdpa(q, k, v, mask)
+
+
+def test_padded_sdpa_refuses_an_unpadded_float_mask():
+    """Every caller passes a bool keep-mask or an additive mask already padded to the
+    stick; an unpadded float mask is the ambiguous case and has to say so."""
+    q, k, v = (torch.randn(2, 2, 50, 64, dtype=torch.float16) for _ in range(3))
+
+    with pytest.raises(TypeError, match="bool keep-mask"):
+        padded_sdpa(q, k, v, torch.zeros(50, 50, dtype=torch.float16))
+
+
+# ---------------------------------------------------------------------------
+# Block-diagonal mask from packed boundaries
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "patch_embeds_list",
+    [
+        [16],  # one image: the whole mask is one block
+        [16, 16],  # two images
+        [9, 16, 25],  # three unequal images
+    ],
+)
+def test_block_diagonal_mask_matches_upstream_blocks(patch_embeds_list):
+    """The block-diagonal mask rebuilt from `cu_seqlens` must match the per-image
+    blocks of transformers' `generate_block_attention_mask`."""
+    from spyre_inference.multimodal.utils import block_diagonal_mask
+
+    seq = sum(patch_embeds_list)
+    cu_seqlens = torch.tensor([0, *torch.tensor(patch_embeds_list).cumsum(0).tolist()])
+
+    got = block_diagonal_mask(cu_seqlens, seq)
+
+    want = torch.zeros(seq, seq, dtype=torch.bool)
+    start = 0
+    for length in patch_embeds_list:
+        want[start : start + length, start : start + length] = True
+        start += length
+
+    assert got.dtype == torch.bool, "padded_sdpa's mask contract is a bool keep-mask"
+    assert got.device.type == "cpu", "built on CPU: strided sub-block writes are not stick-safe"
+    assert torch.equal(got, want)
+
+
+def test_block_diagonal_mask_blocks_cross_image_attention():
+    """Two images must not attend to each other: the off-diagonal blocks stay False."""
+    from spyre_inference.multimodal.utils import block_diagonal_mask
+
+    mask = block_diagonal_mask(torch.tensor([0, 16, 32]), 32)
+
+    assert mask[:16, :16].all()
+    assert mask[16:, 16:].all()
+    assert not mask[:16, 16:].any()
+    assert not mask[16:, :16].any()
+
+
+def test_block_diagonal_mask_is_cached_on_cu_seqlens():
+    """The tower reuses one `cu_seqlens` across every layer; the O(L²) mask must be
+    built once, so that each layer then hits the padded-mask cache too."""
+    from spyre_inference.multimodal.utils import block_diagonal_mask
+
+    cu_seqlens = torch.tensor([0, 16, 32])
+
+    first = block_diagonal_mask(cu_seqlens, 32)
+    assert all(block_diagonal_mask(cu_seqlens, 32) is first for _ in range(23))
+
+
+def test_block_diagonal_mask_follows_a_new_partition():
+    """`[0, 16, 32]` (two images) and `[0, 32]` (one) share a token count. vLLM builds
+    a fresh `cu_seqlens` per tower forward, so each gets its own mask."""
+    from spyre_inference.multimodal.utils import block_diagonal_mask
+
+    assert not block_diagonal_mask(torch.tensor([0, 16, 32]), 32)[0, 16]
+    assert block_diagonal_mask(torch.tensor([0, 32]), 32).all()
+
+
+def test_block_diagonal_mask_rebuilds_after_an_in_place_repartition():
+    """A tensor that tracks versions is re-read once it changes in place."""
+    from spyre_inference.multimodal.utils import block_diagonal_mask
+
+    with torch.inference_mode(False):
+        cu_seqlens = torch.tensor([0, 16, 32])
+        assert not block_diagonal_mask(cu_seqlens, 32)[0, 16]
+        cu_seqlens[:] = torch.tensor([0, 32, 32])
+        assert block_diagonal_mask(cu_seqlens, 32).all(), "stale mask after a repartition"
+
+
+def test_block_diagonal_mask_cache_hit_reads_no_boundaries(monkeypatch):
+    """`cu_seqlens` lives on the card, so only the first layer may copy it to the host."""
+    from spyre_inference.multimodal import utils
+
+    with torch.inference_mode():  # as vLLM builds it: no version counter to key on
+        cu_seqlens = torch.tensor([0, 16, 32])
+    utils.block_diagonal_mask(cu_seqlens, 32)
+    reads = []
+    monkeypatch.setattr(utils, "convert", lambda *a, **k: reads.append(a) or a[0])
+    for _ in range(23):
+        utils.block_diagonal_mask(cu_seqlens, 32)
+    assert not reads

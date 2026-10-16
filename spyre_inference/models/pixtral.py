@@ -17,7 +17,8 @@
 ``SpyrePixtralForConditionalGeneration`` keeps upstream's processor, weight loading and
 decoder, and adds the ``SpyreVisionEncoderMixin`` hooks:
 
-- attention: ``SpyrePixtralAttention``, with RoPE as a matmul and the stick-aligned SDPA;
+- blocks: ``SpyrePixtralTransformerBlock``, whose attention does RoPE as a matmul and the
+  stick-aligned SDPA;
 - inputs: patches laid out offset-major on the host, with each patch's image and position;
 - RoPE: cos and sin gathered on the card by position, from a ``GatherTable``;
 - patch embedding: the conv folded into a linear at load time;
@@ -98,6 +99,29 @@ class SpyrePixtralAttention(pixtral.Attention):
         return out
 
 
+class SpyrePixtralTransformerBlock(pixtral.TransformerBlock):
+    """Upstream's block with ``SpyrePixtralAttention``, called as ``(x, mask, freqs_cis)``.
+
+    Its own forward, since upstream's passes packed sequence lengths where these blocks take
+    the same-image mask built once per encoder call in ``vision_embed``.
+    """
+
+    def __init__(self, args, prefix: str = "", disable_tp: bool = False) -> None:
+        super().__init__(args, prefix=prefix, disable_tp=disable_tp)
+        self.attention = SpyrePixtralAttention(
+            args, prefix=f"{prefix}.attention", disable_tp=disable_tp
+        )
+
+    def forward(  # ty: ignore[invalid-method-override]
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor,
+        freqs_cis: tuple[torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        h = x + self.attention(self.attention_norm(x), mask, freqs_cis)
+        return h + self.feed_forward(self.ffn_norm(h))
+
+
 def pixtral_rope_tables(
     head_dim: int, max_side: int, theta: float
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -152,7 +176,7 @@ class SpyrePixtralForConditionalGeneration(
         self._init_spyre_vision(prefix)
 
     def _init_spyre_vision(self, prefix: str) -> None:
-        """Set the mixin's attributes and swap in Spyre attention. Separate from ``__init__``
+        """Set the mixin's attributes and swap in the Spyre blocks. Separate from ``__init__``
         so tests can run it on upstream modules without a full ``VllmConfig``."""
         args = self.vision_args
         self._merge = args.spatial_merge_size if self.patch_merger is not None else 1
@@ -174,10 +198,11 @@ class SpyrePixtralForConditionalGeneration(
         # With an image limit of 0, upstream leaves a placeholder instead of the tower.
         if not isinstance(self.vision_encoder, pixtral.VisionTransformer):
             return
-        for i, layer in enumerate(self.vision_encoder.transformer.layers):
-            layer.attention = SpyrePixtralAttention(
+        layers = self.vision_encoder.transformer.layers
+        for i in range(len(layers)):
+            layers[i] = SpyrePixtralTransformerBlock(
                 args,
-                prefix=maybe_prefix(prefix, f"vision_encoder.transformer.layers.{i}.attention"),
+                prefix=maybe_prefix(prefix, f"vision_encoder.transformer.layers.{i}"),
                 disable_tp=is_vit_use_data_parallel(),
             )
 
@@ -250,7 +275,7 @@ class SpyrePixtralForConditionalGeneration(
         patch_weight_t = cast(torch.Tensor, tower.patch_conv.weight)
         x = tower.ln_pre(torch.matmul(values["patches"], patch_weight_t).unsqueeze(0))
         # Same-image mask as a matmul: Spyre cannot lay out a column-minus-row broadcast.
-        segments = values["segments"]
+        segments = values["segments"].to(x.dtype)
         mask = ((1.0 - torch.matmul(segments, segments.t())) * _MASK_MIN)[None, None]
         rope = self.spyre_rope_table.gather(values["positions"])
         freqs_cis = (rope[:, : self._head_dim], rope[:, self._head_dim :])
