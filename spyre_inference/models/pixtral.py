@@ -48,7 +48,7 @@ from spyre_inference.multimodal.utils import (
     STICK,
     align_up,
     padded_sdpa,
-    pair_swap_matrix,
+    rope_perm_matrix,
     rope_rotate_matmul,
 )
 
@@ -71,7 +71,11 @@ class SpyrePixtralAttention(pixtral.Attention):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        self.register_buffer("rope_perm", pair_swap_matrix(self.head_dim), persistent=False)
+        self.register_buffer(
+            "rope_perm",
+            rope_perm_matrix("pair", self.head_dim, torch.device("cpu")),
+            persistent=False,
+        )
 
     def forward(  # ty: ignore[invalid-method-override]
         self,

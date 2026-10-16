@@ -192,7 +192,7 @@ def test_offset_major_merge_matches_upstream_merger(tp_group):
 
 def test_rope_tables_match_upstream_complex_rope():
     from spyre_inference.models.pixtral import pixtral_rope_tables
-    from spyre_inference.multimodal.utils import pair_swap_matrix, rope_rotate_matmul
+    from spyre_inference.multimodal.utils import rope_perm_matrix, rope_rotate_matmul
 
     head_dim, side = 64, 16
     cos, sin = pixtral_rope_tables(head_dim, side, 10000.0)
@@ -203,7 +203,7 @@ def test_rope_tables_match_upstream_complex_rope():
     want_q, want_k = pixtral.apply_rotary_emb_vit(q, k, freqs_cis=freqs)
 
     flat = rows * side + cols
-    perm = pair_swap_matrix(head_dim).float()
+    perm = rope_perm_matrix("pair", head_dim, torch.device("cpu")).float()
     c, s = cos[flat][None, :, None], sin[flat][None, :, None]
     torch.testing.assert_close(rope_rotate_matmul(q, c, s, perm), want_q, atol=1e-5, rtol=1e-5)
     torch.testing.assert_close(rope_rotate_matmul(k, c, s, perm), want_k, atol=1e-5, rtol=1e-5)

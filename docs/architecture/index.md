@@ -246,7 +246,15 @@ every image-batch width up to `mm_max_items_per_batch`, for pooling and generati
 alike, and the compile guard watches its blocks like the decoder's: a tower compile after
 warmup is a shape warmup missed. A tower whose per-image shape varies beyond the batch
 width (a patch budget, an aspect ratio) has to make that shape enumerable before it is
-marked.
+marked. Gemma 4's tower is marked too (`multimodal/gemma4_vision.py`): its rope half-swap
+is a buffer, and its key-pad mask is one row per image built in the encoder forward from
+the image's patch count, since the processor pads an image's patches after its content.
+Every image is padded to the patch count `max_soft_tokens` fixes, so the image-batch widths
+warmup runs are the shapes image serving sees. Not covered: a per-request `max_soft_tokens`
+(vLLM accepts one per prompt), and a video, whose frames reach the tower in memory-sized
+chunks at their own budget; those compile on first use and the guard reports them at its
+default `warn` level. At `error` the guard refuses them like any other unwarmed watched
+shape, so a deployment serving video keeps `warn`.
 
 Blocks of one class share one `forward` code object, so Dynamo traces the first and the
 rest reuse that entry; whatever it re-traces hits the Inductor FX graph cache. The
@@ -511,10 +519,11 @@ exactly the extents a request can be assigned):
    offsets are data. A group wider than the widest declared width is chunked into
    descending powers of two, so every dispatch lands on a warmed pair.
 
-The runner picks between them once per step in `_build_attention_metadata` and records the
-choice as the *type* of `attn_metadata.encoder_plan` (`EncoderRectPlan` versus a list of
-`EncoderGroupPlan`). It has to run there rather than in `forward`: the builder does a D2H
-read and H2D conversions, which inside a traced region become graph nodes.
+The runner picks between them once per step in `_build_attention_metadata`, through
+`plan_encoder_step`, and records the choice as the *type* of `attn_metadata.encoder_plan`
+(`EncoderRectPlan` versus a list of `EncoderGroupPlan`). It has to run there rather than
+in `forward`: the builder does a D2H read and H2D conversions, which inside a traced
+region become graph nodes.
 
 The ragged path always stays behind the opaque `unified_attention_with_output`: it
 dispatches once per group, so tracing it in would make the block graph's structure depend on

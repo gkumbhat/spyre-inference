@@ -108,7 +108,7 @@ def test_pair_matrix_equals_pair_swap(head_dim):
     """`x @ M_pair` swaps each `(2k, 2k+1)` pair; the sign lives in the sin table."""
     torch.manual_seed(1)
     x = torch.randn(2, 7, head_dim, dtype=torch.float16)
-    m = utils.pair_swap_matrix(head_dim)
+    m = utils.rope_perm_matrix("pair", head_dim, torch.device("cpu"))
     assert m.shape == (head_dim, head_dim) and m.device.type == "cpu"
     torch.testing.assert_close(torch.matmul(x, m), _reference_pair_swap(x))
 
@@ -120,7 +120,7 @@ def test_rope_rotate_matmul_matches_rotation_formula(head_dim):
     x = torch.randn(1, 4, 11, head_dim, dtype=torch.float16)
     angles = torch.randn(11, head_dim, dtype=torch.float16)
     cos, sin = angles.cos()[None, None], angles.sin()[None, None]
-    m = utils.pair_swap_matrix(head_dim)
+    m = utils.rope_perm_matrix("pair", head_dim, torch.device("cpu"))
     expected = x * cos + _reference_pair_swap(x) * sin
     torch.testing.assert_close(utils.rope_rotate_matmul(x, cos, sin, m), expected)
 
@@ -137,7 +137,7 @@ def test_rope_rotate_matmul_matches_cpu_on_spyre(num_patches):
     x = torch.randn(1, 4, num_patches, 64, dtype=torch.float16)
     angles = torch.randn(num_patches, 64, dtype=torch.float16)
     cos, sin = angles.cos()[None, None], angles.sin()[None, None]
-    m = utils.pair_swap_matrix(64)
+    m = utils.rope_perm_matrix("pair", 64, torch.device("cpu"))
     expected = utils.rope_rotate_matmul(x, cos, sin, m)
 
     device = torch.device("spyre")
@@ -189,3 +189,13 @@ def test_padded_keys_are_masked_off(seq, seq_pad):
     assert m.shape == (1, 1, seq_pad, seq_pad)
     assert (m[:, :, :, seq:] == torch.finfo(torch.float16).min).all()
     assert (m[:, :, :, :seq] == 0).all()
+
+
+def test_padded_sdpa_refuses_a_padded_mask_at_another_dtype():
+    """A mask already padded to `seq_pad` keys is used as is, so a dtype miss has to say
+    so instead of reaching `_padded_attn_mask`, which would reshape it to `[seq, seq]`."""
+    q, k, v = (torch.randn(2, 2, 50, 64, dtype=torch.float16) for _ in range(3))
+    mask = torch.zeros(2, 1, 1, 64, dtype=torch.float32)
+
+    with pytest.raises(TypeError, match="float32"):
+        padded_sdpa(q, k, v, mask)
