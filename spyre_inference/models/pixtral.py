@@ -32,6 +32,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from vllm.model_executor.models import pixtral
 from vllm.model_executor.models.utils import maybe_prefix
@@ -53,7 +54,6 @@ from spyre_inference.multimodal.utils import (
 )
 
 if TYPE_CHECKING:
-    from torch import nn
     from vllm.config import VllmConfig
 
 # Half of fp16's most negative value: a full `finfo.min` saturates to -inf and NaNs SDPA.
@@ -182,19 +182,22 @@ class SpyrePixtralForConditionalGeneration(
             )
 
     def process_weights_after_loading(self) -> None:
-        """Reshape the patch-conv and merging weights for the vision graphs. Runs on the host,
-        before the runner moves the model to the card."""
+        """Reshape the patch-conv and merging weights for the vision graphs, in place, as the
+        Spyre linears do, so one copy of each reaches the card. Runs on the host, before the
+        runner moves the model to the card."""
         if not isinstance(self.vision_encoder, pixtral.VisionTransformer):
             return
         tower = self.vision_encoder
         weight = tower.patch_conv.weight.detach().flatten(1)
         weight_t = F.pad(weight, (0, self._patch_width - weight.shape[1])).t().contiguous()
-        tower.register_buffer("spyre_patch_weight_t", weight_t, persistent=False)
+        # A plain holder, not the conv layer: nothing runs the conv, so the runner must not
+        # place a tiled conv copy of the weight on the card as well.
+        tower.patch_conv = nn.Module()
+        tower.patch_conv.weight = nn.Parameter(weight_t, requires_grad=False)
         if self.patch_merger is not None:
-            merge_weight = offset_major_merge_weight(
-                _linear_weight(self.patch_merger.merging_layer), self._merge
-            )
-            self.patch_merger.register_buffer("spyre_merge_weight", merge_weight, persistent=False)
+            layer = self.patch_merger.merging_layer
+            merge_weight = offset_major_merge_weight(_linear_weight(layer), self._merge)
+            layer.weight = nn.Parameter(merge_weight, requires_grad=False)
 
     # --- protocol methods upstream Pixtral does not provide ---
 
@@ -243,7 +246,8 @@ class SpyrePixtralForConditionalGeneration(
 
     def vision_embed(self, values: dict[str, torch.Tensor]) -> tuple[torch.Tensor, dict[str, Any]]:
         tower = self.vision_encoder
-        patch_weight_t = cast(torch.Tensor, tower.spyre_patch_weight_t)
+        # [patch width, D] since process_weights_after_loading.
+        patch_weight_t = cast(torch.Tensor, tower.patch_conv.weight)
         x = tower.ln_pre(torch.matmul(values["patches"], patch_weight_t).unsqueeze(0))
         # Same-image mask as a matmul: Spyre cannot lay out a column-minus-row broadcast.
         segments = values["segments"]
@@ -262,6 +266,7 @@ class SpyrePixtralForConditionalGeneration(
         if self.patch_merger is not None:
             # One [tokens, D] group per merge offset, each with its slice of the weight.
             x = x.reshape(self.patches_per_token, -1, x.shape[-1])
-            merge_weight = cast(torch.Tensor, self.patch_merger.spyre_merge_weight)
+            # [merge**2, D, D_out] since process_weights_after_loading.
+            merge_weight = cast(torch.Tensor, self.patch_merger.merging_layer.weight)
             x = torch.matmul(x, merge_weight).sum(dim=0)
         return self.vision_language_adapter(x)

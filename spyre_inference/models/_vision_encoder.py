@@ -401,6 +401,8 @@ class SpyreVisionEncoderMixin:
                 f"Attempted to assign {expr} = {rows.shape[0]} multimodal tokens to "
                 f"{int(mask.sum())} placeholders"
             )
+        # TODO(#1278): keep the image tokens on the card and gather them there, instead of
+        # placing the whole bucket's [T, H] on the host and uploading it every image step.
         image = torch.zeros(text.shape, dtype=text.dtype)
         image[mask] = rows.to(text.dtype)
         merge = getattr(self, "_spyre_vision_merge", self.vision_merge)

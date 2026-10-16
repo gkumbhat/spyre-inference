@@ -249,6 +249,21 @@ def test_construction_reaches_upstream_init_and_protocol():
     assert supports_encoder_cudagraph(SpyrePixtralForConditionalGeneration)
 
 
+def test_loaded_vision_weights_are_reshaped_in_place(tp_group):
+    """The patch-conv and merging weights become the graphs' layouts under their own names,
+    so one copy of each reaches the card."""
+    args = _args()
+    model = _spyre_model(args)
+    tower, merger = model.vision_encoder, model.patch_merger
+    from spyre_inference.custom_ops.conv import SpyreConv2d
+
+    assert not isinstance(tower.patch_conv, SpyreConv2d), "the runner would tile a conv copy"
+    assert tower.patch_conv.weight.shape == (model._patch_width, args.hidden_size)
+    assert merger.merging_layer.weight.shape == (MERGE**2, args.hidden_size, args.hidden_size)
+    names = {name for name, _ in model.named_parameters()} | {n for n, _ in model.named_buffers()}
+    assert not any("spyre_patch_weight" in n or "spyre_merge_weight" in n for n in names)
+
+
 @pytest.mark.skipif(not spyre_available(), reason="Spyre device not available")
 def test_pipeline_matches_upstream_on_spyre(tp_group):
     """Same comparison with the encoder on the card, uncompiled (the eager path)."""
