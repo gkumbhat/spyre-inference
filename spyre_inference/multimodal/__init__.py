@@ -28,7 +28,6 @@ from . import (
     clip,
     gemma4_vision,
     granite4_vision,
-    pixtral_hf,
     siglip,
 )
 
@@ -69,9 +68,6 @@ def apply_multimodal_patches(model: torch.nn.Module, device: torch.device) -> No
             siglip.apply(model, device)
             granite4_vision.apply(model, device)
             blip2.apply(model, device)
-        elif tower_cls == "PixtralHFVisionModel":
-            # HF-format Mistral3; native Pixtral is a SpyreVisionEncoderMixin model.
-            pixtral_hf.apply(model, device)
 
     # CLIPEmbeddingModel: text_model/vision_model, not vision_encoder/vision_tower.
     # Gated on model_type, not just attribute presence: other architectures (e.g.
