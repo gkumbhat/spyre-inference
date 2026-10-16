@@ -77,7 +77,7 @@ models:
     serving_configs:
       - tp_size: 1
         max_model_len: 256
-        max_num_seqs: 4
+        max_num_seqs: 8
 
   sentence-transformers/all-roberta-large-v1:
     platforms: [x86_64]
