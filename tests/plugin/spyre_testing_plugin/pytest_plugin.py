@@ -132,17 +132,22 @@ def spyre_available() -> bool:
 def spyre_device_count() -> int:
     """Return the number of visible Spyre cards, or 0 if unavailable.
 
-    Reads AIU_WORLD_SIZE (set by the Spyre runtime environment when
-    cards are visible) instead of touching the Spyre runtime, so
-    `uses_subprocess` tests don't import torch_spyre in the main
-    pytest process.
+    Reads SPYRE_DEVICES (if set) and AIU_WORLD_SIZE (set by the Spyre runtime
+    environment when cards are visible) without touching the Spyre runtime, so
+    `uses_subprocess` tests don't import torch_spyre in the main pytest process.
 
     Returns:
         Number of visible Spyre devices, or 0 if unavailable.
     """
     try:
-        return int(os.environ.get("AIU_WORLD_SIZE", "0"))
-    except ValueError:
+        aiu_world_size = int(os.environ.get("AIU_WORLD_SIZE", "0"))
+        spyre_devices = os.environ.get("SPYRE_DEVICES")
+        if spyre_devices is not None:
+            devices = [d.strip() for d in spyre_devices.split(",") if d.strip()]
+            return min(len(devices), aiu_world_size)
+        return aiu_world_size
+    except ValueError as e:
+        print(f"AIU_WORLD_SIZE '{aiu_world_size}' is invalid, error: {e}", file=sys.stderr)
         return 0
 
 
@@ -554,7 +559,7 @@ def pytest_configure(config):
     _terminal_reporter = config.pluginmanager.get_plugin("terminalreporter")
 
     # Set env vars BEFORE any vllm imports
-    os.environ["VLLM_PLUGINS"] = "spyre_inference,spyre_inference_ops"
+    os.environ["VLLM_PLUGINS"] = "spyre_inference"
     os.environ["VLLM_USE_AOT_COMPILE"] = "0"
     # Let a shutting-down worker take longer to release the VFIO card: the default
     # 5s can expire mid-teardown (e.g. finishing a Spyre compile), leaving the card
@@ -863,7 +868,7 @@ def _spyre_session_config():
     plugin initialization. Tests that need a different config can still enter
     their own set_current_vllm_config context (nesting is safe).
     """
-    os.environ["VLLM_PLUGINS"] = "spyre_inference,spyre_inference_ops"
+    os.environ["VLLM_PLUGINS"] = "spyre_inference"
     os.environ["VLLM_USE_AOT_COMPILE"] = "0"
 
     from vllm.plugins import load_general_plugins
@@ -1135,10 +1140,11 @@ def patch_backend_list(request, monkeypatch):
     monkeypatch.setattr(test_module, "_test_backend_correctness", tbc_wrapper)
 
     # The upstream helper returns the logical [num_blocks, num_kv_heads, block_size,
-    # 2 * head_size] view that upstream's get_kv_cache_shape advertises; the physical
-    # layout underneath is token-major, which upstream expresses separately via
-    # get_kv_cache_stride_order (NHD). SpyreAttentionBackend advertises the physical
-    # layout directly, so undo the helper's transpose and split K from V.
+    # 2 * head_size] view; the physical layout underneath is token-major, which vLLM
+    # expresses through the KVCacheLayout descriptor's stride_order (the per-backend
+    # get_kv_cache_shape/get_kv_cache_stride_order hooks it replaced are gone).
+    # SpyreAttentionBackend keeps its own get_kv_cache_shape, which advertises the
+    # physical layout directly, so undo the helper's transpose and split K from V.
     orig_run_attention_backend = test_module.run_attention_backend
 
     def patched_run_attention_backend(
@@ -1152,11 +1158,11 @@ def patch_backend_list(request, monkeypatch):
         key,
         value,
         kv_cache,
-        attn_type=None,
-        sliding_window=None,
-        kv_cache_dtype="auto",
-        sinks=None,
+        *args,
+        **kwargs,
     ):
+        # Everything after kv_cache passes through untouched: upstream keeps appending
+        # defaulted parameters (use_cuda_graph in 0.30, layer_k/v_scale in 0.31).
         if backend == AttentionBackendEnum.CUSTOM:
 
             def pin_slot_major(blocks):
@@ -1188,10 +1194,8 @@ def patch_backend_list(request, monkeypatch):
             key,
             value,
             kv_cache,
-            attn_type,
-            sliding_window,
-            kv_cache_dtype,
-            sinks,
+            *args,
+            **kwargs,
         )
 
     monkeypatch.setattr(test_module, "run_attention_backend", patched_run_attention_backend)

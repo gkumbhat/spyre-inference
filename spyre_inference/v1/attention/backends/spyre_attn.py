@@ -36,7 +36,7 @@ from vllm.v1.attention.backend import (
     MultipleOf,
 )
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
-from vllm.v1.kv_cache_interface import AttentionSpec, EncoderOnlyAttentionSpec
+from vllm.v1.kv_cache_interface import AttentionSpec, EncoderOnlyAttentionSpec, KVCacheSpec
 
 from spyre_inference import envs
 from spyre_inference.custom_ops.utils import convert, row_outermost_layout
@@ -156,8 +156,8 @@ def _build_query_row_tables(
 ) -> list[torch.Tensor]:
     """Build query gather/dest row tables for the whole batch.
 
-    Each row is converted on its own so it lands at storage offset 0
-    (torch-spyre#3770); slicing a batched device tensor instead hits
+    Each row is converted on its own rather than as a row of one 2-D table
+    (torch-spyre#3851); slicing a batched device tensor instead hits
     spyre::copy_from_d2d, which recompiles per (shape, src_off, dst_off).
     """
     num_seqs = attn_metadata.num_seqs
@@ -185,6 +185,9 @@ _batched_decode_compiled = torch.compile(
 compile_guard.watch(page_attn_kernel, "page attention kernel")
 compile_guard.watch(batched_decode_kernel, "batched decode kernel")
 compile_guard.watch(reshape_and_cache_kernel, "reshape_and_cache kernel")
+
+# Stored as float8_e4m3fn with one per-tensor (k_scale, v_scale) pair per layer.
+FP8_KV_CACHE_DTYPES = ("fp8", "fp8_e4m3")
 
 
 @dataclass
@@ -226,6 +229,7 @@ class SpyreAttentionMetadata(AttentionMetadata):
     # True when causal masking is needed (prefill/mixed, i.e. max_query_len > 1).
     # Decode steps (max_query_len=1) don't need explicit causal masking because
     # the online softmax over KV pages naturally only attends to past tokens.
+    # Encoder-only metadata carries upstream's per-group flag as is (see build()).
     apply_causal_mask: bool = False
 
     # Number of KV heads (for GQA).
@@ -685,6 +689,9 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         max_query_len = common_attn_metadata.max_query_len
         block_table = common_attn_metadata.block_table_tensor
         slot_mapping = common_attn_metadata.slot_mapping
+        causal = common_attn_metadata.causal
+        if isinstance(causal, torch.Tensor):
+            causal = bool(causal.item())
 
         if self._encoder_only:
             # Everything below is KV-cache state -- block counts, per-block mask
@@ -695,6 +702,9 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             # max_model_len while a pooling model's body buckets come from
             # max_num_batched_tokens, and warmup profiles every sequence at the full
             # body size (a 256-token sentence-transformer asks for 512).
+            #
+            # Causality is the group's flag: EncoderOnlyAttention's builder clears it,
+            # CausalEncoderOnlyAttention's (CLIP text, models/clip.py) sets it.
             return SpyreAttentionMetadata(
                 num_actual_tokens=common_attn_metadata.num_actual_tokens,
                 num_seqs=common_attn_metadata.num_reqs,
@@ -707,11 +717,9 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 slot_mapping=slot_mapping,
                 num_kv_heads=self.num_kv_heads,
                 num_heads=self.num_heads,
+                apply_causal_mask=causal,
             )
 
-        causal = common_attn_metadata.causal
-        if isinstance(causal, torch.Tensor):
-            causal = bool(causal.item())
         # Batch-level flag: True iff the batch contains at least one prefill
         # sequence (max_query_len > 1). For decode sequences (query_len == 1)
         # in a mixed batch, the causal constraint is subsumed by the KV
@@ -1070,7 +1078,10 @@ class SpyreAttentionBackend(AttentionBackend):
     ]
 
     @staticmethod
-    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+    def get_supported_kernel_block_sizes(
+        kv_cache_spec: KVCacheSpec | None = None,
+    ) -> list[int | MultipleOf]:
+        # `kv_cache_spec` is ignored: the stick constraint is the same for every spec.
         # Spyre stick size is 128 bytes; tensors are transferred as float16 (2 bytes),
         # so block_size must be a multiple of 64 (= 128 / 2) to satisfy stick alignment.
         # This matches the constraint on head_size in supports_head_size().
@@ -1096,9 +1107,8 @@ class SpyreAttentionBackend(AttentionBackend):
         head_size: int,
         cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
-        # K and V are separate tensors in SpyrePagedKVCache, each with the same
-        # shape. The base vLLM API expects a single tuple here; callers like
-        # get_kv_cache_block_dim and KV-transfer code index into it directly.
+        # K and V are separate tensors in SpyrePagedKVCache, each with this shape. Not an
+        # upstream hook any more; Spyre's own source of truth for the page shape.
         return (num_blocks, block_size, num_kv_heads, head_size)
 
     @classmethod
@@ -1128,6 +1138,10 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     compiles its attention kernels, including under --enforce-eager.
     """
 
+    supports_fp8_kv_cache: ClassVar[bool] = False
+    # False for layers that keep no KV cache (encoder self-attention).
+    keeps_kv_cache: ClassVar[bool] = True
+
     def __init__(
         self,
         num_heads: int,
@@ -1140,7 +1154,12 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         logits_soft_cap: float | None = None,
         attn_type: str = AttentionType.DECODER,
         kv_sharing_target_layer_name: str | None = None,
+        sinks: torch.Tensor | None = None,
     ) -> None:
+        # The only guard against sink models (gpt-oss, Transformers-backend sinks):
+        # upstream checks supports_sink() on CUDA/ROCm only.
+        if sinks is not None:
+            raise NotImplementedError("Spyre attention does not support attention sinks")
         self.num_heads = num_heads
         self.head_size = head_size
         self.scale = float(scale)
@@ -1161,13 +1180,33 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         _dtype = get_current_vllm_config().model_config.dtype
         self.model_dtype: torch.dtype = _dtype if isinstance(_dtype, torch.dtype) else torch.float16
 
+        fp8_requested = kv_cache_dtype in FP8_KV_CACHE_DTYPES
+        self.kv_cache_fp8 = fp8_requested and self.keeps_kv_cache
+        if self.kv_cache_fp8:
+            if not self.supports_fp8_kv_cache:
+                raise ValueError(
+                    f"kv_cache_dtype={kv_cache_dtype} is not supported by "
+                    f"{type(self).__name__}; it needs the head-major KV layout "
+                    "(unset SPYRE_ATTN_KV_LAYOUT)."
+                )
+            # A float8 stick holds 128 elements.
+            if head_size % 128:
+                raise ValueError(
+                    f"kv_cache_dtype={kv_cache_dtype} needs head_size % 128 == 0, got {head_size}."
+                )
         # The kernels read a page at model dtype and Spyre has no cast on the way in, so
-        # the two 2-byte dtypes are not interchangeable per-cache.
-        if kv_cache_dtype not in ("auto", str(self.model_dtype).removeprefix("torch.")):
+        # the two 2-byte dtypes are not interchangeable per-cache. A layer without a cache
+        # has nothing to apply an fp8 dtype to; upstream passes the engine-wide one.
+        elif not fp8_requested and kv_cache_dtype not in (
+            "auto",
+            str(self.model_dtype).removeprefix("torch."),
+        ):
             raise ValueError(
                 f"kv_cache_dtype={kv_cache_dtype} does not match the model dtype "
                 f"{self.model_dtype} on Spyre; use 'auto'."
             )
+        # Per-layer (k_scale, v_scale); see `prepare_kv_scales`.
+        self._kv_scales: tuple[float, float] | None = None
 
         # ALiBi slopes: per-head linear-bias coefficients (BLOOM/MPT style).
         # Reshape once to [num_kv_heads, num_queries_per_kv, 1, 1] so the
@@ -1606,6 +1645,17 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             shape = (-1, k_pages.shape[2], k_pages.shape[3])
             self._kv_slots = SpyrePagedKVCache(k_pages.view(shape), v_pages.view(shape))
         return self._kv_slots
+
+    def prepare_kv_scales(self, layer: AttentionLayer | None) -> None:
+        """Read the layer's float8 KV scales as floats (a [1] tensor fails torch-spyre's
+        pointwise layout pass). The runner calls it at load and after a reload."""
+        if not self.kv_cache_fp8:
+            return
+        # Set by upstream after weight loading.
+        self._kv_scales = (
+            float(getattr(layer, "_k_scale_float", 1.0)),
+            float(getattr(layer, "_v_scale_float", 1.0)),
+        )
 
     def do_kv_cache_update(
         self,
