@@ -19,7 +19,7 @@ defaults:
     metric-percentiles: 99,100
     max-concurrency: 4
     num-prompts: 200
-    input-len: 16384
+    input-len: 8192
     output-len: 128
     random-mm-limit-mm-per-prompt: '{"image": 1, "video": 0}'
     random-mm-bucket-config: '{(2048, 2048, 1): 1}'
