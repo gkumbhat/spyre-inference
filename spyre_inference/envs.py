@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     SPYRE_ATTN_PROFILING: bool = False
     SPYRE_ATTN_RECORD: bool = True
     SPYRE_ATTN_FOR_EACH_TILE: bool = True
+    SPYRE_ENCODER_JAGGED_ATTENTION: bool = False
     SPYRE_ATTN_KV_BUCKETS: str | None = None
     SPYRE_ATTN_QUERY_BUCKETS: str | None = None
     SPYRE_ATTN_NUM_SEQS_BUCKETS: str | None = None
@@ -89,6 +90,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # block chunks with torch-spyre's `for_each_tile`, so each traced graph holds
     # one loop body. Enabled by default; "0" runs the same bodies under Python loops.
     "SPYRE_ATTN_FOR_EACH_TILE": lambda: bool(int(os.getenv("SPYRE_ATTN_FOR_EACH_TILE", "1"))),
+    # When "1", the encoder ragged path flattens every sequence's attention into
+    # chunk-sized visits and walks the whole batch in one kernel call (adapted from
+    # the decoder jagged-attention design, spyre-inference#1118), instead of one
+    # kernel call per equal-extent group. Off by default: experimental, unevaluated
+    # against the existing per-group kernels outside microbenchmarks.
+    "SPYRE_ENCODER_JAGGED_ATTENTION": lambda: bool(
+        int(os.getenv("SPYRE_ENCODER_JAGGED_ATTENTION", "0"))
+    ),
     # Comma-separated kv_len buckets to record, unset uses the default buckets of
     # powers of two from block_size up to max_model_len.
     "SPYRE_ATTN_KV_BUCKETS": lambda: os.getenv("SPYRE_ATTN_KV_BUCKETS"),

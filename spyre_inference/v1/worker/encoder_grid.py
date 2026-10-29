@@ -129,8 +129,15 @@ class EncoderDispatchStats:
             self.ragged_steps += 1
             query_lens = [length for group in plan for length in group.query_lens]
             num_seqs = sum(group.group for group in plan)
-        else:
+        elif hasattr(plan, "width"):
             self.rect_steps += 1
+            query_lens = plan.query_lens
+            num_seqs = len(plan.query_lens)
+        else:
+            # EncoderJaggedPlan: the other alternative to the traced rectangle, one
+            # flat visit table instead of several per-extent groups -- counts as
+            # "slow" like the list-of-groups ragged plan above.
+            self.ragged_steps += 1
             query_lens = plan.query_lens
             num_seqs = len(plan.query_lens)
         self.real_tokens += sum(query_lens)

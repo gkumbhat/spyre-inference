@@ -1134,6 +1134,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             # loop has no launch overhead to amortise.
             batched=self.compilation_config.mode is CompilationMode.STOCK_TORCH_COMPILE,
             forced_rect=self._forced_encoder_rect,
+            body_rows=rows or None,
         )
         # A rectangle's mask shape is how a traced forward reads the grid; the ragged path
         # publishes nothing and so stays opaque.

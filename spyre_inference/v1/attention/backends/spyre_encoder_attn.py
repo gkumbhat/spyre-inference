@@ -52,13 +52,19 @@ from vllm.model_executor.layers.attention.attention import Attention
 from vllm.utils.math_utils import cdiv, next_power_of_2
 from vllm.v1.attention.backend import AttentionLayer, AttentionType
 
+from spyre_inference import envs
 from spyre_inference.custom_ops.utils import convert
+from spyre_inference.v1.attention.backends.encoder_jagged_plan import (
+    EncoderJaggedPlan,
+    build_encoder_jagged_plan,
+)
 from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionBackend,
     SpyreAttentionImpl,
     SpyreAttentionMetadata,
     SpyrePagedKVCache,
 )
+from spyre_inference.v1.attention.ops.encoder_jagged_attn import encoder_jagged_attn_kernel
 from spyre_inference.v1.worker import compile_guard
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
     encoder_rectangle_for_batch,
@@ -343,6 +349,7 @@ _encoder_rect_out_compiled = torch.compile(_encoder_rect_kernel_out, dynamic=Fal
 _encoder_gather_compiled = torch.compile(_encoder_gather_kernel, dynamic=False)
 _encoder_sdpa_compiled = torch.compile(_encoder_sdpa_kernel, dynamic=False)
 _encoder_fused_compiled = torch.compile(_encoder_fused_kernel, dynamic=False)
+_encoder_jagged_compiled = torch.compile(encoder_jagged_attn_kernel, dynamic=False)
 
 for _kernel in (
     _encoder_rect_kernel,
@@ -350,6 +357,7 @@ for _kernel in (
     _encoder_gather_kernel,
     _encoder_sdpa_kernel,
     _encoder_fused_kernel,
+    encoder_jagged_attn_kernel,
 ):
     compile_guard.watch(_kernel, f"encoder attention kernel {_kernel.__name__}")
 
@@ -395,7 +403,8 @@ def build_encoder_plan(
     device: torch.device,
     dtype: torch.dtype,
     batched: bool,
-) -> EncoderRectPlan | list[EncoderGroupPlan]:
+    body_rows: int | None = None,
+) -> EncoderRectPlan | list[EncoderGroupPlan] | EncoderJaggedPlan:
     """Choose the path for this step and build what its kernels need.
 
     Module-level and query-free so the runner can call it before the model runs: inside
@@ -405,12 +414,20 @@ def build_encoder_plan(
     upstream's ``_dummy_run`` puts the whole padded token count in ``seq_lens``.
 
     The masks are causal iff the metadata's ``apply_causal_mask`` is set.
+
+    ``body_rows`` is the step's whole padded buffer size, which the jagged plan's sink
+    rows must sit past -- distinct from ``num_actual_tokens`` below, which is only the
+    real-token count and can be less than the buffer. Defaults to ``num_actual_tokens``
+    for a caller (e.g. the per-call fallback in ``forward``) that has no better bound;
+    that is only safe because the real device buffer there is `query.shape[0]`, always
+    >= the row range this function ever touches when no body is declared.
     """
     causal = attn_metadata.apply_causal_mask
     query_start_loc = attn_metadata.query_start_loc.cpu().tolist()
     seq_lens = attn_metadata.seq_lens.cpu().tolist()
     # The body pads past num_actual_tokens; those rows are not a request.
     num_tokens = attn_metadata.num_actual_tokens
+    sink_base = body_rows if body_rows is not None else num_tokens
 
     members: list[tuple[int, int, int]] = []  # (start, query_len, kv_len)
     for seq_idx in range(attn_metadata.num_seqs):
@@ -439,6 +456,30 @@ def build_encoder_plan(
             width=width,
             mask=convert(encoder_key_pad_mask(extent, kv_lens, dtype, causal), device),
             query_lens=[m[1] for m in members],
+        )
+
+    if envs.SPYRE_ENCODER_JAGGED_ATTENTION and not causal and members:
+        # One flat visit table for the whole batch, regardless of how many distinct
+        # lengths it contains -- see encoder_jagged_plan.py. Causal is not implemented
+        # (encoder_jagged_attn_kernel has no triangular gate), so a causal group still
+        # falls through to the by-extent path below.
+        jagged = build_encoder_jagged_plan(
+            starts=[m[0] for m in members],
+            query_lens=[m[1] for m in members],
+            rows=sink_base,
+            # for_each_tile's scan lowers through an internal torch.compile step
+            # regardless of whether the caller compiled -- its own index_copy_ needs
+            # int64 off that path, same as every other eager index_copy_ on Spyre
+            # (encoder_index_dtype's docstring). int32 is only safe once this kernel
+            # itself is wrapped in the caller's own outer torch.compile.
+            index_dtype=encoder_index_dtype(device) if batched else torch.int64,
+        )
+        return EncoderJaggedPlan(
+            query_row_index=convert(jagged.query_row_index, device),
+            kv_row_index=convert(jagged.kv_row_index, device),
+            valid_keys=convert(jagged.valid_keys, device),
+            first_visit=convert(jagged.first_visit, device),
+            query_lens=jagged.query_lens,
         )
 
     by_extent: dict[int, list[tuple[int, int, int]]] = {}
@@ -511,6 +552,7 @@ def plan_encoder_step(
     dtype: torch.dtype,
     batched: bool,
     forced_rect: tuple[int, int] | None = None,
+    body_rows: int | None = None,
 ) -> EncoderRectPlan | list[EncoderGroupPlan] | None:
     """Give each encoder metadata object its own plan, with its own causality; return the last."""
     plan = None
@@ -533,6 +575,7 @@ def plan_encoder_step(
                     device=device,
                     dtype=dtype,
                     batched=batched,
+                    body_rows=body_rows,
                 )
             encoder_md.encoder_plan = plan
         else:
@@ -571,12 +614,14 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
             self._gather_fn = _encoder_gather_compiled
             self._sdpa_fn = _encoder_sdpa_compiled
             self._fused_fn = _encoder_fused_compiled
+            self._jagged_fn = _encoder_jagged_compiled
         else:
             self._rect_fn = _encoder_rect_kernel
             self._rect_out_fn = _encoder_rect_kernel_out
             self._gather_fn = _encoder_gather_kernel
             self._sdpa_fn = _encoder_sdpa_kernel
             self._fused_fn = _encoder_fused_kernel
+            self._jagged_fn = encoder_jagged_attn_kernel
         # get_current_vllm_config() only works at construction time; forward() runs
         # through a custom-op boundary that loses the context.
         config = get_current_vllm_config()
@@ -650,6 +695,22 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
             heads,
             kv_heads,
             dim,
+        )
+
+    def _run_jagged(self, out, plan, query, key, value, heads, kv_heads, dim):
+        return self._jagged_fn(
+            query,
+            key,
+            value,
+            plan.query_row_index,
+            plan.kv_row_index,
+            plan.valid_keys,
+            plan.first_visit,
+            self.scale,
+            heads,
+            kv_heads,
+            dim,
+            out=out,
         )
 
     def warm_kernels(
@@ -761,6 +822,7 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
                 device=query.device,
                 dtype=query.dtype,
                 batched=self._compile_attn,
+                body_rows=query.shape[0],
             )
             attn_metadata.encoder_plan = plan
 
@@ -801,6 +863,8 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
 
         if isinstance(plan, EncoderRectPlan):
             self._forward_rect(plan, query, key, value, output, fused_store_ok, head_size)
+        elif isinstance(plan, EncoderJaggedPlan):
+            self._forward_jagged(plan, query, key, value, output, fused_store_ok, head_size)
         else:
             self._forward_groups(plan, query, key, value, output, fused_store_ok, head_size)
 
@@ -870,6 +934,15 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
             for i, (start, query_len) in enumerate(zip(plan.starts, plan.query_lens)):
                 base = i * plan.extent
                 output[start : start + query_len] = attn[base : base + query_len]
+
+    def _forward_jagged(self, plan, query, key, value, output, fused_store_ok, head_size) -> None:
+        """One kernel call for the whole batch's flattened visit table."""
+        num_heads, num_kv_heads = query.shape[1], key.shape[1]
+        if fused_store_ok:
+            self._run_jagged(output, plan, query, key, value, num_heads, num_kv_heads, head_size)
+            return
+        attn = self._run_jagged(None, plan, query, key, value, num_heads, num_kv_heads, head_size)
+        output.copy_(attn)
 
 
 class SpyreEncoderAttentionBackend(SpyreAttentionBackend):
