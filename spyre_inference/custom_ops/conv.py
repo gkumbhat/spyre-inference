@@ -16,10 +16,8 @@
 
 vLLM lowers a patch conv to im2col + GEMM, whose on-device reshape produces a
 sub-stick `copy_from_d2d` expression torch-spyre cannot lay out for patch grids
-coprime with the 64-wide stick. So call the real `F.conv2d` instead. torch-spyre's
-own conv2d lowering still falls back to a CPU unfold/reshape round trip for this
-shape family regardless of input layout, so only the weight is pre-staged into a
-tiled `SpyreTensorLayout` (once, at load time); the input is passed through as-is.
+coprime with the 64-wide stick. So call the real `F.conv2d` and let torch-spyre
+lower it.
 """
 
 import torch
@@ -28,20 +26,16 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.conv import Conv2dLayer
 
 from .lazy_compile import CompileOutermost, maybe_compile
-from .utils import convert
 
 logger = init_logger(__name__)
 
 
 def _layouts_supported(x: torch.Tensor, weight: torch.Tensor) -> bool:
     """Whether this call is a vision patch embed: in-channels within a stick,
-    out-channels a whole number of sticks. Batch size doesn't matter -- the
-    compiled call below takes whatever batch it's given, tiled (one image) or
-    not (e.g. a granite-vision tile batch).
+    out-channels a whole number of sticks, any batch.
 
-    True for a Pixtral/granite-vision patch embed, not for convs in general —
-    and this class is registered OOT for *every* `Conv2dLayer`, so fall back
-    rather than assert.
+    True for a patch embed, not for convs in general — and this class is
+    registered OOT for *every* `Conv2dLayer`, so fall back rather than assert.
     """
     if x.dim() != 4 or weight.dim() != 4:
         return False
@@ -49,42 +43,9 @@ def _layouts_supported(x: torch.Tensor, weight: torch.Tensor) -> bool:
     return c <= 64 and weight.shape[0] % 64 == 0
 
 
-def _weight_layout(weight: torch.Tensor):
-    """SpyreTensorLayout for a conv weight (O, C, K1, K2), sticked on out-channels.
-
-    The stick walks the out-channel dim (host stride C*K1*K2), tiling it into O//64.
-    """
-    from torch_spyre._C import SpyreTensorLayout, get_device_dtype
-
-    o, c, k1, k2 = weight.shape
-    assert o % 64 == 0, f"conv out_channels {o} must be a multiple of the 64-wide stick"
-    return SpyreTensorLayout(
-        [k2, k1, o // 64, c, 64],
-        [1, k2, c * k1 * k2 * 64, k1 * k2, c * k1 * k2],
-        get_device_dtype(weight.dtype),
-    )
-
-
-def _input_layout(x: torch.Tensor):
-    """SpyreTensorLayout for a conv input (1, C, H, W), sticked on in-channels.
-
-    The stick walks the channel dim (host stride H*W), padding C up to a full stick.
-    """
-    from torch_spyre._C import SpyreTensorLayout, get_device_dtype
-
-    b, c, h, w = x.shape
-    assert b == 1, f"conv input batch {b} != 1 (Pixtral feeds one image at a time)"
-    assert c <= 64, f"conv in_channels {c} must fit in one 64-wide stick"
-    return SpyreTensorLayout(
-        [w, h, 1, 1, 64],
-        [1, w, -1, c * h * w, h * w],
-        get_device_dtype(x.dtype),
-    )
-
-
 @Conv2dLayer.register_oot(name="Conv2dLayer")
 class SpyreConv2d(CompileOutermost, Conv2dLayer):
-    """Out-of-tree Conv2d for Spyre: `F.conv2d` on-card with explicit tiled layouts.
+    """Out-of-tree Conv2d for Spyre: `F.conv2d` on-card.
 
     Spyre needs static shapes, so the kernel recompiles per distinct (H, W). The
     platform lifts dynamo's recompile limits, so there is no eager fallback, but every
@@ -95,10 +56,6 @@ class SpyreConv2d(CompileOutermost, Conv2dLayer):
     # Per-(H, W) recompiles are this layer's contract, so the compile guard must not
     # report them; warmup cannot enumerate every image resolution.
     allow_inference_recompiles = True
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._w_dev: torch.Tensor | None = None
 
     @maybe_compile
     def _conv_native(self, x: torch.Tensor, w: torch.Tensor, bias) -> torch.Tensor:
@@ -112,31 +69,20 @@ class SpyreConv2d(CompileOutermost, Conv2dLayer):
             groups=self.groups,
         )
 
-    def process_weights_after_loading(self) -> None:
-        """Place the patch-conv weight into its tiled layout once after model load."""
-        if self._w_dev is not None or self.weight.device.type != "spyre":
-            return
-        w_cpu = convert(self.weight.detach(), device="cpu")
-        self._w_dev = convert(w_cpu, device="spyre", device_layout=_weight_layout(w_cpu))
-
     def forward_oot(self, x: torch.Tensor) -> torch.Tensor:
         assert x.dim() == 4
         # `_forward_conv`, not `forward_native`: a patch embed sets `enable_linear`, so
         # `forward_native` picks the unfold/reshape path this class exists to avoid.
         if x.device.type != "spyre":
-            # The tiled layouts move a tensor onto the card; applying them to a
-            # CPU input is the opposite of what the caller asked for.
             return self._forward_conv(x)
         if not _layouts_supported(x, self.weight):
             logger.warning_once(
                 "Spyre conv2d: shape %s (weight %s) outside the patch-embed "
                 "assumptions (in_channels <= 64, out_channels %% 64 == 0); "
-                "falling back to F.conv2d without them.",
+                "falling back to the stock conv path.",
                 tuple(x.shape),
                 tuple(self.weight.shape),
             )
             return self._forward_conv(x)
         logger.info_once("Spyre conv2d: on-card F.conv2d")
-        # No input staging: torch-spyre's internal unfold/reshape fallback runs
-        # regardless of layout, so the explicit tiled conversion was dead weight.
         return self._conv_native(x, self.weight, self.bias)
