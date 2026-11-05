@@ -38,14 +38,16 @@ class TorchSpyreScheduler(Scheduler):
             else envs.SPYRE_MAX_NUM_PARTIAL_PREFILLS
         )
 
+    def _num_partial_prefills(self) -> int:
+        return sum(
+            request.num_computed_tokens < request.num_prompt_tokens for request in self.running
+        )
+
     def schedule(self, *args, **kwargs) -> SchedulerOutput:
         if self.max_num_partial_prefills <= 0:
             return super().schedule(*args, **kwargs)
 
-        prefilling = sum(
-            request.num_computed_tokens < request.num_prompt_tokens for request in self.running
-        )
-        free_slots = max(self.max_num_partial_prefills - prefilling, 0)
+        free_slots = max(self.max_num_partial_prefills - self._num_partial_prefills(), 0)
         # The waiting loop re-reads this every iteration and appends one request per
         # admission, so a lowered cap stops it after `free_slots` of them while still
         # letting it skip candidates. Steps that preempt skip the loop entirely.

@@ -180,6 +180,23 @@ class ParallelEncoderScheduler(TorchSpyreScheduler):
             self._max_inflight_encode_images,
         )
 
+    def _num_partial_prefills(self) -> int:
+        """Leave out requests parked on an image the encoder has not finished: they do
+        no prefill work until it lands, and counting them would stop every new request
+        (text-only included) at the default cap of one partial prefill."""
+        return sum(
+            request.num_computed_tokens < request.num_prompt_tokens
+            and not self._waits_on_encoder(request)
+            for request in self.running
+        )
+
+    def _waits_on_encoder(self, request: Request) -> bool:
+        for feature in request.mm_features or ():
+            pos = feature.mm_position
+            if pos.offset + pos.length > request.num_computed_tokens:
+                return feature.identifier in self._encoding_inflight
+        return False
+
     def schedule(self, *args, **kwargs) -> SchedulerOutput:
         prof = self._prof
         t0 = time.perf_counter() if prof.enabled else 0.0
