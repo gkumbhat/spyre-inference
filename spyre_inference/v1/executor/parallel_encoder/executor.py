@@ -113,9 +113,11 @@ class ParallelEncoderExecutor(MultiprocExecutor):
                 "active non-text modality."
             )
         self._region_num_blocks = num_blocks
+        # Not the scheduler's encoder_compute_budget: Spyre caps max_num_batched_tokens
+        # at 512, which leaves room for one image, so a backed-up encoder would run its
+        # queue one image per call. Default to everything the region can hold.
         self._max_batch_embeds = min(
-            self._pe_config.max_dispatch_batch_embeds or mm_budget.encoder_compute_budget,
-            num_blocks,
+            self._pe_config.max_dispatch_batch_embeds or num_blocks, num_blocks
         )
         self._region_block_size_bytes = region_block_size_bytes(self.vllm_config)
         self._region_engine_id = region_engine_id(self.vllm_config)

@@ -42,6 +42,8 @@ class ParallelEncoderConfig:
     encoder_device: str = "cpu"
     encoder_dtype: str = "bfloat16"
     encoder_num_threads: int | None = None
+    # Cap on embedding rows the encoder process runs in one embed_multimodal call.
+    # None batches everything queued, up to the working set below.
     max_dispatch_batch_embeds: int | None = None
     # Encoder working set in embedding rows: region size and EncoderCacheManager
     # capacity, decoupled from max_num_batched_tokens. None sizes it for ~16 images.
