@@ -20,8 +20,10 @@ def first_divergence(a: list[int], b: list[int]) -> int | None:
 
 
 def main() -> int:
-    inline = json.load(open(sys.argv[1]))["results"]
-    parallel = json.load(open(sys.argv[2]))["results"]
+    with open(sys.argv[1]) as f:
+        inline = json.load(f)["results"]
+    with open(sys.argv[2]) as f:
+        parallel = json.load(f)["results"]
     failed = False
     print(f"{'prompt':<14} {'result':<18} detail")
     for name in [k for k in inline if not k.startswith("_")]:
