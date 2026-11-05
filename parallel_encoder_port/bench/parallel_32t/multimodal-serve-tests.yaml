@@ -1,0 +1,33 @@
+# Parallel arm with a 32-thread CPU encoder. SPYRE_NUM_CPUS=64 (the pod's cgroup
+# quota) minus the encoder's 32 leaves 8 per decoder worker, as in the inline arm.
+defaults:
+  server_health_timeout: 3600
+  environment_variables:
+    VLLM_CPU_KVCACHE_SPACE: 64
+    DTLOG_LEVEL: error
+  server_parameters:
+    load-format: auto
+    tensor-parallel-size: 4
+    max-model-len: 32768
+  parameters:
+    dataset-name: random-mm
+    backend: openai-chat
+    endpoint: /v1/chat/completions
+    ignore-eos: true
+    percentile-metrics: ttft,tpot,itl,e2el
+    metric-percentiles: 99,100
+    max-concurrency: 4
+    num-prompts: 200
+    input-len: 8192
+    output-len: 128
+    random-mm-limit-mm-per-prompt: '{"image": 1, "video": 0}'
+    random-mm-bucket-config: '{(2048, 2048, 1): 1}'
+tests:
+- test_name: serve_ministral3-14b_tp4_mm_random_parallel_encoder_32t
+  server_parameters:
+    model: mistralai/Ministral-3-14B-Instruct-2512-BF16
+    distributed-executor-backend: spyre_inference.v1.executor.parallel_encoder.executor.ParallelEncoderExecutor
+    additional-config: '{"parallel_encoder": {"enabled": true, "encoder_num_threads":
+      32}}'
+  environment_variables:
+    SPYRE_NUM_CPUS: 64
