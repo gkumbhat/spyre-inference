@@ -77,6 +77,7 @@ class _SchedProfiler:
         self.dispatch_items = 0
         self.dispatch_bytes = 0
         self.loads = 0
+        self.image_waits: list[float] = []
 
     def record_step(self, sched_s: float, drain_s: float, flush_s: float, loads: int) -> None:
         self.steps += 1
@@ -86,23 +87,29 @@ class _SchedProfiler:
         self.max_sched_s = max(self.max_sched_s, sched_s)
         self.loads += loads
 
+    def record_image_wait(self, wait_s: float) -> None:
+        """Dispatch to completion for one image: how long its request waited on it."""
+        self.image_waits.append(wait_s)
+
     def record_dispatch(self, items: int, nbytes: int) -> None:
         self.dispatch_events += 1
         self.dispatch_items += items
         self.dispatch_bytes += nbytes
 
-    def maybe_log(self) -> None:
+    def maybe_log(self, inflight: int) -> None:
         now = time.monotonic()
         dt = now - self._last
         if dt < self._interval:
             return
         n = max(self.steps, 1)
         pe_overhead_ms = 1e3 * (self.drain_s + self.flush_s) / n
+        waits = self.image_waits
         logger.info(
             "parallel-encoder PROFILE[sched] %.1fs, %d steps: "
             "schedule mean=%.3fms max=%.3fms | PE-overhead mean=%.3fms "
             "(drain=%.3fms flush=%.3fms) | dispatch %d ev / %d items / "
-            "%.1f MB (%.2f MB/s) | region-loads=%d",
+            "%.1f MB (%.2f MB/s) | region-loads=%d | images in flight=%d | "
+            "image wait n=%d mean=%.2fs max=%.2fs",
             dt,
             self.steps,
             1e3 * self.sched_s / n,
@@ -115,6 +122,10 @@ class _SchedProfiler:
             self.dispatch_bytes / 1e6,
             (self.dispatch_bytes / 1e6) / dt if dt else 0.0,
             self.loads,
+            inflight,
+            len(waits),
+            sum(waits) / len(waits) if waits else 0.0,
+            max(waits, default=0.0),
         )
         self._last = now
         self._reset()
@@ -163,6 +174,8 @@ class ParallelEncoderScheduler(TorchSpyreScheduler):
 
         # mm_hashes dispatched to the encoder but not yet reported complete.
         self._encoding_inflight: set[str] = set()
+        # Dispatch time per in-flight image; filled only while profiling.
+        self._dispatched_at: dict[str, float] = {}
         # mm_hashes whose embedding is already loaded into the worker caches
         # (emit a region load exactly once, on first consumption).
         self._loaded_by_workers: set[str] = set()
@@ -234,7 +247,7 @@ class ParallelEncoderScheduler(TorchSpyreScheduler):
                 flush_s=t3 - t2,
                 loads=len(self._pending_loads_this_step),
             )
-            prof.maybe_log()
+            prof.maybe_log(len(self._encoding_inflight))
         return output
 
     def _drain_completions(self) -> None:
@@ -253,6 +266,8 @@ class ParallelEncoderScheduler(TorchSpyreScheduler):
                     f"parallel-encoder: encoding failed for {done.mm_hash}: {done.error}"
                 )
             self._encoding_inflight.discard(done.mm_hash)
+            if (sent := self._dispatched_at.pop(done.mm_hash, None)) is not None:
+                self._prof.record_image_wait(time.perf_counter() - sent)
 
     def _flush_dispatch(self) -> None:
         if not self._dispatch_this_step:
@@ -384,6 +399,8 @@ class ParallelEncoderScheduler(TorchSpyreScheduler):
             if not needs_reencode:
                 self.encoder_cache_manager.allocate(request, i)
             self._encoding_inflight.add(item_identifier)
+            if self._prof.enabled:
+                self._dispatched_at[item_identifier] = time.perf_counter()
             self._dispatch_this_step.append(
                 EncodeItem(
                     mm_hash=item_identifier,

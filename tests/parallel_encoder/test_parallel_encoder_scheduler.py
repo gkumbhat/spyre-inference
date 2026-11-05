@@ -243,3 +243,20 @@ def test_parked_request_does_not_block_admission(harness):
     out = _step(harness)
     assert out.num_scheduled_tokens.get("text", 0) > 0
     assert sorted(_dispatched_hashes(harness)) == ["img-a", "img-b"]
+
+
+def test_profiler_reports_image_wait_and_inflight(harness, caplog):
+    s = harness.scheduler
+    s._prof.enabled = True
+    s._prof._interval = 0.0
+    s.add_request(_request("r0", "img-a"))
+    _step(harness)
+    assert "img-a" in s._dispatched_at
+
+    harness.completion.put(EncodeDone(mm_hash="img-a"))
+    with caplog.at_level("INFO"):
+        _step(harness)
+    line = next(r.getMessage() for r in caplog.records if "PROFILE[sched]" in r.getMessage())
+    assert "images in flight=0" in line
+    assert "image wait n=1" in line
+    assert not s._dispatched_at

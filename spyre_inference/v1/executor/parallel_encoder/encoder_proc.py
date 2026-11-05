@@ -67,6 +67,7 @@ class _EncProfiler:
         self.encode_s = 0.0
         self.write_s = 0.0
         self.wait_s = 0.0
+        self.max_queued = 0
 
     def record(self, items: int, encode_s: float, write_s: float) -> None:
         self.batches += 1
@@ -74,6 +75,9 @@ class _EncProfiler:
         self.max_batch = max(self.max_batch, items)
         self.encode_s += encode_s
         self.write_s += write_s
+
+    def record_queued(self, queued: int) -> None:
+        self.max_queued = max(self.max_queued, queued)
 
     def add_wait(self, wait_s: float) -> None:
         self.wait_s += wait_s
@@ -88,7 +92,7 @@ class _EncProfiler:
         _logger().info(
             "parallel-encoder PROFILE[enc] %.1fs: %d batches / %d items "
             "(avg=%.1f max=%d) | encode mean=%.2fms | write mean=%.2fms | "
-            "busy=%.0f%% idle=%.0f%%",
+            "busy=%.0f%% idle=%.0f%% | max queued=%d",
             dt,
             self.batches,
             self.items,
@@ -98,6 +102,7 @@ class _EncProfiler:
             1e3 * self.write_s / b,
             100 * busy / dt if dt else 0.0,
             100 * self.wait_s / dt if dt else 0.0,
+            self.max_queued,
         )
         self._last = now
         self._reset()
@@ -260,6 +265,14 @@ def encoder_main(
     """Child entry point: load, signal READY, then serve ``EncodeBatch`` messages until
     the parent exits (``death_pipe`` EOF). An encode failure is posted on
     ``completion_q`` and then re-raised; the executor's monitor shuts the engine down."""
+    # Without the plugin, nothing configures logging here: set it up as vLLM's workers
+    # do and route spyre_inference through vllm's handler, or every line is dropped.
+    import logging
+
+    from vllm.logger import configure_logging
+
+    configure_logging(vllm_config.logging_config)
+    logging.getLogger("spyre_inference").parent = logging.getLogger("vllm")
     logger = _logger()
     proc: EncoderProc | None = None
     try:
@@ -306,6 +319,8 @@ def encoder_main(
                     break
                 pending.extend(batch.items)
 
+            if prof.enabled:
+                prof.record_queued(len(pending))
             to_encode, pending = _take_budget_batch(pending, max_batch_embeds)
             if prof.enabled:
                 prof.add_wait(time.perf_counter() - t_wait0)
