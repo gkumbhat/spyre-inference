@@ -55,8 +55,13 @@ logger = init_logger(__name__)
 _READY_TIMEOUT_S = 600.0
 
 # A CPU encoder must not load the Spyre plugin: it would resolve TorchSpyrePlatform,
-# swap in Spyre custom ops and model classes, and open a card.
-_CPU_ENCODER_ENV = {"VLLM_PLUGINS": "", "TORCH_DEVICE_BACKEND_AUTOLOAD": "0"}
+# swap in Spyre custom ops and model classes, and open a card. Without a plugin, the
+# `+empty` vLLM build resolves no platform unless the target device is named.
+_CPU_ENCODER_ENV = {
+    "VLLM_PLUGINS": "",
+    "TORCH_DEVICE_BACKEND_AUTOLOAD": "0",
+    "VLLM_TARGET_DEVICE": "cpu",
+}
 
 
 @contextlib.contextmanager
