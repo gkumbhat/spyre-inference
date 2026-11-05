@@ -64,6 +64,7 @@ from vllm.v1.worker.cpu_model_runner import _torch_cuda_wrapper
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from spyre_inference import envs
+from spyre_inference.config.parallel_encoder import ParallelEncoderConfig
 from spyre_inference.custom_ops.utils import convert, convert_tensor_tree
 from spyre_inference.models import check_spyre_model
 from spyre_inference.models._vision_encoder import SpyreVisionEncoderMixin
@@ -77,6 +78,11 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     allocate_staging_buffers,
 )
 from spyre_inference.v1.attention.warmup import record_attention_graphs
+from spyre_inference.v1.executor.parallel_encoder.region import (
+    build_region,
+    resolve_encoder_cache_size,
+)
+from spyre_inference.v1.executor.parallel_encoder.region_io import RegionReader
 from spyre_inference.v1.pool import (
     configure_pooling_for_spyre,
     copy_pooler_output_to_cpu,
@@ -117,6 +123,8 @@ from spyre_inference.v1.worker.spyre_shape_bucketer import (
 )
 
 if TYPE_CHECKING:
+    from vllm.v1.core.sched.output import SchedulerOutput
+
     from spyre_inference.v1.spec_decode.dflash import SpyreDFlashProposer
 
 logger = init_logger(__name__)
@@ -638,11 +646,32 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # kernels against real pages. Populated by initialize_kv_cache_tensors.
         self._spyre_kv_caches: dict[str, SpyrePagedKVCache] = {}
 
+        # The vision tower runs in the encoder process; this runner only merges.
+        self._parallel_encoder = ParallelEncoderConfig.is_enabled(vllm_config)
+        self._encoder_region_reader: RegionReader | None = None
+
         # Replace Triton kernel with a pure-PyTorch implementation.
         # GPUModelRunner uses @triton.jit which is mocked on non-GPU platforms.
         # The upstream CPU backend uses a C++ kernel (torch.ops._C) as its
         # fallback, but we don't have _C.abi3.so with VLLM_TARGET_DEVICE=empty.
         _patch_compute_slot_mapping()
+
+    def _execute_mm_encoder(self, scheduler_output: SchedulerOutput) -> list[torch.Tensor]:
+        """Pull the encoder process's embeddings into ``encoder_cache`` first, so the
+        base finds them cached; with the parallel encoder it never schedules an input."""
+        loads = getattr(scheduler_output, "encoder_region_loads", None)
+        if loads:
+            if self._encoder_region_reader is None:
+                assert self.mm_budget is not None
+                region = build_region(
+                    self.vllm_config,
+                    resolve_encoder_cache_size(
+                        self.mm_budget, ParallelEncoderConfig.from_vllm_config(self.vllm_config)
+                    ),
+                )
+                self._encoder_region_reader = RegionReader(region, self.model_config.dtype)
+            self._encoder_region_reader.load(self.encoder_cache, loads)
+        return super()._execute_mm_encoder(scheduler_output)
 
     def load_model(self, load_dummy_weights: bool = False) -> None:
         """Load weights on CPU, move Spyre layers to device, compile, and wrap."""
@@ -956,6 +985,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
         if model is None:
             return
         with _set_spyre_compilation_settings(self.vllm_config):
+            if self._parallel_encoder:
+                # The tower runs in the encoder process; only the merge runs here.
+                self._warmup_vision_merge(model)
+                return
             model.compile_vision_graphs()
             self._maybe_init_encoder_cudagraph_manager()
             assert self.encoder_cudagraph_manager is not None
@@ -1038,8 +1071,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
         eager tower's ops compile through torch-spyre's per-op kernels, which the guard
         expects on the serving path, and enumerating them would dominate startup.
         """
-        if not self.supports_mm_inputs or (
-            self.model_config.runner_type != "pooling" and not self._compiled_tower_blocks
+        if (
+            not self.supports_mm_inputs
+            or self._parallel_encoder
+            or (self.model_config.runner_type != "pooling" and not self._compiled_tower_blocks)
         ):
             return
         mm_budget = getattr(self, "mm_budget", None)

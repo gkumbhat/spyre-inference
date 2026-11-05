@@ -659,6 +659,22 @@ class TorchSpyrePlatform(CpuPlatform):
         )
 
     @classmethod
+    def _check_parallel_encoder(cls, vllm_config: VllmConfig) -> None:
+        """The parallel encoder needs a multimodal decoder and its own executor."""
+        model_config = vllm_config.model_config
+        if model_config is None or model_config.get_multimodal_config() is None:
+            raise ValueError("parallel_encoder.enabled needs a multimodal model.")
+        if model_config.runner_type == "pooling":
+            raise ValueError("parallel_encoder.enabled does not support pooling models.")
+        backend = vllm_config.parallel_config.distributed_executor_backend
+        name = backend.__name__ if isinstance(backend, type) else str(backend)
+        if not name.endswith("ParallelEncoderExecutor"):
+            raise ValueError(
+                "parallel_encoder.enabled needs --distributed-executor-backend "
+                "spyre_inference.v1.executor.parallel_encoder.executor.ParallelEncoderExecutor"
+            )
+
+    @classmethod
     def _align_block_size(cls, vllm_config: VllmConfig) -> None:
         cache_config = vllm_config.cache_config
 
@@ -961,7 +977,14 @@ class TorchSpyrePlatform(CpuPlatform):
         # ---- scheduler ----
         scheduler_config = vllm_config.scheduler_config
         # Caps how many sequences prefill in one batch (SPYRE_MAX_NUM_PARTIAL_PREFILLS).
+        from spyre_inference.config.parallel_encoder import ParallelEncoderConfig
+
         scheduler_class = "spyre_inference.v1.core.scheduler.TorchSpyreScheduler"
+        if ParallelEncoderConfig.is_enabled(vllm_config):
+            cls._check_parallel_encoder(vllm_config)
+            scheduler_class = (
+                "spyre_inference.v1.core.parallel_encoder_scheduler.ParallelEncoderScheduler"
+            )
         logger.info("Loading scheduler from: %s", scheduler_class)
         scheduler_config.scheduler_cls = scheduler_class
 
