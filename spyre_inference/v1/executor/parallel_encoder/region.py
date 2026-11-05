@@ -76,7 +76,10 @@ def region_block_size_bytes(vllm_config: "VllmConfig") -> int:
 
     Deepstack towers (Qwen3-VL), whose cached rows are wider than the LM's
     inputs, are not supported."""
+    import torch
+
     model_config = vllm_config.model_config
+    assert isinstance(model_config.dtype, torch.dtype)
     return model_config.get_inputs_embeds_size() * model_config.dtype.itemsize
 
 

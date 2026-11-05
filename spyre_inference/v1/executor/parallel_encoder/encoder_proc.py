@@ -27,7 +27,7 @@ import os
 import queue
 import time
 from multiprocessing.connection import Connection
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 
@@ -188,7 +188,7 @@ class EncoderProc:
                 mm_kwargs, device=self.device, pin_memory=False
             ):
                 # (num_items, rows, hidden) tensor or a list of (rows, hidden).
-                outputs.extend(self.model.embed_multimodal(**mm_kwargs_batch))
+                outputs.extend(cast(Any, self.model).embed_multimodal(**mm_kwargs_batch))
         assert len(outputs) == len(items), (
             f"encoder produced {len(outputs)} outputs for {len(items)} items"
         )

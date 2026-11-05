@@ -192,7 +192,7 @@ class ParallelEncoderScheduler(TorchSpyreScheduler):
 
         # SchedulerOutput has no field for this; it reaches the workers pickled, and
         # TorchSpyreModelRunner reads it with getattr.
-        output.encoder_region_loads = self._pending_loads_this_step  # type: ignore[attr-defined]
+        output.encoder_region_loads = self._pending_loads_this_step
         # Free region blocks for anything the cache manager evicted this step.
         # A hash can be evicted AND re-dispatched within one pass (the same
         # image referenced by a new request after eviction); the eviction is
@@ -372,7 +372,7 @@ class ParallelEncoderScheduler(TorchSpyreScheduler):
                     mm_hash=item_identifier,
                     modality=mm_feature.modality,
                     block_ids=block_ids,
-                    data=mm_feature.data,
+                    data=mm_feature.data,  # ty: ignore[invalid-argument-type]
                 )
             )
             scheduled_this_call.add(item_identifier)

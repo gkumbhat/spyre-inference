@@ -1,0 +1,585 @@
+<title>Spyre Parallel Encoder Port</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans+Condensed:wght@500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+/* Layout: one working column — header, diagram + inspector, phase board, verification, acceptance. */
+:root {
+  --bg: #f4f6f9;
+  --surface: #ffffff;
+  --ink: #161a21;
+  --muted: #586172;
+  --line: #d6dbe3;
+  --accent: #3552c8;
+  --new-fill: #fcefd9; --new-stroke: #b9741a;
+  --reuse-fill: #e3ebfa; --reuse-stroke: #4a6cbc;
+  --shm-fill: #e0f1e4; --shm-stroke: #3b8753;
+  --spyre-fill: #ede4fa; --spyre-stroke: #7549bd;
+  --ok: #2b8a4b; --active: #3552c8; --todo: #9aa2b0; --blocked: #c23b3b;
+  --dim: 0.22;
+  --font-display: "IBM Plex Sans Condensed", "Arial Narrow", system-ui, sans-serif;
+  --font-body: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #11141a; --surface: #191d24; --ink: #e5e8ee; --muted: #9aa3b2; --line: #2b313b; --accent: #8ea4ff;
+    --new-fill: #392b14; --new-stroke: #dfa04a;
+    --reuse-fill: #1a2740; --reuse-stroke: #7c99df;
+    --shm-fill: #15301e; --shm-stroke: #6bc189;
+    --spyre-fill: #291e3c; --spyre-stroke: #b088e6;
+    --ok: #5cc27f; --active: #8ea4ff; --todo: #6b7383; --blocked: #ee7a7a;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #11141a; --surface: #191d24; --ink: #e5e8ee; --muted: #9aa3b2; --line: #2b313b; --accent: #8ea4ff;
+  --new-fill: #392b14; --new-stroke: #dfa04a;
+  --reuse-fill: #1a2740; --reuse-stroke: #7c99df;
+  --shm-fill: #15301e; --shm-stroke: #6bc189;
+  --spyre-fill: #291e3c; --spyre-stroke: #b088e6;
+  --ok: #5cc27f; --active: #8ea4ff; --todo: #6b7383; --blocked: #ee7a7a;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--bg); color: var(--ink);
+  font-family: var(--font-body); font-size: 14px; line-height: 1.5;
+}
+.wrap {
+  max-width: 1240px; margin: 0 auto;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 28px 56px;
+  display: flex; flex-direction: column; gap: 36px;
+}
+h1, h2, h3 { font-family: var(--font-display); font-weight: 600; text-wrap: balance; margin: 0; letter-spacing: 0.005em; }
+h1 { font-size: 30px; line-height: 1.15; }
+h2 { font-size: 20px; }
+h3 { font-size: 15px; }
+p { margin: 0; }
+code, .mono { font-family: var(--font-mono); font-size: 12.5px; }
+.eyebrow { font-family: var(--font-mono); font-size: 11.5px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+.muted { color: var(--muted); }
+
+header { display: flex; flex-direction: column; gap: 14px; }
+.lede { max-width: 68ch; color: var(--muted); }
+.meta { display: flex; flex-wrap: wrap; gap: 8px 18px; font-family: var(--font-mono); font-size: 12px; color: var(--muted); }
+.meta b { color: var(--ink); font-weight: 500; }
+
+.progress { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+.prog { display: flex; flex-direction: column; gap: 6px; }
+.prog-head { display: flex; justify-content: space-between; gap: 8px; font-size: 12.5px; }
+.prog-head span:last-child { font-family: var(--font-mono); color: var(--muted); font-variant-numeric: tabular-nums; }
+.bar { height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; display: flex; }
+.bar i { display: block; height: 100%; }
+.bar .d { background: var(--ok); }
+.bar .a { background: var(--active); }
+
+section { display: flex; flex-direction: column; gap: 14px; }
+.section-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 10px; }
+
+.filters { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip {
+  font: inherit; font-size: 12.5px; cursor: pointer;
+  padding: 4px 11px; border-radius: 999px;
+  border: 1px solid var(--line); background: var(--surface); color: var(--ink);
+}
+.chip[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--surface); }
+.chip:focus-visible, .node:focus-visible, .comp-link:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.arch { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 16px; align-items: start; }
+.diagram { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; overflow-x: auto; }
+.diagram svg { display: block; width: 100%; min-width: 860px; height: auto; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 16px; padding: 10px 14px; border-top: 1px solid var(--line); font-size: 12px; color: var(--muted); min-width: 860px; }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.sw { width: 12px; height: 12px; border-radius: 3px; border: 1.5px solid; display: inline-block; }
+.dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+
+svg text { font-family: var(--font-body); fill: var(--ink); }
+svg .g-label { font-family: var(--font-mono); font-size: 11px; fill: var(--muted); letter-spacing: 0.04em; }
+svg .group { fill: none; stroke: var(--line); stroke-width: 1.5; stroke-dasharray: 5 4; }
+svg .n-title { font-size: 13px; font-weight: 600; }
+svg .n-sub { font-size: 11px; fill: var(--muted); }
+svg .edge { fill: none; stroke: var(--muted); stroke-width: 1.4; }
+svg .edge.async { stroke-dasharray: 4 3; }
+svg .edge-num { font-family: var(--font-mono); font-size: 10.5px; font-weight: 500; fill: var(--surface); }
+svg .edge-badge { fill: var(--muted); }
+svg .edge-label { font-size: 10.5px; fill: var(--muted); }
+svg .arrowhead { fill: var(--muted); }
+.node { cursor: pointer; transition: opacity 160ms ease; }
+.node rect, .node path.body { stroke-width: 1.5; }
+.node.k-new rect, .node.k-new path.body { fill: var(--new-fill); stroke: var(--new-stroke); }
+.node.k-reuse rect { fill: var(--reuse-fill); stroke: var(--reuse-stroke); }
+.node.k-shm path.body { fill: var(--shm-fill); stroke: var(--shm-stroke); }
+.node.k-spyre rect { fill: var(--spyre-fill); stroke: var(--spyre-stroke); }
+.node.selected rect, .node.selected path.body { stroke: var(--accent); stroke-width: 3; }
+.node.dimmed { opacity: var(--dim); }
+.node .st { stroke: var(--surface); stroke-width: 2; }
+.st-done { fill: var(--ok); } .st-active { fill: var(--active); } .st-todo { fill: var(--todo); } .st-blocked { fill: var(--blocked); }
+@media (prefers-reduced-motion: reduce) { .node { transition: none; } }
+
+.inspector { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 16px; display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.inspector h3 { font-size: 17px; }
+.kv { display: grid; grid-template-columns: 74px minmax(0, 1fr); gap: 4px 10px; font-size: 12.5px; }
+.kv dt { color: var(--muted); }
+.kv dd { margin: 0; overflow-wrap: anywhere; }
+.inspector ul { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 4px; }
+.task-mini { list-style: none; padding: 0 !important; }
+.task-mini li { display: flex; gap: 8px; align-items: baseline; }
+
+.pill { display: inline-flex; align-items: center; gap: 5px; font-family: var(--font-mono); font-size: 11px; letter-spacing: 0.03em; padding: 1px 8px; border-radius: 999px; border: 1px solid currentColor; white-space: nowrap; }
+.pill.done { color: var(--ok); } .pill.active { color: var(--active); } .pill.todo { color: var(--todo); } .pill.blocked { color: var(--blocked); }
+.pill.open { color: var(--todo); } .pill.confirmed { color: var(--ok); } .pill.differs { color: var(--blocked); }
+
+.board { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; }
+.col { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 14px; display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.col-head { display: flex; flex-direction: column; gap: 4px; padding-bottom: 8px; border-bottom: 1px solid var(--line); }
+.col-head p { font-size: 12.5px; color: var(--muted); }
+.tasks { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 9px; }
+.task { display: grid; grid-template-columns: 34px minmax(0, 1fr); gap: 2px 8px; font-size: 13px; }
+.task .tid { font-family: var(--font-mono); font-size: 11px; color: var(--muted); padding-top: 2px; }
+.task .tmeta { grid-column: 2; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.comp-link { font: inherit; font-family: var(--font-mono); font-size: 11px; color: var(--accent); background: none; border: 0; padding: 0; cursor: pointer; text-decoration: underline; text-underline-offset: 2px; }
+.task.is-done .ttext { color: var(--muted); }
+
+.tbl-wrap { overflow-x: auto; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; min-width: 640px; }
+th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font-family: var(--font-mono); font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); font-weight: 500; }
+tr:last-child td { border-bottom: 0; }
+td.id { font-family: var(--font-mono); font-size: 12px; white-space: nowrap; }
+
+.decisions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.decision { border-top: 2px solid var(--line); padding-top: 10px; display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.decision p { color: var(--muted); font-size: 13px; }
+
+footer { font-family: var(--font-mono); font-size: 11.5px; color: var(--muted); border-top: 1px solid var(--line); padding-top: 14px; }
+
+@media (max-width: 1100px) {
+  .arch { grid-template-columns: minmax(0, 1fr); }
+  .board { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 640px) {
+  h1 { font-size: 24px; }
+  .progress, .board, .decisions { grid-template-columns: minmax(0, 1fr); }
+}
+</style>
+
+<div class="wrap">
+  <header>
+    <span class="eyebrow">spyre-inference · implementation tracker</span>
+    <h1>Spyre Parallel Encoder Port</h1>
+    <p class="lede">Porting the in-engine parallel encoder from the upstream vLLM fork into the spyre-inference plugin. The vision tower runs in its own process, on CPU by default, while the decoder keeps its tensor-parallel Spyre workers. Click a component in the diagram to see its source, target file, changes and tasks.</p>
+    <div class="meta" id="meta"></div>
+    <div class="progress" id="progress"></div>
+  </header>
+
+  <section aria-labelledby="arch-h">
+    <div class="section-head">
+      <h2 id="arch-h">Architecture</h2>
+      <div class="filters" id="filters" role="group" aria-label="Highlight components touched by a phase"></div>
+    </div>
+    <div class="arch">
+      <div class="diagram">
+        <svg id="svg" viewBox="0 0 1080 560" role="img" aria-label="Parallel encoder architecture on Spyre"></svg>
+        <div class="legend">
+          <span><i class="sw" style="background:var(--new-fill);border-color:var(--new-stroke)"></i>Ported from the fork</span>
+          <span><i class="sw" style="background:var(--spyre-fill);border-color:var(--spyre-stroke)"></i>Spyre-specific change</span>
+          <span><i class="sw" style="background:var(--reuse-fill);border-color:var(--reuse-stroke)"></i>Existing vLLM, reused</span>
+          <span><i class="sw" style="background:var(--shm-fill);border-color:var(--shm-stroke)"></i>Shared memory</span>
+          <span><i class="dot st-done" style="background:var(--ok)"></i>Done</span>
+          <span><i class="dot" style="background:var(--active)"></i>In progress</span>
+          <span><i class="dot" style="background:var(--todo)"></i>Not started</span>
+        </div>
+      </div>
+      <aside class="inspector" id="inspector" aria-live="polite"></aside>
+    </div>
+  </section>
+
+  <section aria-labelledby="board-h">
+    <div class="section-head"><h2 id="board-h">Phases</h2><span class="muted">Status is updated as each task lands on the branch.</span></div>
+    <div class="board" id="board"></div>
+  </section>
+
+  <section aria-labelledby="bench-h">
+    <div class="section-head"><h2 id="bench-h">Benchmark results</h2><span class="muted" id="bench-note"></span></div>
+    <div class="tbl-wrap"><table id="bench"></table></div>
+  </section>
+
+  <section aria-labelledby="verify-h">
+    <div class="section-head"><h2 id="verify-h">Check before building</h2><span class="muted">Assumptions the port depends on</span></div>
+    <div class="tbl-wrap"><table id="verify"></table></div>
+  </section>
+
+  <section aria-labelledby="dec-h">
+    <h2 id="dec-h">Departures from the upstream design</h2>
+    <div class="decisions" id="decisions"></div>
+  </section>
+
+  <section aria-labelledby="ac-h">
+    <div class="section-head"><h2 id="ac-h">Acceptance criteria</h2><span class="muted">Adapted from spec_as_built.md §8 for Spyre</span></div>
+    <div class="tbl-wrap"><table id="ac"></table></div>
+  </section>
+
+  <section aria-labelledby="log-h">
+    <div class="section-head"><h2 id="log-h">Log</h2><span class="muted">Environment findings, decisions and progress, newest last</span></div>
+    <div class="tbl-wrap"><table id="log"></table></div>
+  </section>
+
+  <footer id="footer"></footer>
+</div>
+
+<script>
+const META = { updated: "2026-11-05 23:15", branch: "feat/parallel-encoder", remote: "gkumbhat", head: "see git log", base: "78512255 (origin/main)", source: "/home/senuser/vllm (fork)", vllm: "0.33" };
+
+const PHASES = [
+  { id: "P1", name: "Port + CPU encoder", goal: "All files ported, CPU encoder, Pixtral / Ministral-3 at TP1. Image request works end to end; text-only is token-exact." },
+  { id: "P2", name: "TP and correctness", goal: "TP2/4, logprob-close vs inline Spyre tower, cache reuse and crash tests." },
+  { id: "P3", name: "Spyre-card encoder", goal: "encoder_device: spyre:N on a card outside the TP set, with its own compile and warmup." },
+  { id: "P4", name: "Benchmarks", goal: "vllm-bench-serve vs inline at low and high multimodal concurrency, then Gemma-4." },
+];
+
+const TASKS = [
+  { id: "1.1", phase: "P1", status: "done", text: "Create branch feat/parallel-encoder from origin/main", comp: [] },
+  { id: "1.2", phase: "P1", status: "done", text: "Port ParallelEncoderConfig: cpu default, spyre:N parsing, encoder_dtype, encoder_num_threads", comp: ["config"] },
+  { id: "1.3", phase: "P1", status: "done", text: "Port channel, region sizing, allocator and profiling (import paths only)", comp: ["channel", "alloc"] },
+  { id: "1.4", phase: "P1", status: "done", text: "Host-only RegionReader (slice + clone); RegionWriter kept for CPU", comp: ["reader", "writer", "region"] },
+  { id: "1.5", phase: "P1", status: "done", text: "Encoder process: exclude the Spyre plugin, stock CpuPlatform, bf16 compute, eager", comp: ["encmain", "tower"] },
+  { id: "1.6", phase: "P1", status: "done", text: "Executor: device validation, channel slot, child environment and config", comp: ["executor"] },
+  { id: "1.7", phase: "P1", status: "done", text: "Scheduler on TorchSpyreScheduler; 5-tuple return for vLLM 0.33; channel pickup", comp: ["sched", "ecm"] },
+  { id: "1.8", phase: "P1", status: "done", text: "Platform selects the scheduler when enabled; skips decoder tower warmup", comp: ["platform"] },
+  { id: "1.9", phase: "P1", status: "done", text: "TorchSpyreModelRunner._execute_mm_encoder loads the region first", comp: ["runner", "merge"] },
+  { id: "1.10", phase: "P1", status: "done", text: "Unit tests for allocator, config, region read/write and channel slot (22 pass)", comp: ["alloc"] },
+  { id: "1.11", phase: "P1", status: "done", text: "Sync the shared env to main: vLLM 0.33, RPM bundle main_snap_2026_11_02_06", comp: [] },
+  { id: "1.12", phase: "P1", status: "done", text: "Existing scheduler and platform tests still pass (107)", comp: ["sched", "platform"] },
+  { id: "1.13", phase: "P1", status: "done", text: "ty@0.0.16 clean on the new code (one existing error in multimodal_merge.py, also on main)", comp: [] },
+  { id: "1.14", phase: "P1", status: "done", text: "Smoke run on hardware: Ministral-3 3B at TP1, eager; text-only exact, images exact or logprob-close", comp: ["llm"] },
+  { id: "2.1", phase: "P2", status: "done", text: "Run at TP4 with a compiled decoder: exact or logprob-close vs inline (TP2 set aside)", comp: ["llm", "executor"] },
+  { id: "2.2", phase: "P2", status: "done", text: "End-to-end logprob-close test vs the inline Spyre tower passes (tests/e2e/test_parallel_encoder.py, 14B, compiled)", comp: ["merge", "tower"] },
+  { id: "2.3", phase: "P2", status: "done", text: "Encoder cache reuse and no-leak test (scheduler-level, real schedule() loop)", comp: ["ecm", "alloc", "region"] },
+  { id: "2.4", phase: "P2", status: "done", text: "Encoder crash test: SIGKILL mid-request gives EngineDeadError at once, no hang (smoke/crash.py)", comp: ["executor"] },
+  { id: "2.6", phase: "P2", status: "done", text: "Parked requests no longer take Spyre's single partial-prefill slot", comp: ["sched"] },
+  { id: "2.7", phase: "P2", status: "done", text: "Compiled decoder: TP4 done and the decoder skips its tower compile (engine init well under half of inline's)", comp: ["runner", "llm"] },
+  { id: "2.8", phase: "P2", status: "done", text: "Unlink the region file once every process has attached; no /dev/shm leak after a forced kill", comp: ["region", "executor", "runner"] },
+  { id: "2.5", phase: "P2", status: "done", text: "Reserve host cores for a CPU encoder: an even share by default, or encoder_num_threads", comp: ["platform", "encmain"] },
+  { id: "3.1", phase: "P3", status: "todo", text: "Accept spyre:N (compiled only); child keeps the plugin and runs SpyreVisionEncoderMixin; testable at TP1-3 with 4 cards", comp: ["tower", "config"] },
+  { id: "3.2", phase: "P3", status: "todo", text: "Tower compile and warmup inside the encoder process", comp: ["encmain"] },
+  { id: "3.3", phase: "P3", status: "todo", text: "Write embeddings card-to-host into the region", comp: ["writer"] },
+  { id: "4.1", phase: "P4", status: "active", text: "Benchmark CPU encoder vs inline: first pass done (encoder bound, not batching); fix in, rerun pending", comp: ["executor"] },
+  { id: "4.2", phase: "P4", status: "todo", text: "Benchmark the Spyre-card encoder", comp: ["tower"] },
+  { id: "4.3", phase: "P4", status: "todo", text: "Gemma-4 bring-up on the parallel encoder", comp: ["tower"] },
+  { id: "4.4", phase: "P4", status: "todo", text: "User docs: when each mode wins, and how to configure it", comp: ["config"] },
+];
+
+const COMPONENTS = {
+  client:   { title: "Client / API", sub: "chat request", kind: "reuse", x: 10, y: 205, w: 112, h: 64,
+              what: "OpenAI chat request with images. Input processing computes mm_hash.", up: "—", to: "unchanged", changes: [] },
+  sched:    { title: "ParallelEncoderScheduler", sub: "extends TorchSpyreScheduler", kind: "spyre", x: 168, y: 52, w: 296, h: 76,
+              what: "Dispatches every not-cached image in the decode window to the encoder process, truncates decode before the first image that is not ready, and emits encoder_region_loads.",
+              up: "vllm/v1/core/sched/parallel_encoder_scheduler.py", to: "spyre_inference/v1/core/parallel_encoder_scheduler.py",
+              changes: ["Base class TorchSpyreScheduler instead of AsyncScheduler (async scheduling is off on CpuPlatform)", "_try_schedule_encoder_inputs returns 5 values in vLLM 0.33", "Reads the channel from a module slot the executor fills (replaces the engine/core.py edit)", "Sets encoder_region_loads as an instance attribute (replaces the output.py edit)"] },
+  ecm:      { title: "EncoderCacheManager", sub: "mm_hash refcounts", kind: "reuse", x: 168, y: 146, w: 144, h: 66,
+              what: "vLLM's own cache manager, rebuilt with the decoupled working-set size. Single eviction authority.", up: "vllm/v1/core/encoder_cache_manager.py", to: "unchanged (reused)", changes: [] },
+  alloc:    { title: "RegionBlockAllocator", sub: "contiguous ranges", kind: "new", x: 320, y: 146, w: 144, h: 66,
+              what: "Contiguous block range per image, coalescing free list. Slaved to EncoderCacheManager.", up: "vllm/v1/executor/parallel_encoder/region.py", to: "spyre_inference/v1/executor/parallel_encoder/region.py", changes: ["Import paths only"] },
+  channel:  { title: "EncoderChannel", sub: "dispatch_q · completion_q", kind: "new", x: 168, y: 230, w: 296, h: 58,
+              what: "Two multiprocessing queues: EncodeBatch out, EncodeDone back. Embedding bytes travel through the region.", up: "vllm/v1/executor/parallel_encoder/channel.py", to: "spyre_inference/v1/executor/parallel_encoder/channel.py", changes: ["None"] },
+  platform: { title: "TorchSpyrePlatform", sub: "scheduler choice · warmup skip", kind: "spyre", x: 168, y: 306, w: 296, h: 62,
+              what: "check_and_update_config always overwrites scheduler_cls. It picks the parallel-encoder scheduler when parallel_encoder.enabled is set, and skips the decoder's tower warmup.",
+              up: "—", to: "spyre_inference/platform.py, threading_config.py", changes: ["Select ParallelEncoderScheduler when enabled", "Skip _warmup_multimodal_encoder on the decoder", "Reserve host cores for a CPU encoder (phase 2)"] },
+  config:   { title: "ParallelEncoderConfig", sub: "additional_config", kind: "spyre", x: 168, y: 386, w: 296, h: 58,
+              what: "Settings under additional_config[\"parallel_encoder\"]: enabled, encoder_device, encoder_cache_tokens, max_dispatch_batch_embeds, max_inflight_encode_images.",
+              up: "vllm/config/parallel_encoder.py", to: "spyre_inference/config/parallel_encoder.py",
+              changes: ["encoder_device defaults to cpu", "Parses cpu and spyre:N instead of cuda:N", "Adds encoder_dtype (CPU compute dtype) and encoder_num_threads"] },
+  encmain:  { title: "encoder_main loop", sub: "continuous batching", kind: "spyre", x: 538, y: 52, w: 210, h: 58,
+              what: "Child process. Coalesces queued items up to max_dispatch_batch_embeds and batches them with group_and_batch_mm_kwargs.",
+              up: "vllm/v1/executor/parallel_encoder/encoder_proc.py", to: "spyre_inference/v1/executor/parallel_encoder/encoder_proc.py",
+              changes: ["Starts without the Spyre plugin (VLLM_PLUGINS, TORCH_DEVICE_BACKEND_AUTOLOAD=0)", "gloo distributed init on CPU", "Compute in encoder_dtype, cast to the region dtype on write"] },
+  tower:    { title: "Vision tower + projector", sub: "stock vLLM · mm_encoder_only", kind: "reuse", x: 538, y: 126, w: 210, h: 66,
+              what: "The model's embed_multimodal, loaded with mm_encoder_only so the language model weights are skipped.", up: "vllm model code", to: "unchanged on CPU; SpyreVisionEncoderMixin on spyre:N (phase 3)", changes: ["Must confirm row counts match Spyre's merge"] },
+  writer:   { title: "RegionWriter", sub: "one copy per image", kind: "new", x: 538, y: 208, w: 210, h: 58,
+              what: "Writes each image's embedding into its contiguous block range, then posts EncodeDone.", up: "vllm/v1/executor/parallel_encoder/region_io.py", to: "spyre_inference/v1/executor/parallel_encoder/region_io.py", changes: ["CPU path unchanged", "CUDA scattered path dropped"] },
+  region:   { title: "Shared region", sub: "/dev/shm · fp16 rows", kind: "shm", x: 538, y: 330, w: 210, h: 96, shape: "cyl",
+              what: "vLLM's ECSharedRegion: an mmap block grid, one block per embedding row, keyed by mm_hash. The executor creates it before workers spawn.", up: "vllm/distributed/ec_transfer/ec_connector/cpu/ec_shared_region.py", to: "unchanged (reused)", changes: ["pin_memory is a no-op without CUDA"] },
+  runner:   { title: "TorchSpyreModelRunner", sub: "_execute_mm_encoder override", kind: "spyre", x: 818, y: 52, w: 238, h: 66,
+              what: "Loads encoder_region_loads into encoder_cache, then calls the base method, which finds nothing left to encode.",
+              up: "vllm/v1/worker/gpu_model_runner.py (_maybe_load_encoder_region)", to: "spyre_inference/v1/worker/spyre_model_runner.py", changes: ["Override instead of a vLLM patch", "V1 runner first; V2 deferred"] },
+  reader:   { title: "RegionReader", sub: "host slice + clone", kind: "spyre", x: 818, y: 136, w: 238, h: 58,
+              what: "Copies rows out of /dev/shm into host tensors. Spyre already keeps image embeddings on the host, so there is no device copy here.",
+              up: "vllm/v1/executor/parallel_encoder/region_io.py", to: "spyre_inference/v1/executor/parallel_encoder/region_io.py", changes: ["No streams, no swap_blocks_batch", "clone() because freed blocks are reused"] },
+  merge:    { title: "embed_input_ids merge", sub: "placeholder positions", kind: "reuse", x: 818, y: 212, w: 238, h: 58,
+              what: "Spyre's existing merge places the image rows at the [IMG] placeholders on the host, then uploads.", up: "—", to: "unchanged", changes: [] },
+  llm:      { title: "Decoder forward · TP", sub: "Spyre cards 0..TP-1", kind: "reuse", x: 818, y: 288, w: 238, h: 58,
+              what: "The language model on the TP workers, paged KV, compiled blocks. Unchanged.", up: "—", to: "unchanged", changes: [] },
+  executor: { title: "ParallelEncoderExecutor", sub: "extends MultiprocExecutor · creates region and queues, spawns and monitors the encoder", kind: "spyre", x: 150, y: 494, w: 920, h: 50,
+              what: "Creates the region and queues before workers spawn, starts one encoder process, and shuts the engine down if it dies.",
+              up: "vllm/v1/executor/parallel_encoder/executor.py", to: "spyre_inference/v1/executor/parallel_encoder/executor.py",
+              changes: ["Validates cpu or spyre:N outside the TP set", "Publishes the channel for the scheduler", "Builds the child config and environment for a CPU encoder"] },
+};
+
+const GROUPS = [
+  { label: "ENGINECORE PROCESS", x: 152, y: 22, w: 328, h: 440 },
+  { label: "ENCODER PROCESS · CPU BY DEFAULT", x: 522, y: 22, w: 242, h: 260 },
+  { label: "DECODER TP WORKERS · SPYRE", x: 802, y: 22, w: 270, h: 440 },
+];
+
+const EDGES = [
+  { n: 1, d: "M122,237 L145,237 L145,90 L168,90", label: "request", lx: 20, ly: 228 },
+  { n: 2, d: "M464,259 L500,259 L500,81 L538,81", label: "dispatch", lx: 470, ly: 172 },
+  { n: 3, d: "M643,266 L643,330", label: "write", lx: 650, ly: 302 },
+  { n: 4, d: "M538,250 L512,250 L512,276 L464,276", label: "EncodeDone", lx: 468, ly: 296, async: true },
+  { n: 5, d: "M316,52 L316,10 L937,10 L937,52", label: "SchedulerOutput + encoder_region_loads", lx: 560, ly: 6 },
+  { n: 6, d: "M748,378 L782,378 L782,165 L818,165", label: "read", lx: 752, ly: 392 },
+  { d: "M937,118 L937,136" }, { d: "M937,194 L937,212" }, { d: "M937,270 L937,288" },
+];
+
+const VERIFY = [
+  { id: "V1", item: "Pixtral / Mistral3 in vLLM 0.33 honours mm_encoder_only and skips the language model weights", why: "Encoder process memory and load time", status: "confirmed", note: "Both build the LM inside _mark_language_model, which stubs it under mm_encoder_only" },
+  { id: "V2", item: "Stock tower output rows equal mm_position.get_num_embeds() and the rows Spyre's merge expects", why: "Region sizing and the merge", status: "confirmed", note: "Encoder asserts rows == allocated blocks; one and two images merged correctly in the smoke run" },
+  { id: "V3", item: "SchedulerOutput reaches the workers pickled, so an extra instance attribute survives", why: "Replaces the output.py edit", status: "confirmed", note: "execute_model goes through the shm broadcast, which pickles it" },
+  { id: "V4", item: "MultiModalBudget and get_mm_features_in_window keep the fork's signatures in 0.33", why: "Scheduler and executor sizing", status: "confirmed", note: "Same signatures" },
+  { id: "V5", item: "_try_schedule_encoder_inputs return arity in vLLM 0.33", why: "Scheduler override", status: "differs", note: "Returns 5 values (adds duplicate_encoder_inputs); fork returns 4" },
+  { id: "V7", item: "The fork's _get_encoder_cache_hidden_dim helper exists in vLLM 0.33", why: "Region row width", status: "differs", note: "Not in 0.33; rows sized by get_inputs_embeds_size(), so deepstack towers are unsupported" },
+  { id: "V8", item: "EncoderCacheManager is built directly from cache_size", why: "Decoupled working set", status: "differs", note: "0.33 uses create_manager() via ec_manager_config; rebuild goes through the same factory" },
+  { id: "V6", item: "Async scheduling available on the Spyre platform", why: "Fork requires AsyncScheduler", status: "differs", note: "CpuPlatform forces it off; runner asserts off" },
+];
+
+const DECISIONS = [
+  { t: "Scheduler base is TorchSpyreScheduler", p: "Async scheduling is off on CpuPlatform, so subclassing AsyncScheduler would gain nothing. Overlap comes from the encoder running in its own process. The partial-prefill cap stays." },
+  { t: "No vLLM patch", p: "The three edits to engine/core.py, sched/output.py and the GPU runner become a module-level channel slot, an instance attribute on SchedulerOutput, and a runner method override." },
+  { t: "Host-only region reader", p: "Spyre's image embeddings already live on the host and the merge runs there, so the read is a slice and a clone. The host-memory bounce noted upstream mostly goes away." },
+  { t: "CPU encoder runs without the plugin", p: "Every process registers Spyre custom ops and the Spyre Pixtral class. The child starts with the plugin excluded so it loads the stock CPU tower and never touches a card." },
+];
+
+const AC = [
+  { id: "AC-1", c: "Launch starts exactly one encoder process plus the decoder TP workers", phase: "P1", status: "done" },
+  { id: "AC-2", c: "Encoder process holds only the vision tower and projector", phase: "P1", status: "done" },
+  { id: "AC-3", c: "Decoder runs at TP>1 unchanged; encoder uses no TP and no card in the TP set", phase: "P2", status: "done" },
+  { id: "AC-4", c: "Greedy output is logprob-close to the inline Spyre tower", phase: "P2", status: "done" },
+  { id: "AC-5", c: "Text-only requests skip the encoder and match the inline engine token-exactly", phase: "P1", status: "done" },
+  { id: "AC-6", c: "A repeated image is encoded once, reused, and its region blocks are freed", phase: "P2", status: "done" },
+  { id: "AC-7", c: "One request's encode overlaps other requests' decode", phase: "P2", status: "done" },
+  { id: "AC-8", c: "Encoder death gives a clear error and a clean shutdown, no hang", phase: "P2", status: "done" },
+  { id: "AC-9", c: "ITL and throughput at high multimodal concurrency vs inline", phase: "P4", status: "active" },
+  { id: "AC-10", c: "TTFT and E2E at high multimodal concurrency vs inline", phase: "P4", status: "active" },
+  { id: "AC-11", c: "Low-concurrency behaviour documented (inline may win)", phase: "P4", status: "todo" },
+];
+
+const BENCH = {
+  note: "serve_ministral3-14b_tp4_mm_random: Ministral-3 14B, decoder TP4 on 4 Spyre cards, 200 prompts at concurrency 4, one 2048x2048 image each. Relative to the inline arm only; absolute numbers are not recorded here.",
+  arms: [
+    { name: "Inline", sub: "tower compiled on the decoder cards" },
+    { name: "Parallel, 6 threads", sub: "CPU encoder, first run, batch cap bug" },
+    { name: "Parallel, 32 threads", sub: "CPU encoder, batching fix" },
+  ],
+  rows: [
+    { m: "TTFT mean", v: ["baseline", "~3.9x worse", "running"] },
+    { m: "TPOT mean", v: ["baseline", "~40% better", "running"] },
+    { m: "ITL p99", v: ["baseline", "~55% better", "running"] },
+    { m: "E2E latency mean", v: ["baseline", "~36% worse", "running"] },
+    { m: "Output throughput", v: ["baseline", "~27% lower", "running"] },
+    { m: "Boot to server ready, warm cache", v: ["baseline", "~40% faster", "~40% faster"] },
+    { m: "Vision tower compile at boot", v: ["9 budgets", "none", "none"] },
+    { m: "CPU encode time per image", v: ["n/a", "reference", "~3.9x faster"] },
+  ],
+};
+
+const NOTES = [
+  { date: "2026-11-05", kind: "env", text: "Spyre shells must source ~/spyre-libs/env.sh (pinned RPMs), not only /etc/profile.d/ibm-aiu-setup.sh; otherwise torch_spyre/_C.so fails on an undefined flex symbol." },
+  { date: "2026-11-05", kind: "env", text: "Ran scripts/install-pinned-rpms.sh --rebuild: refilled ~/spyre-libs with bundle main_snap_2026_11_02_06 (flex 2.1.0, 8267eae), rebuilt torch-spyre and moved the shared .venv from vLLM 0.32 to 0.33. The pr1441-review branch needs a re-sync to run again." },
+  { date: "2026-11-05", kind: "decision", text: "Encoder child is spawned with VLLM_PLUGINS=\"\" and TORCH_DEVICE_BACKEND_AUTOLOAD=0, set only around proc.start(): CpuPlatform forces spawn, so the TP workers (already started) keep the Spyre environment." },
+  { date: "2026-11-05", kind: "decision", text: "Region rows are sized from get_inputs_embeds_size(); the fork's _get_encoder_cache_hidden_dim does not exist in vLLM 0.33. Deepstack towers (Qwen3-VL) are out of scope." },
+  { date: "2026-11-05", kind: "decision", text: "vLLM 0.33 now defers encoder-cache allocation until after KV allocation (_allocate_encoder_inputs). Our override returns empty lists, so it never runs for us and we keep the fork's eager allocation; revisit for the preemption follow-up." },
+  { date: "2026-11-05", kind: "decision", text: "Decoder skips the tower warmup and compile when the parallel encoder is on, but still warms vision_merge, which runs on the decoder." },
+  { date: "2026-11-05", kind: "progress", text: "Phase 1 code committed and pushed (e914aee0). 22 new unit tests and 107 existing scheduler/platform tests pass." },
+  { date: "2026-11-05", kind: "progress", text: "Type fixes pushed; tracker, spec and diagrams now live in parallel_encoder_port/ on the branch. Next: hardware smoke run with a Ministral-3 checkpoint at TP1." },
+  { date: "2026-11-05", kind: "progress", text: "Smoke run started: Ministral-3-3B-Instruct-2512-BF16 (same Pixtral tower as the 14B, faster to iterate), eager, TP1, parallel encoder on CPU. Script: parallel_encoder_port/smoke/smoke.py; compares text-only, one image, a repeated image, two images, and a batched pass against an inline run." },
+  { date: "2026-11-05", kind: "finding", text: "Run 1: the platform picked ParallelEncoderScheduler, but the encoder child failed with 'Invalid attention backend for None'. With VLLM_PLUGINS empty, the +empty vLLM build resolves no platform. Fix: also set VLLM_TARGET_DEVICE=cpu for the child, which gives CpuPlatform with gloo. The LM layers are built on meta under mm_encoder_only (V1 holds), but building them still selects an attention backend." },
+  { date: "2026-11-05", kind: "finding", text: "Run 2: the child resolved CpuPlatform and loaded only the vision weights, then failed in torch.accelerator.empty_cache(): no accelerator without torch-spyre. Fix: call vLLM's _set_torch_accelerator_to_noop() before loading, as its CPU runner does. The failure surfaced as 'Encoder process failed to start' and a clean engine shutdown." },
+  { date: "2026-11-05", kind: "result", text: "Run 3 passes. Encoder process ready on CPU; scheduler working set 48400 rows, 16 images in flight. Versus inline: text-only 24/24 tokens exact; one image and repeated image exact despite a bf16 CPU tower against fp16 Spyre; two images first differ at token 14 on a near-tie (-3.366 vs -3.370), logprob-close; batched pass 4/4 identical. Results in parallel_encoder_port/smoke/results/." },
+  { date: "2026-11-05", kind: "result", text: "AC-2: the encoder-only model keeps only the vision side (420.1M parameters: vision encoder 403.3M, adapter 12.6M, patch merger 4.2M); language_model is a StageMissingLayer with no weights. Checked with smoke/encoder_params.py." },
+  { date: "2026-11-05", kind: "note", text: "Eager latencies in this run are dominated by first-use per-op compiles and say nothing about steady-state speed; measure in phase 4 with warm, compiled engines." },
+  { date: "2026-11-05", kind: "progress", text: "Phase 1 done. Next: phase 2, starting with TP2, then the 14B and a compiled run, cache-reuse and crash tests." },
+  { date: "2026-11-05", kind: "finding", text: "TP2 parallel run: encoder ready, text-only and one image decoded, then both TP workers failed on the repeated-image prompt: 'Deeptools dbo-opt compilation failed with exit code 256' in the vocab-parallel embedding all_reduce (SpyreCommunicator) inside embed_input_ids. Not on the parallel-encoder path; running the inline TP2 baseline to see whether it hits the same op." },
+  { date: "2026-11-05", kind: "progress", text: "Added tests/parallel_encoder/test_scheduler.py: drives the real schedule() loop with fake queues to check one dispatch per image, decode truncation, one region load per completion, repeated-image reuse, eviction returning region blocks, and the in-flight cap. Not run yet (card busy with TP2)." },
+  { date: "2026-11-05", kind: "finding", text: "Inline TP2 baseline fails on the same op at the same prompt (dbo-opt compile of the vocab-parallel embedding all_reduce), so the TP2 failure is a Spyre stack issue with eager TP2 multimodal, not the parallel encoder. Up to the failure, parallel TP2 output matched inline exactly (text-only and one image). Next: retry TP2 compiled, or isolate the all_reduce shape for a torch-spyre report." },
+  { date: "2026-11-05", kind: "fix", text: "Admission bug found by the scheduler tests: Spyre admits one partial prefill per step (SPYRE_MAX_NUM_PARTIAL_PREFILLS=1), and a request parked on an image still being encoded counted as one. One slow CPU encode would stop every new request, text-only included. TorchSpyreScheduler now counts through _num_partial_prefills(), and ParallelEncoderScheduler leaves out requests whose next image is in flight." },
+  { date: "2026-11-05", kind: "result", text: "Scheduler tests pass: 36 parallel-encoder tests plus 99 existing scheduler/platform tests (135 total)." },
+  { date: "2026-11-05", kind: "decision", text: "TP2 set aside on the user's call; testing TP4 directly (expected to work on this stack). Smoke run at TP4: parallel then inline, same prompts." },
+  { date: "2026-11-05", kind: "decision", text: "Supported modes, per the user: the vision tower runs either on CPU in eager mode, or on its own Spyre card in compiled mode. The decoder always compiles, as today. Config gains a compiled property (true only for spyre:N). Smoke runs move to a compiled decoder; the eager-decoder runs so far were a bring-up shortcut. With 4 cards, a Spyre-card encoder can only be tested at TP1 to TP3." },
+  { date: "2026-11-05", kind: "finding", text: "TP4 eager: encoder ready beside 4 TP workers; text-only and one image decoded with the same text as TP1, then all 4 workers failed on the third prompt with the same dbo-opt all_reduce compile error as TP2. It is the eager decoder compiling a new collective shape on first use; inline TP2 eager fails identically. Moved to the compiled decoder, which records its shapes at warmup." },
+  { date: "2026-11-05", kind: "progress", text: "Compiled-decoder smoke run started at TP4 (parallel, then inline)." },
+  { date: "2026-11-05", kind: "result", text: "TP4 compiled decoder works in both modes, no all_reduce failure. Versus inline: text-only, one image and repeated image token-exact; two images first differ at token 11 on a near-tie (-2.110 vs -2.116), logprob-close; batched 3/4 identical (the fourth is the two-image prompt). Results in smoke/results/*_tp4_compiled.*." },
+  { date: "2026-11-05", kind: "result", text: "Startup, compiled TP4 Ministral-3 3B: the inline engine init includes the decoder-side vision tower compile at 9 budgets; the parallel encoder's decoder compiles only the vision merge, and its engine init took well under half of inline's, even running first on a cold decoder compile cache. Warmup and attention-recording differences between the two runs are compile-cache order, not code." },
+  { date: "2026-11-05", kind: "plan", text: "User direction: finish phase 2, then run correctness and performance tests. Performance uses vllm bench serve with the repo's vllm-benchmarks/benchmarks/spyre/multimodal-serve-tests.yaml entry serve_ministral3-14b_tp4_mm_random: Ministral-3 14B, TP4, max-model-len 32768, random-mm dataset, 200 prompts, concurrency 4, 8192 input + one 2048x2048 image, 128 output tokens, ignore-eos, p99/p100 TTFT/TPOT/ITL/E2E. A/B runs through the repo harness (run_vllm_benchmarks.py) with only the executor backend and additional_config added for the parallel arm." },
+  { date: "2026-11-05", kind: "decision", text: "CPU threads: a CPU encoder counts as one more worker. By default it takes an even share (32 CPUs, TP4: 6 for the encoder, 7 per TP worker after the clamp); encoder_num_threads reserves an exact count. The platform and the executor read the same helper, so they agree. A Spyre-card encoder reserves nothing." },
+  { date: "2026-11-05", kind: "result", text: "AC-8 passes on hardware (3B, TP1, compiled decoder): SIGKILL on the encoder with four two-image requests queued. The monitor logged 'Encoder process SpyreEncoderProc died unexpectedly' and shut the executor down; the requests failed with EngineDeadError almost at once, no hang. The monitor now reaps the process before logging so the exit code is shown." },
+  { date: "2026-11-05", kind: "progress", text: "Benchmark A/B configs written in parallel_encoder_port/bench/{inline,parallel}/multimodal-serve-tests.yaml: the stock Ministral-3 entry, and the same entry plus --distributed-executor-backend and --additional-config. Harness command preview matches the stock config exactly apart from those two flags." },
+  { date: "2026-11-05", kind: "fix", text: "Shared-memory leak: three region files were left in /dev/shm, including one from a completed run whose TP workers missed the shutdown grace period and were force-killed before the executor unlinked the file. Fix: TP workers now attach the region in the runner's __init__ (before they report ready), and the executor unlinks the file at the end of _post_init_executor, once every process has it mapped. Linux keeps the memory alive for existing mappings, so a crash can no longer leave a file. Crash test rerun: exit code -9 now logged, 0 files left." },
+  { date: "2026-11-05", kind: "progress", text: "Automated correctness test added: tests/e2e/test_parallel_encoder.py (Ministral-3 14B, the CI-cached checkpoint; compiled decoder, TP1, max-model-len 512). Text-only must be token-exact and images logprob-close against the inline tower. Collects; hardware run next." },
+  { date: "2026-11-05", kind: "result", text: "tests/e2e/test_parallel_encoder.py passes on hardware (Ministral-3 14B, compiled decoder, TP1): text-only token-exact, one and two images logprob-close. No region file left in /dev/shm." },
+  { date: "2026-11-05", kind: "progress", text: "Phase 2 complete except AC-7 (encode overlaps decode), which the serve benchmark measures. Next: the Ministral-3 14B TP4 multimodal serve benchmark, inline then parallel, through make perf-tests." },
+  { date: "2026-11-05", kind: "result", text: "Benchmark, inline arm (serve_ministral3-14b_tp4_mm_random, stock config): 200/200 requests ok. This is the baseline every other arm is compared against. Its boot includes the decoder-side vision tower compile at 9 budgets." },
+  { date: "2026-11-05", kind: "finding", text: "Boot breakdown: the inline arm booted on a cold compile cache and the parallel arm on the warm cache it left, so most of the raw boot gap was cache, not code. Only the vision tower compile, which the parallel decoder skips, is a real saving. Fair boot comparison needs the same cache state: rebooting the inline server once on the warm cache, boot only, after the parallel arm." },
+  { date: "2026-11-05", kind: "result", text: "AC-7 seen in the parallel arm's server stats: 4 requests running and 0 waiting at every sample, image requests entering prefill while the others decode." },
+  { date: "2026-11-05", kind: "decision", text: "User asked for boot time in the comparison. Reporting server-ready (harness) and engine init (vLLM log), with the vision compile split out, both arms from the same compile-cache state." },
+  { date: "2026-11-05", kind: "result", text: "Benchmark, parallel arm (CPU encoder, 6 threads): 200/200 ok. Relative to inline: TTFT about 3.9x worse; TPOT about 40% better; p99 ITL about 55% better; E2E latency worse; output throughput about 27% lower. No region left in /dev/shm." },
+  { date: "2026-11-05", kind: "result", text: "Warm-cache inline boot (same cache state as the parallel arm): the parallel encoder reaches server ready about 40% sooner on equal footing, which is about the vision tower compile it skips." },
+  { date: "2026-11-05", kind: "finding", text: "Why TTFT got worse: the encoder was asynchronous but not batching. The executor capped each embed_multimodal call at the scheduler's encoder_compute_budget, which follows max_num_batched_tokens, which the Spyre platform caps at 512, so the cap collapsed to one image (~3040 rows). With 4 requests in flight and a slow eager encode per 2048x2048 image on 6 cores, images queued one call at a time and prefills arrived more slowly than inline. The fork decoupled region size from the decode budget (learning #4) but the batch cap kept the coupling; the Spyre cap makes it bite here." },
+  { date: "2026-11-05", kind: "fix", text: "Encoder batch cap now defaults to the whole working set (every image the region holds); max_dispatch_batch_embeds still sets an explicit cap. Next: a CPU-tower microbenchmark (batch 1 vs 4, 6 vs 32 threads) to see whether batching or threads moves per-image encode time, before rerunning the 70-minute parallel arm." },
+  { date: "2026-11-05", kind: "result", text: "CPU tower microbenchmark (14B Pixtral tower, max-size image = 3025 rows, bf16, eager): a batch of 4 costs 4x a single image at both 6 and 32 threads, so batching gives no per-image gain on CPU; 32 threads encode about 3.9x faster than 6. The 6-thread default was the bottleneck, not batching. At 32 threads the encoder keeps well ahead of inline's per-request turnover." },
+  { date: "2026-11-05", kind: "finding", text: "Thread budget: the pod sets SPYRE_NUM_CPUS=32 (cgroup quota is 64). Inline gave each TP worker 8 threads; the first parallel run took the encoder's 6 out of the same 32, leaving 7 per worker. Rerun uses SPYRE_NUM_CPUS=64 with encoder_num_threads=32, which leaves 8 per TP worker as inline and fits the 64-CPU quota." },
+  { date: "2026-11-05", kind: "progress", text: "Rerunning the parallel arm: bench/parallel_32t (batching fix + 32-thread encoder), same benchmark otherwise." },
+  { date: "2026-11-05", kind: "fix", text: "Observability gap: the encoder process logged nothing, because without the plugin no process configures logging and spyre_inference loggers have no handler; even the 'first batch encoded' line never appeared. encoder_main now calls vllm's configure_logging and routes spyre_inference through vllm, as vLLM's own workers do. Verified: an encoder INFO line now reaches the server log." },
+  { date: "2026-11-05", kind: "progress", text: "Live encoder metrics behind PARALLEL_ENCODER_PROFILE=1 (interval PARALLEL_ENCODER_PROFILE_INTERVAL). PROFILE[sched] in the engine log now adds images in flight and per-image wait (dispatch to completion, mean and max). PROFILE[enc] from the encoder process: batches, items per batch, encode and write time, busy/idle share, and now max queued. These answer 'is the encoder keeping up' directly instead of inferring it from prefill cadence. The running 32-thread rerun started before this fix, so it has none of these lines." },
+];
+
+const STATUS_LABEL = { done: "done", active: "in progress", todo: "not started", blocked: "blocked", open: "open", confirmed: "confirmed", differs: "differs" };
+const NS = "http://www.w3.org/2000/svg";
+let selected = "sched";
+let phaseFilter = "all";
+try { phaseFilter = localStorage.getItem("pe-phase") || "all"; } catch (e) {}
+
+function compStatus(id) {
+  const ts = TASKS.filter(t => t.comp.includes(id));
+  if (!ts.length) return "done";
+  if (ts.every(t => t.status === "done")) return "done";
+  if (ts.some(t => t.status === "blocked")) return "blocked";
+  if (ts.some(t => t.status === "active" || t.status === "done")) return "active";
+  return "todo";
+}
+function el(tag, attrs = {}, text) {
+  const e = document.createElementNS(NS, tag);
+  for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+  if (text != null) e.textContent = text;
+  return e;
+}
+function pill(status) { return `<span class="pill ${status}">${STATUS_LABEL[status]}</span>`; }
+function esc(s) { return String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
+
+function drawDiagram() {
+  const svg = document.getElementById("svg");
+  svg.innerHTML = "";
+  const defs = el("defs");
+  const m = el("marker", { id: "ah", viewBox: "0 0 10 10", refX: "9", refY: "5", markerWidth: "7", markerHeight: "7", orient: "auto-start-reverse" });
+  m.appendChild(el("path", { d: "M0,0 L10,5 L0,10 z", class: "arrowhead" }));
+  defs.appendChild(m);
+  svg.appendChild(defs);
+  for (const g of GROUPS) {
+    svg.appendChild(el("rect", { x: g.x, y: g.y, width: g.w, height: g.h, rx: 12, class: "group" }));
+    svg.appendChild(el("text", { x: g.x + 12, y: g.y + 18, class: "g-label" }, g.label));
+  }
+  for (const e of EDGES) {
+    svg.appendChild(el("path", { d: e.d, class: "edge" + (e.async ? " async" : ""), "marker-end": "url(#ah)" }));
+    if (e.label) {
+      svg.appendChild(el("text", { x: e.lx, y: e.ly, class: "edge-label" }, e.label));
+    }
+    if (e.n) {
+      const [sx, sy] = e.d.slice(1).split(" ")[0].split(",").map(Number);
+      svg.appendChild(el("circle", { cx: sx, cy: sy, r: 8, class: "edge-badge" }));
+      svg.appendChild(el("text", { x: sx, y: sy + 3.6, "text-anchor": "middle", class: "edge-num" }, e.n));
+    }
+  }
+  const touched = phaseFilter === "all" ? null : new Set(TASKS.filter(t => t.phase === phaseFilter).flatMap(t => t.comp));
+  for (const [id, c] of Object.entries(COMPONENTS)) {
+    const st = compStatus(id);
+    const g = el("g", { class: `node k-${c.kind}` + (id === selected ? " selected" : "") + (touched && !touched.has(id) ? " dimmed" : ""), tabindex: "0", role: "button", "aria-label": `${c.title}, ${STATUS_LABEL[st]}`, "data-id": id });
+    if (c.shape === "cyl") {
+      const ry = 10;
+      g.appendChild(el("path", { class: "body", d: `M${c.x},${c.y + ry} a${c.w / 2},${ry} 0 0,1 ${c.w},0 v${c.h - 2 * ry} a${c.w / 2},${ry} 0 0,1 ${-c.w},0 z` }));
+      g.appendChild(el("path", { class: "body", d: `M${c.x},${c.y + ry} a${c.w / 2},${ry} 0 0,0 ${c.w},0`, style: "fill:none" }));
+    } else {
+      g.appendChild(el("rect", { x: c.x, y: c.y, width: c.w, height: c.h, rx: 7 }));
+    }
+    const cx = c.x + c.w / 2;
+    const midY = c.y + c.h / 2;
+    g.appendChild(el("text", { x: cx, y: midY - 2, "text-anchor": "middle", class: "n-title" }, c.title));
+    g.appendChild(el("text", { x: cx, y: midY + 14, "text-anchor": "middle", class: "n-sub" }, c.sub));
+    g.appendChild(el("circle", { cx: c.x + c.w - 9, cy: c.y + (c.shape === "cyl" ? 22 : 9), r: 5, class: `st st-${st}` }));
+    g.addEventListener("click", () => select(id));
+    g.addEventListener("keydown", ev => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); select(id); } });
+    svg.appendChild(g);
+  }
+}
+
+function drawInspector() {
+  const c = COMPONENTS[selected];
+  const st = compStatus(selected);
+  const ts = TASKS.filter(t => t.comp.includes(selected));
+  const kindLabel = { new: "Ported from the fork", spyre: "Spyre-specific change", reuse: "Existing vLLM, reused", shm: "Shared memory" }[c.kind];
+  document.getElementById("inspector").innerHTML = `
+    <span class="eyebrow">${kindLabel}</span>
+    <h3>${esc(c.title)}</h3>
+    <div>${pill(st)}</div>
+    <p>${esc(c.what)}</p>
+    <dl class="kv">
+      <dt>Upstream</dt><dd class="mono">${esc(c.up)}</dd>
+      <dt>Target</dt><dd class="mono">${esc(c.to)}</dd>
+    </dl>
+    ${c.changes.length ? `<div><span class="eyebrow">Changes</span><ul>${c.changes.map(x => `<li>${esc(x)}</li>`).join("")}</ul></div>` : ""}
+    ${ts.length ? `<div><span class="eyebrow">Tasks</span><ul class="task-mini">${ts.map(t => `<li><span class="mono muted">${t.id}</span><span>${esc(t.text)}</span></li>`).join("")}</ul></div>` : ""}
+  `;
+}
+
+function select(id) { selected = id; drawDiagram(); drawInspector(); }
+
+function drawFilters() {
+  const f = document.getElementById("filters");
+  const opts = [{ id: "all", name: "All phases" }, ...PHASES.map(p => ({ id: p.id, name: p.id }))];
+  f.innerHTML = opts.map(o => `<button type="button" class="chip" id="flt-${o.id}" data-p="${o.id}" aria-pressed="${o.id === phaseFilter}">${o.name}</button>`).join("");
+  f.querySelectorAll("button").forEach(b => b.addEventListener("click", () => {
+    phaseFilter = b.dataset.p;
+    try { localStorage.setItem("pe-phase", phaseFilter); } catch (e) {}
+    drawFilters(); drawDiagram();
+  }));
+}
+
+function drawProgress() {
+  document.getElementById("progress").innerHTML = PHASES.map(p => {
+    const ts = TASKS.filter(t => t.phase === p.id);
+    const d = ts.filter(t => t.status === "done").length, a = ts.filter(t => t.status === "active").length;
+    return `<div class="prog"><div class="prog-head"><span>${p.id} · ${esc(p.name)}</span><span>${d}/${ts.length}</span></div>
+      <div class="bar" role="img" aria-label="${d} of ${ts.length} done"><i class="d" style="width:${100 * d / ts.length}%"></i><i class="a" style="width:${100 * a / ts.length}%"></i></div></div>`;
+  }).join("");
+}
+
+function drawBoard() {
+  const b = document.getElementById("board");
+  b.innerHTML = PHASES.map(p => {
+    const ts = TASKS.filter(t => t.phase === p.id);
+    return `<div class="col"><div class="col-head"><span class="eyebrow">${p.id}</span><h3>${esc(p.name)}</h3><p>${esc(p.goal)}</p></div>
+      <ul class="tasks">${ts.map(t => `<li class="task${t.status === "done" ? " is-done" : ""}"><span class="tid">${t.id}</span><span class="ttext">${esc(t.text)}</span>
+        <span class="tmeta">${pill(t.status)}${t.comp.map(c => `<button type="button" class="comp-link" data-c="${c}">${esc(COMPONENTS[c].title)}</button>`).join("")}</span></li>`).join("")}</ul></div>`;
+  }).join("");
+  b.querySelectorAll(".comp-link").forEach(x => x.addEventListener("click", () => {
+    select(x.dataset.c);
+    document.getElementById("arch-h").scrollIntoView({ behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" });
+  }));
+}
+
+function drawBench() {
+  document.getElementById("bench-note").textContent = BENCH.note;
+  document.getElementById("bench").innerHTML = `<thead><tr><th>Metric</th>${BENCH.arms.map(a =>
+    `<th>${esc(a.name)}<br><span class="muted" style="text-transform:none;letter-spacing:0">${esc(a.sub)}</span></th>`).join("")}</tr></thead><tbody>${BENCH.rows.map(r =>
+    `<tr><td>${esc(r.m)}</td>${r.v.map(v => `<td class="mono">${v === "running" ? pill("active") : esc(v)}</td>`).join("")}</tr>`).join("")}</tbody>`;
+}
+
+function drawTables() {
+  document.getElementById("verify").innerHTML = `<thead><tr><th>ID</th><th>Assumption</th><th>Affects</th><th>Status</th><th>Finding</th></tr></thead><tbody>${VERIFY.map(v =>
+    `<tr><td class="id">${v.id}</td><td>${esc(v.item)}</td><td class="muted">${esc(v.why)}</td><td>${pill(v.status)}</td><td class="muted">${esc(v.note)}</td></tr>`).join("")}</tbody>`;
+  document.getElementById("ac").innerHTML = `<thead><tr><th>ID</th><th>Criterion</th><th>Phase</th><th>Status</th></tr></thead><tbody>${AC.map(a =>
+    `<tr><td class="id">${a.id}</td><td>${esc(a.c)}</td><td class="id">${a.phase}</td><td>${pill(a.status)}</td></tr>`).join("")}</tbody>`;
+  document.getElementById("log").innerHTML = `<thead><tr><th>Date</th><th>Kind</th><th>Note</th></tr></thead><tbody>${NOTES.map(n =>
+    `<tr><td class="id">${n.date}</td><td class="id">${n.kind}</td><td>${esc(n.text)}</td></tr>`).join("")}</tbody>`;
+  document.getElementById("decisions").innerHTML = DECISIONS.map(d => `<div class="decision"><h3>${esc(d.t)}</h3><p>${esc(d.p)}</p></div>`).join("");
+}
+
+function drawMeta() {
+  document.getElementById("meta").innerHTML = `<span>branch <b>${META.remote}/${META.branch}</b></span><span>head <b>${META.head}</b></span><span>base <b>${META.base}</b></span><span>vLLM <b>${META.vllm}</b></span><span>updated <b>${META.updated}</b></span>`;
+  document.getElementById("footer").textContent = `Source: ${META.source}. Spec: spec_as_built.md. Updated ${META.updated}.`;
+}
+
+drawMeta(); drawProgress(); drawFilters(); drawDiagram(); drawInspector(); drawBoard(); drawBench(); drawTables();
+</script>

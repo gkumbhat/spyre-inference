@@ -17,7 +17,7 @@
 ``additional_config["parallel_encoder"]``."""
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 
@@ -57,10 +57,10 @@ class ParallelEncoderConfig:
 
     @classmethod
     def from_vllm_config(cls, vllm_config: "VllmConfig") -> "ParallelEncoderConfig | None":
-        additional = vllm_config.additional_config
+        additional: object = vllm_config.additional_config
         if not isinstance(additional, dict):
             return None
-        raw = additional.get(_ADDITIONAL_CONFIG_KEY)
+        raw = cast(dict[str, Any], additional).get(_ADDITIONAL_CONFIG_KEY)
         if not raw:
             return None
         if isinstance(raw, ParallelEncoderConfig):

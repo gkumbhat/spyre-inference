@@ -669,6 +669,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
                         self.mm_budget, ParallelEncoderConfig.from_vllm_config(self.vllm_config)
                     ),
                 )
+                assert isinstance(self.model_config.dtype, torch.dtype)
                 self._encoder_region_reader = RegionReader(region, self.model_config.dtype)
             self._encoder_region_reader.load(self.encoder_cache, loads)
         return super()._execute_mm_encoder(scheduler_output)
