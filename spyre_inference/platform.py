@@ -895,9 +895,14 @@ class TorchSpyrePlatform(CpuPlatform):
 
         # Clamp CPU threading env vars before workers fork so they inherit the
         # corrected values. DP is rejected above, so world_size is the worker count.
-        from spyre_inference.threading_config import configure_threading
+        from spyre_inference.config.parallel_encoder import ParallelEncoderConfig
+        from spyre_inference.threading_config import configure_threading, encoder_cpu_share
 
-        configure_threading(parallel_config.world_size)
+        pe_config = ParallelEncoderConfig.from_vllm_config(vllm_config)
+        reserved = 0
+        if pe_config is not None and pe_config.enabled and not pe_config.compiled:
+            reserved = encoder_cpu_share(parallel_config.world_size, pe_config.encoder_num_threads)
+        configure_threading(parallel_config.world_size, reserved_cpus=reserved)
 
         # ---- worker ----
         from spyre_inference import pin_model_runner
@@ -977,10 +982,8 @@ class TorchSpyrePlatform(CpuPlatform):
         # ---- scheduler ----
         scheduler_config = vllm_config.scheduler_config
         # Caps how many sequences prefill in one batch (SPYRE_MAX_NUM_PARTIAL_PREFILLS).
-        from spyre_inference.config.parallel_encoder import ParallelEncoderConfig
-
         scheduler_class = "spyre_inference.v1.core.scheduler.TorchSpyreScheduler"
-        if ParallelEncoderConfig.is_enabled(vllm_config):
+        if pe_config is not None and pe_config.enabled:
             cls._check_parallel_encoder(vllm_config)
             scheduler_class = (
                 "spyre_inference.v1.core.parallel_encoder_scheduler.ParallelEncoderScheduler"

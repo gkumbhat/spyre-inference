@@ -958,6 +958,19 @@ def test_configure_threading_overrides_when_enabled(monkeypatch):
         assert os.environ[env] == "4", env  # ceil(8 / 2)
 
 
+def test_configure_threading_reserves_cpus_for_the_parallel_encoder(monkeypatch):
+    """A CPU parallel encoder's share is held back before splitting across workers."""
+    from spyre_inference.threading_config import configure_threading, encoder_cpu_share
+
+    monkeypatch.delenv("SPYRE_UPDATE_THREAD_CONFIG", raising=False)
+    _force_cpu_count(monkeypatch, 32.0)
+
+    assert encoder_cpu_share(4, None) == 6  # 32 // (4 workers + encoder)
+    assert encoder_cpu_share(4, 12) == 12
+    configure_threading(worker_count=4, reserved_cpus=12)
+    assert os.environ["OMP_NUM_THREADS"] == "5"  # ceil((32 - 12) / 4)
+
+
 def test_configure_threading_single_worker_uses_full_count(monkeypatch):
     """TP=1 clamps to the detected budget, not the host core count."""
     from spyre_inference.threading_config import configure_threading

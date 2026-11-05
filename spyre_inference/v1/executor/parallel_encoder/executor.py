@@ -40,6 +40,7 @@ from vllm.utils.system_utils import get_mp_context
 from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 
 from spyre_inference.config.parallel_encoder import ParallelEncoderConfig
+from spyre_inference.threading_config import encoder_cpu_share
 from spyre_inference.v1.executor.parallel_encoder import channel_slot
 from spyre_inference.v1.executor.parallel_encoder.channel import EncoderChannel
 from spyre_inference.v1.executor.parallel_encoder.encoder_proc import encoder_main
@@ -61,6 +62,8 @@ _CPU_ENCODER_ENV = {
     "VLLM_PLUGINS": "",
     "TORCH_DEVICE_BACKEND_AUTOLOAD": "0",
     "VLLM_TARGET_DEVICE": "cpu",
+    # Marks the process for tools that need to find it, such as the crash test.
+    "SPYRE_PARALLEL_ENCODER_PROC": "1",
 }
 
 
@@ -174,7 +177,9 @@ class ParallelEncoderExecutor(MultiprocExecutor):
                 region_block_size_bytes=self._region_block_size_bytes,
                 region_dtype=self.vllm_config.model_config.dtype,
                 max_batch_embeds=self._max_batch_embeds,
-                num_threads=self._pe_config.encoder_num_threads,
+                num_threads=encoder_cpu_share(
+                    self.parallel_config.world_size, self._pe_config.encoder_num_threads
+                ),
                 dispatch_q=self._dispatch_q,
                 completion_q=self._completion_q,
                 ready_pipe=ready_writer,

@@ -79,8 +79,20 @@ def get_cpu_count(use_logical_cpus: bool = False) -> tuple[float | None, str]:
     return cpu_count, detection_message
 
 
-def configure_threading(worker_count: int) -> None:
+def encoder_cpu_share(worker_count: int, requested: int | None) -> int:
+    """Threads for a CPU parallel encoder: ``requested``, else an even share with the
+    ``worker_count`` decoder workers."""
+    if requested:
+        return requested
+    cpu_count, _ = get_cpu_count()
+    return max(1, int(cpu_count // (worker_count + 1))) if cpu_count else 1
+
+
+def configure_threading(worker_count: int, reserved_cpus: int = 0) -> None:
     """Clamp the CPU threading env vars to the per-worker CPU budget.
+
+    ``reserved_cpus`` are held back for another process (a CPU parallel encoder) before
+    the rest is split across the workers.
 
     Enabled by default; set SPYRE_UPDATE_THREAD_CONFIG=0 to only warn instead of
     overriding. vLLM already forces OMP_NUM_THREADS=1 for its own multi-worker
@@ -95,6 +107,9 @@ def configure_threading(worker_count: int) -> None:
     )
 
     cpu_count, detection_message = get_cpu_count()
+    if cpu_count is not None and reserved_cpus:
+        cpu_count = max(float(worker_count), cpu_count - reserved_cpus)
+        detection_message += f", {reserved_cpus} reserved for the parallel encoder"
     # math.ceil may sum to slightly more than cpu_count across workers.
     cpus_per_worker = math.ceil(cpu_count / worker_count) if cpu_count is not None else None
 
