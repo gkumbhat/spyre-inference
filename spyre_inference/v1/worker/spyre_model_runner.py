@@ -646,9 +646,21 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # kernels against real pages. Populated by initialize_kv_cache_tensors.
         self._spyre_kv_caches: dict[str, SpyrePagedKVCache] = {}
 
-        # The vision tower runs in the encoder process; this runner only merges.
+        # The vision tower runs in the encoder process; this runner only merges. Attach
+        # the region now, before this worker reports ready: the executor unlinks its
+        # file once every process has, so a killed engine leaves nothing in /dev/shm.
         self._parallel_encoder = ParallelEncoderConfig.is_enabled(vllm_config)
         self._encoder_region_reader: RegionReader | None = None
+        if self._parallel_encoder:
+            assert self.mm_budget is not None
+            assert isinstance(self.model_config.dtype, torch.dtype)
+            region = build_region(
+                vllm_config,
+                resolve_encoder_cache_size(
+                    self.mm_budget, ParallelEncoderConfig.from_vllm_config(vllm_config)
+                ),
+            )
+            self._encoder_region_reader = RegionReader(region, self.model_config.dtype)
 
         # Replace Triton kernel with a pure-PyTorch implementation.
         # GPUModelRunner uses @triton.jit which is mocked on non-GPU platforms.
@@ -661,16 +673,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         base finds them cached; with the parallel encoder it never schedules an input."""
         loads = getattr(scheduler_output, "encoder_region_loads", None)
         if loads:
-            if self._encoder_region_reader is None:
-                assert self.mm_budget is not None
-                region = build_region(
-                    self.vllm_config,
-                    resolve_encoder_cache_size(
-                        self.mm_budget, ParallelEncoderConfig.from_vllm_config(self.vllm_config)
-                    ),
-                )
-                assert isinstance(self.model_config.dtype, torch.dtype)
-                self._encoder_region_reader = RegionReader(region, self.model_config.dtype)
+            assert self._encoder_region_reader is not None
             self._encoder_region_reader.load(self.encoder_cache, loads)
         return super()._execute_mm_encoder(scheduler_output)
 

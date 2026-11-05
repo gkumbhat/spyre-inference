@@ -212,6 +212,29 @@ def test_region_read_survives_block_reuse(region):
     torch.testing.assert_close(cache["first"], first, rtol=0, atol=0)
 
 
+def test_region_survives_unlink_once_attached(region):
+    """The executor unlinks the file after every process attaches: existing mappings
+    must keep sharing the same memory, and no name is left behind."""
+    import os
+
+    r, hidden, dtype = region
+    other = ECSharedRegion(
+        engine_id=r._mmap_path.removeprefix("/dev/shm/vllm_ec_").removesuffix(".mmap"),
+        num_blocks=r.num_blocks,
+        block_size_bytes=r.block_size_bytes,
+    )
+    os.unlink(r._mmap_path)
+    r._is_creator = False
+    assert not os.path.exists(r._mmap_path)
+
+    rows = torch.randn(2, hidden).to(dtype)
+    RegionWriter(r).write_batch([("x", [3, 4], rows)])
+    cache: dict[str, torch.Tensor] = {}
+    RegionReader(other, dtype).load(cache, {"x": [3, 4]})
+    torch.testing.assert_close(cache["x"], rows, rtol=0, atol=0)
+    other.cleanup()
+
+
 def test_region_load_skips_cached(region):
     r, hidden, dtype = region
     sentinel = torch.full((2, hidden), 7, dtype=dtype)

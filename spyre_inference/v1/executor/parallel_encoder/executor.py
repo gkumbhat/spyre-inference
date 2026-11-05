@@ -131,6 +131,16 @@ class ParallelEncoderExecutor(MultiprocExecutor):
     def _post_init_executor(self) -> None:
         self._spawn_encoder_proc()
         self._start_encoder_monitor()
+        self._unlink_region_file()
+
+    def _unlink_region_file(self) -> None:
+        """Every process now maps the region: the TP workers attach before reporting
+        ready and the encoder before its READY. Drop the name so a killed engine
+        leaves no file behind; the mappings keep the memory alive."""
+        path = self._region._mmap_path
+        os.unlink(path)
+        self._region._is_creator = False
+        logger.debug("parallel-encoder: unlinked %s; all processes attached", path)
 
     def _build_encoder_config(self) -> VllmConfig:
         """World size 1, eager, the encoder's compute dtype, vision-only load."""
