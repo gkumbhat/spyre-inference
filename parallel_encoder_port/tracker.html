@@ -232,7 +232,7 @@ footer { font-family: var(--font-mono); font-size: 11.5px; color: var(--muted); 
 </div>
 
 <script>
-const META = { updated: "2026-11-05 23:15", branch: "feat/parallel-encoder", remote: "gkumbhat", head: "see git log", base: "78512255 (origin/main)", source: "/home/senuser/vllm (fork)", vllm: "0.33" };
+const META = { updated: "2026-11-06 00:10", branch: "feat/parallel-encoder", remote: "gkumbhat", head: "see git log", base: "78512255 (origin/main)", source: "/home/senuser/vllm (fork)", vllm: "0.33" };
 
 const PHASES = [
   { id: "P1", name: "Port + CPU encoder", goal: "All files ported, CPU encoder, Pixtral / Ministral-3 at TP1. Image request works end to end; text-only is token-exact." },
@@ -267,7 +267,7 @@ const TASKS = [
   { id: "3.1", phase: "P3", status: "todo", text: "Accept spyre:N (compiled only); child keeps the plugin and runs SpyreVisionEncoderMixin; testable at TP1-3 with 4 cards", comp: ["tower", "config"] },
   { id: "3.2", phase: "P3", status: "todo", text: "Tower compile and warmup inside the encoder process", comp: ["encmain"] },
   { id: "3.3", phase: "P3", status: "todo", text: "Write embeddings card-to-host into the region", comp: ["writer"] },
-  { id: "4.1", phase: "P4", status: "active", text: "Benchmark CPU encoder vs inline: first pass done (encoder bound, not batching); fix in, rerun pending", comp: ["executor"] },
+  { id: "4.1", phase: "P4", status: "done", text: "Benchmark CPU encoder vs inline at high concurrency: with 32 encoder threads, throughput matches inline, tail ITL much better, TTFT worse", comp: ["executor"] },
   { id: "4.2", phase: "P4", status: "todo", text: "Benchmark the Spyre-card encoder", comp: ["tower"] },
   { id: "4.3", phase: "P4", status: "todo", text: "Gemma-4 bring-up on the parallel encoder", comp: ["tower"] },
   { id: "4.4", phase: "P4", status: "todo", text: "User docs: when each mode wins, and how to configure it", comp: ["config"] },
@@ -375,11 +375,14 @@ const BENCH = {
     { name: "Parallel, 32 threads", sub: "CPU encoder, batching fix" },
   ],
   rows: [
-    { m: "TTFT mean", v: ["baseline", "~3.9x worse", "running"] },
-    { m: "TPOT mean", v: ["baseline", "~40% better", "running"] },
-    { m: "ITL p99", v: ["baseline", "~55% better", "running"] },
-    { m: "E2E latency mean", v: ["baseline", "~36% worse", "running"] },
-    { m: "Output throughput", v: ["baseline", "~27% lower", "running"] },
+    { m: "TTFT mean", v: ["baseline", "~3.9x worse", "~41% worse"] },
+    { m: "TTFT p99", v: ["baseline", "~3.1x worse", "~17% worse"] },
+    { m: "TPOT mean", v: ["baseline", "~40% better", "~13% better"] },
+    { m: "ITL median", v: ["baseline", "~57% better", "~9% better"] },
+    { m: "ITL p99", v: ["baseline", "~55% better", "~54% better"] },
+    { m: "E2E latency mean", v: ["baseline", "~36% worse", "same"] },
+    { m: "E2E latency p99", v: ["baseline", "~51% worse", "~3% better"] },
+    { m: "Output throughput", v: ["baseline", "~27% lower", "same"] },
     { m: "Boot to server ready, warm cache", v: ["baseline", "~40% faster", "~40% faster"] },
     { m: "Vision tower compile at boot", v: ["9 budgets", "none", "none"] },
     { m: "CPU encode time per image", v: ["n/a", "reference", "~3.9x faster"] },
@@ -434,6 +437,8 @@ const NOTES = [
   { date: "2026-11-05", kind: "progress", text: "Rerunning the parallel arm: bench/parallel_32t (batching fix + 32-thread encoder), same benchmark otherwise." },
   { date: "2026-11-05", kind: "fix", text: "Observability gap: the encoder process logged nothing, because without the plugin no process configures logging and spyre_inference loggers have no handler; even the 'first batch encoded' line never appeared. encoder_main now calls vllm's configure_logging and routes spyre_inference through vllm, as vLLM's own workers do. Verified: an encoder INFO line now reaches the server log." },
   { date: "2026-11-05", kind: "progress", text: "Live encoder metrics behind PARALLEL_ENCODER_PROFILE=1 (interval PARALLEL_ENCODER_PROFILE_INTERVAL). PROFILE[sched] in the engine log now adds images in flight and per-image wait (dispatch to completion, mean and max). PROFILE[enc] from the encoder process: batches, items per batch, encode and write time, busy/idle share, and now max queued. These answer 'is the encoder keeping up' directly instead of inferring it from prefill cadence. The running 32-thread rerun started before this fix, so it has none of these lines." },
+  { date: "2026-11-05", kind: "result", text: "Benchmark, parallel arm with a 32-thread CPU encoder and the batching fix: 200/200 ok, no region left in /dev/shm. Relative to inline: output throughput and mean E2E latency the same; p99 E2E about 3% better; p99 ITL about 54% better and median ITL about 9% better; mean TPOT about 13% better; mean TTFT about 41% worse and p99 TTFT about 17% worse. Boot to server ready about 40% faster on a warm cache. The encoder now keeps up, so throughput matches inline, while decode is smoother because the decoder cards do no vision work; each request's eager CPU encode still adds to its first-token time." },
+  { date: "2026-11-05", kind: "decision", text: "Absolute performance numbers are kept out of the branch, commits and this report at the user's request; results here are relative to the inline arm. Raw benchmark output stays outside git." },
 ];
 
 const STATUS_LABEL = { done: "done", active: "in progress", todo: "not started", blocked: "blocked", open: "open", confirmed: "confirmed", differs: "differs" };
