@@ -128,10 +128,14 @@ class EncoderProc:
         )
         from vllm.model_executor.model_loader import get_model
         from vllm.platforms import current_platform
+        from vllm.v1.worker.cpu_model_runner import _set_torch_accelerator_to_noop
         from vllm.v1.worker.gpu_worker import init_worker_distributed_environment
 
         from spyre_inference.v1.executor.parallel_encoder.region_io import RegionWriter
 
+        # The loader calls torch.accelerator.empty_cache(), which raises without an
+        # accelerator; vLLM's CPU runner installs the same no-ops.
+        _set_torch_accelerator_to_noop()
         if num_threads:
             torch.set_num_threads(num_threads)
         self.vllm_config = vllm_config
