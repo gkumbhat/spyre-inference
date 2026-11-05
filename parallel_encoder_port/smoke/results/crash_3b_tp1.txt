@@ -1,0 +1,6 @@
+[crash] warm text-only ok: 'The three primary colors depend on the c'
+[crash] encoder pid 1347705; killing it with SIGKILL in 1s
+ERROR 11-05 19:44:27 [executor.py:234] Encoder process SpyreEncoderProc died unexpectedly (exit code -9), shutting down executor.
+[crash] outcome: EngineDeadError: EngineCore encountered an issue. See stack trace (above) for the root cause.
+[crash] PASS: clear error, no hang
+penc files left in /dev/shm: 0

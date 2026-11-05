@@ -220,6 +220,7 @@ class ParallelEncoderExecutor(MultiprocExecutor):
             if not _self or getattr(_self, "shutting_down", False):
                 return
             _self.is_failed = True
+            proc.join(timeout=1.0)  # reap it, so exitcode is set
             logger.error(
                 "Encoder process %s died unexpectedly (exit code %s), shutting down executor.",
                 proc.name,
