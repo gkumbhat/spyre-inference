@@ -142,6 +142,8 @@ def test_config_defaults_to_cpu():
     assert cfg is not None and cfg.enabled
     assert cfg.encoder_device == "cpu"
     assert cfg.encoder_device_index() is None
+    assert not cfg.compiled
+    assert ParallelEncoderConfig(encoder_device="spyre:2").compiled
     assert cfg.torch_dtype is torch.bfloat16
     assert ParallelEncoderConfig.is_enabled(_Cfg())
 

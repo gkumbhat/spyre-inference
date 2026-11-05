@@ -30,9 +30,11 @@ _DTYPES = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torc
 
 @dataclass(frozen=True)
 class ParallelEncoderConfig:
-    """``encoder_device`` is ``"cpu"`` or ``"spyre:<idx>"`` with idx outside the
-    decoder TP set. ``encoder_dtype`` is the tower's compute dtype on CPU, where the
-    platform's fp16 is slow; embeddings are cast to the decoder dtype on write.
+    """``encoder_device`` is ``"cpu"``, where the tower runs eager, or
+    ``"spyre:<idx>"`` with idx outside the decoder TP set, where it runs compiled. The
+    decoder compiles as usual either way. ``encoder_dtype`` is the tower's compute
+    dtype on CPU, where the platform's fp16 is slow; embeddings are cast to the
+    decoder dtype on write.
     ``encoder_num_threads`` caps the CPU encoder's torch threads (``None`` keeps
     torch's default)."""
 
@@ -71,6 +73,11 @@ class ParallelEncoderConfig:
     def is_enabled(cls, vllm_config: "VllmConfig") -> bool:
         pe_config = cls.from_vllm_config(vllm_config)
         return pe_config is not None and pe_config.enabled
+
+    @property
+    def compiled(self) -> bool:
+        """A Spyre-card tower compiles; a CPU tower runs eager."""
+        return self.encoder_device_index() is not None
 
     @property
     def torch_dtype(self) -> torch.dtype:
