@@ -1,0 +1,6 @@
+prompt         result             detail
+text_only      exact              24 tokens identical
+one_image      exact              21 tokens identical
+repeat_image   exact              24 tokens identical
+two_images     close              first difference at token 14: inline 112373 (-3.366) vs parallel 44297 (-3.370)
+_batched       info               4/4 sequences identical
