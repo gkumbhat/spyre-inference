@@ -232,7 +232,7 @@ footer { font-family: var(--font-mono); font-size: 11.5px; color: var(--muted); 
 </div>
 
 <script>
-const META = { updated: "2026-11-06 01:45", branch: "feat/parallel-encoder", remote: "gkumbhat", head: "see git log", base: "78512255 (origin/main)", source: "/home/senuser/vllm (fork)", vllm: "0.33" };
+const META = { updated: "2026-11-06 04:00", branch: "feat/parallel-encoder", remote: "gkumbhat", head: "see git log", base: "78512255 (origin/main)", source: "/home/senuser/vllm (fork)", vllm: "0.33" };
 
 const PHASES = [
   { id: "P1", name: "Port + CPU encoder", goal: "All files ported, CPU encoder, Pixtral / Ministral-3 at TP1. Image request works end to end; text-only is token-exact." },
@@ -446,6 +446,8 @@ const NOTES = [
   { date: "2026-11-06", kind: "progress", text: "Next benchmark arm: bench/parallel_prefetch, on-arrival dispatch plus the default thread split, with encoder metrics logged." },
   { date: "2026-11-06", kind: "result", text: "Benchmark, on-arrival dispatch + own encoder threads: 200/200 ok, no region left. Relative to inline: output throughput ~3% higher; E2E latency ~3% better mean and ~11% better p99; TPOT ~20% better; ITL ~53% better median and ~54% better p99; TTFT ~53% worse mean, ~10% worse p99. Boot ~40% faster." },
   { date: "2026-11-06", kind: "finding", text: "The encoder is no longer a bottleneck: PROFILE[enc] shows it idle most of the time with at most one image queued, and PROFILE[sched] shows each image's dispatch-to-done wait equal to its bare encode, finished before the request's prefill reaches it. The TTFT gap is admission: prefill occupancy is the same in every arm, but with Spyre's single prefill slot and decode no longer slowed by vision work, the four running requests hold the decoder more evenly and a new request waits longer for its prefill turn. Total time per request goes down; TTFT is a share of it that moved, not added latency." },
+  { date: "2026-11-06", kind: "finding", text: "Correction: the admission explanation above did not hold, since inline runs under the same single-prefill cap. vLLM's per-request histograms (scraped from /metrics after a short run of each arm) show both halves of TTFT grew in the parallel arm by similar amounts: queue (arrival to admission) and prefill (admission to first token). Async scheduling is off in both arms (CpuPlatform forces it), so the scheduler type does not separate them." },
+  { date: "2026-11-06", kind: "finding", text: "Per-image stage timing (PROFILE[image], PROFILE[load]) rules out transfer overhead: the decoder workers' region read is a few milliseconds per image, the host merge is negligible, the cached tensor has the same contiguous layout as inline's, and the encoder-to-scheduler notification is a small fraction of a second. The cost is the CPU encode itself. The benchmark places the image at the start of the prompt (--skip-chat-template), so no text prefill precedes it to hide the encode behind, and the first wave of images arrives together and is encoded in series on the CPU. The remaining gap is the CPU tower being slower than the compiled Spyre tower; phase 3 (compiled tower on its own card) is the route to close it." },
 ];
 
 const STATUS_LABEL = { done: "done", active: "in progress", todo: "not started", blocked: "blocked", open: "open", confirmed: "confirmed", differs: "differs" };

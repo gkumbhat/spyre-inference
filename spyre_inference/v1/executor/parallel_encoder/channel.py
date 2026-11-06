@@ -62,6 +62,8 @@ class EncodeDone:
     mm_hash: str
     ok: bool = True
     error: str | None = None
+    # Wall clock when the embedding landed in the region; set only while profiling.
+    written_at: float | None = None
 
 
 class EncoderChannel:

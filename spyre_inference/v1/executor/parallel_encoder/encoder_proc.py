@@ -332,8 +332,9 @@ def encoder_main(
                 for item in to_encode:
                     completion_q.put(EncodeDone(mm_hash=item.mm_hash, ok=False, error=str(e)))
                 raise
+            written_at = time.time() if prof.enabled else None
             for mm_hash in done_hashes:
-                completion_q.put(EncodeDone(mm_hash=mm_hash, ok=True))
+                completion_q.put(EncodeDone(mm_hash=mm_hash, ok=True, written_at=written_at))
             if prof.enabled:
                 prof.maybe_log()
     finally:

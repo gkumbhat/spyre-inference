@@ -176,6 +176,8 @@ class ParallelEncoderScheduler(TorchSpyreScheduler):
         self._encoding_inflight: set[str] = set()
         # Dispatch time per in-flight image; filled only while profiling.
         self._dispatched_at: dict[str, float] = {}
+        # Per-image wall-clock stages (dispatched, written, drained); profiling only.
+        self._image_stages: dict[str, dict[str, float]] = {}
         # mm_hashes whose embedding is already loaded into the worker caches
         # (emit a region load exactly once, on first consumption).
         self._loaded_by_workers: set[str] = set()
@@ -269,6 +271,9 @@ class ParallelEncoderScheduler(TorchSpyreScheduler):
             self._encoding_inflight.discard(done.mm_hash)
             if (sent := self._dispatched_at.pop(done.mm_hash, None)) is not None:
                 self._prof.record_image_wait(time.perf_counter() - sent)
+            if (stages := self._image_stages.get(done.mm_hash)) is not None:
+                stages["written"] = done.written_at or 0.0
+                stages["drained"] = time.time()
 
     def _flush_dispatch(self) -> None:
         if not self._dispatch_this_step:
@@ -387,6 +392,7 @@ class ParallelEncoderScheduler(TorchSpyreScheduler):
                             self._region_alloc.block_ids(item_identifier)
                         )
                         self._loaded_by_workers.add(item_identifier)
+                        self._log_image_stages(item_identifier, request)
                     continue
                 # Fail-safe: the cache manager references this item but its
                 # region blocks are gone and no worker holds it. The free-path
@@ -445,6 +451,7 @@ class ParallelEncoderScheduler(TorchSpyreScheduler):
         self._encoding_inflight.add(mm_hash)
         if self._prof.enabled:
             self._dispatched_at[mm_hash] = time.perf_counter()
+            self._image_stages[mm_hash] = {"dispatched": time.time()}
         self._dispatch_this_step.append(
             EncodeItem(
                 mm_hash=mm_hash,
@@ -452,6 +459,26 @@ class ParallelEncoderScheduler(TorchSpyreScheduler):
                 block_ids=block_ids,
                 data=mm_feature.data,  # ty: ignore[invalid-argument-type]
             )
+        )
+
+    def _log_image_stages(self, mm_hash: str, request: Request) -> None:
+        """One line per image when its region load is emitted: encode (dispatch to
+        written), notify (written to drained), and how long the ready image waited for
+        its request's window (drained to load)."""
+        stages = self._image_stages.pop(mm_hash, None)
+        if stages is None or "drained" not in stages:
+            return
+        now = time.time()
+        logger.info(
+            "parallel-encoder PROFILE[image] %s req=%s encode=%.3fs notify=%.3fs "
+            "wait_for_window=%.3fs since_arrival=%.3fs computed=%d",
+            mm_hash[:12],
+            request.request_id[:12],
+            stages["written"] - stages["dispatched"] if stages["written"] else -1.0,
+            stages["drained"] - stages["written"] if stages["written"] else -1.0,
+            now - stages["drained"],
+            now - request.arrival_time,
+            request.num_computed_tokens,
         )
 
     def _prefetch_waiting(self) -> None:

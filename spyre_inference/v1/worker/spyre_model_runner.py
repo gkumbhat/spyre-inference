@@ -78,6 +78,7 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     allocate_staging_buffers,
 )
 from spyre_inference.v1.attention.warmup import record_attention_graphs
+from spyre_inference.v1.executor.parallel_encoder.profiling import PROFILE_ENABLED
 from spyre_inference.v1.executor.parallel_encoder.region import (
     build_region,
     resolve_encoder_cache_size,
@@ -674,7 +675,15 @@ class TorchSpyreModelRunner(GPUModelRunner):
         loads = getattr(scheduler_output, "encoder_region_loads", None)
         if loads:
             assert self._encoder_region_reader is not None
+            t0 = time.perf_counter()
             self._encoder_region_reader.load(self.encoder_cache, loads)
+            if PROFILE_ENABLED:
+                logger.info(
+                    "parallel-encoder PROFILE[load] %d image(s), %d rows, region read %.3fms",
+                    len(loads),
+                    sum(len(b) for b in loads.values()),
+                    1e3 * (time.perf_counter() - t0),
+                )
         return super()._execute_mm_encoder(scheduler_output)
 
     def load_model(self, load_dummy_weights: bool = False) -> None:
