@@ -232,7 +232,7 @@ footer { font-family: var(--font-mono); font-size: 11.5px; color: var(--muted); 
 </div>
 
 <script>
-const META = { updated: "2026-11-06 04:00", branch: "feat/parallel-encoder", remote: "gkumbhat", head: "see git log", base: "78512255 (origin/main)", source: "/home/senuser/vllm (fork)", vllm: "0.33" };
+const META = { updated: "2026-11-06 06:00", branch: "feat/parallel-encoder", remote: "gkumbhat", head: "see git log", base: "78512255 (origin/main)", source: "/home/senuser/vllm (fork)", vllm: "0.33" };
 
 const PHASES = [
   { id: "P1", name: "Port + CPU encoder", goal: "All files ported, CPU encoder, Pixtral / Ministral-3 at TP1. Image request works end to end; text-only is token-exact." },
@@ -267,7 +267,7 @@ const TASKS = [
   { id: "3.1", phase: "P3", status: "todo", text: "Accept spyre:N (compiled only); child keeps the plugin and runs SpyreVisionEncoderMixin; testable at TP1-3 with 4 cards", comp: ["tower", "config"] },
   { id: "3.2", phase: "P3", status: "todo", text: "Tower compile and warmup inside the encoder process", comp: ["encmain"] },
   { id: "3.3", phase: "P3", status: "todo", text: "Write embeddings card-to-host into the region", comp: ["writer"] },
-  { id: "4.1", phase: "P4", status: "active", text: "Benchmark CPU encoder vs inline at high concurrency: throughput matches, tail ITL much better, TTFT worse; rerun with on-arrival dispatch", comp: ["executor"] },
+  { id: "4.1", phase: "P4", status: "done", text: "Benchmark CPU encoder vs inline (random-mm and WDU documents, TP4): throughput and E2E at or above inline, tail ITL much better, TTFT worse", comp: ["executor"] },
   { id: "4.2", phase: "P4", status: "todo", text: "Benchmark the Spyre-card encoder", comp: ["tower"] },
   { id: "4.3", phase: "P4", status: "todo", text: "Gemma-4 bring-up on the parallel encoder", comp: ["tower"] },
   { id: "4.4", phase: "P4", status: "todo", text: "User docs: when each mode wins, and how to configure it", comp: ["config"] },
@@ -448,6 +448,8 @@ const NOTES = [
   { date: "2026-11-06", kind: "finding", text: "The encoder is no longer a bottleneck: PROFILE[enc] shows it idle most of the time with at most one image queued, and PROFILE[sched] shows each image's dispatch-to-done wait equal to its bare encode, finished before the request's prefill reaches it. The TTFT gap is admission: prefill occupancy is the same in every arm, but with Spyre's single prefill slot and decode no longer slowed by vision work, the four running requests hold the decoder more evenly and a new request waits longer for its prefill turn. Total time per request goes down; TTFT is a share of it that moved, not added latency." },
   { date: "2026-11-06", kind: "finding", text: "Correction: the admission explanation above did not hold, since inline runs under the same single-prefill cap. vLLM's per-request histograms (scraped from /metrics after a short run of each arm) show both halves of TTFT grew in the parallel arm by similar amounts: queue (arrival to admission) and prefill (admission to first token). Async scheduling is off in both arms (CpuPlatform forces it), so the scheduler type does not separate them." },
   { date: "2026-11-06", kind: "finding", text: "Per-image stage timing (PROFILE[image], PROFILE[load]) rules out transfer overhead: the decoder workers' region read is a few milliseconds per image, the host merge is negligible, the cached tensor has the same contiguous layout as inline's, and the encoder-to-scheduler notification is a small fraction of a second. The cost is the CPU encode itself. The benchmark places the image at the start of the prompt (--skip-chat-template), so no text prefill precedes it to hide the encode behind, and the first wave of images arrives together and is encoded in series on the CPU. The remaining gap is the CPU tower being slower than the compiled Spyre tower; phase 3 (compiled tower on its own card) is the route to close it." },
+  { date: "2026-11-06", kind: "result", text: "WDU vision benchmark, main (58abac4d, inline tower) vs this branch (CPU parallel encoder): the serve_ministral3-14b_tp2_mm_vision entry of vllm-benchmarks/benchmarks/spyre/multimodal-serve-tests.yaml with its settings, except TP4 on all 4 cards as in the earlier runs; 166/166 document prompts ok in both arms, identical input. Relative to main: output throughput ~1.5% higher; E2E latency ~2% better mean and ~6% better p99; TPOT ~11% better; ITL p99 ~50% better, median the same; TTFT ~64% worse mean and ~23% worse p99. Boot to server ready ~39% faster, both arms warm; the only boot difference is main's vision tower compile." },
+  { date: "2026-11-06", kind: "note", text: "Running main from a worktree: the shared venv's editable install maps spyre_inference to one checkout, and vLLM's spawned engine and workers ignore PYTHONPATH, so the mapping was pointed at the main worktree for that arm and restored after. Each arm's code was confirmed from the platform log line numbers. The linked config does not run as committed: the harness substitutes variables only in the client's dataset-path, not in the server's allowed-local-media-path, and the dataset's relative file:// image names need absolute paths." },
 ];
 
 const STATUS_LABEL = { done: "done", active: "in progress", todo: "not started", blocked: "blocked", open: "open", confirmed: "confirmed", differs: "differs" };
