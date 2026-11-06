@@ -232,7 +232,7 @@ footer { font-family: var(--font-mono); font-size: 11.5px; color: var(--muted); 
 </div>
 
 <script>
-const META = { updated: "2026-11-06 01:00", branch: "feat/parallel-encoder", remote: "gkumbhat", head: "see git log", base: "78512255 (origin/main)", source: "/home/senuser/vllm (fork)", vllm: "0.33" };
+const META = { updated: "2026-11-06 01:45", branch: "feat/parallel-encoder", remote: "gkumbhat", head: "see git log", base: "78512255 (origin/main)", source: "/home/senuser/vllm (fork)", vllm: "0.33" };
 
 const PHASES = [
   { id: "P1", name: "Port + CPU encoder", goal: "All files ported, CPU encoder, Pixtral / Ministral-3 at TP1. Image request works end to end; text-only is token-exact." },
@@ -373,19 +373,20 @@ const BENCH = {
     { name: "Inline", sub: "tower compiled on the decoder cards" },
     { name: "Parallel, 6 threads", sub: "CPU encoder, first run, batch cap bug" },
     { name: "Parallel, 32 threads", sub: "CPU encoder, batching fix" },
+    { name: "Parallel, on-arrival dispatch", sub: "CPU encoder, own threads" },
   ],
   rows: [
-    { m: "TTFT mean", v: ["baseline", "~3.9x worse", "~41% worse"] },
-    { m: "TTFT p99", v: ["baseline", "~3.1x worse", "~17% worse"] },
-    { m: "TPOT mean", v: ["baseline", "~40% better", "~13% better"] },
-    { m: "ITL median", v: ["baseline", "~57% better", "~9% better"] },
-    { m: "ITL p99", v: ["baseline", "~55% better", "~54% better"] },
-    { m: "E2E latency mean", v: ["baseline", "~36% worse", "same"] },
-    { m: "E2E latency p99", v: ["baseline", "~51% worse", "~3% better"] },
-    { m: "Output throughput", v: ["baseline", "~27% lower", "same"] },
-    { m: "Boot to server ready, warm cache", v: ["baseline", "~40% faster", "~40% faster"] },
-    { m: "Vision tower compile at boot", v: ["9 budgets", "none", "none"] },
-    { m: "CPU encode time per image", v: ["n/a", "reference", "~3.9x faster"] },
+    { m: "TTFT mean", v: ["baseline", "~3.9x worse", "~41% worse", "~53% worse"] },
+    { m: "TTFT p99", v: ["baseline", "~3.1x worse", "~17% worse", "~10% worse"] },
+    { m: "TPOT mean", v: ["baseline", "~40% better", "~13% better", "~20% better"] },
+    { m: "ITL median", v: ["baseline", "~57% better", "~9% better", "~53% better"] },
+    { m: "ITL p99", v: ["baseline", "~55% better", "~54% better", "~54% better"] },
+    { m: "E2E latency mean", v: ["baseline", "~36% worse", "same", "~3% better"] },
+    { m: "E2E latency p99", v: ["baseline", "~51% worse", "~3% better", "~11% better"] },
+    { m: "Output throughput", v: ["baseline", "~27% lower", "same", "~3% higher"] },
+    { m: "Boot to server ready, warm cache", v: ["baseline", "~40% faster", "~40% faster", "~40% faster"] },
+    { m: "Vision tower compile at boot", v: ["9 budgets", "none", "none", "none"] },
+    { m: "CPU encode time per image", v: ["n/a", "reference", "~3.9x faster", "~3.9x faster"] },
   ],
 };
 
@@ -443,6 +444,8 @@ const NOTES = [
   { date: "2026-11-06", kind: "fix", text: "On-arrival dispatch: the scheduler now dispatches every image of a request as soon as cache space and the in-flight cap allow, including requests still waiting for admission (_prefetch_waiting) and images past the current window. Images past the window never truncate decode, are not loaded until reached, and do not use the step's inline encoder compute budget, which meters work on the decoder cards. Replay: all four images now reach the encoder in the first step, as one batch, while the first request's text prefills. Guarded by tests/parallel_encoder/test_parallel_encoder_dispatch_timing.py." },
   { date: "2026-11-06", kind: "fix", text: "Threads: the CPU encoder no longer takes its threads out of the TP workers' budget. TP workers keep exactly the split they get without the parallel encoder; the encoder takes encoder_num_threads if set, else the host's spare CPUs (cgroup quota, then psutil, ignoring SPYRE_NUM_CPUS) after the workers' total. On this pod the workers keep their usual threads and the encoder gets the remaining half of the quota, with no SPYRE_NUM_CPUS override." },
   { date: "2026-11-06", kind: "progress", text: "Next benchmark arm: bench/parallel_prefetch, on-arrival dispatch plus the default thread split, with encoder metrics logged." },
+  { date: "2026-11-06", kind: "result", text: "Benchmark, on-arrival dispatch + own encoder threads: 200/200 ok, no region left. Relative to inline: output throughput ~3% higher; E2E latency ~3% better mean and ~11% better p99; TPOT ~20% better; ITL ~53% better median and ~54% better p99; TTFT ~53% worse mean, ~10% worse p99. Boot ~40% faster." },
+  { date: "2026-11-06", kind: "finding", text: "The encoder is no longer a bottleneck: PROFILE[enc] shows it idle most of the time with at most one image queued, and PROFILE[sched] shows each image's dispatch-to-done wait equal to its bare encode, finished before the request's prefill reaches it. The TTFT gap is admission: prefill occupancy is the same in every arm, but with Spyre's single prefill slot and decode no longer slowed by vision work, the four running requests hold the decoder more evenly and a new request waits longer for its prefill turn. Total time per request goes down; TTFT is a share of it that moved, not added latency." },
 ];
 
 const STATUS_LABEL = { done: "done", active: "in progress", todo: "not started", blocked: "blocked", open: "open", confirmed: "confirmed", differs: "differs" };
