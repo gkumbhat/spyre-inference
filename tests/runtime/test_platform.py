@@ -958,17 +958,29 @@ def test_configure_threading_overrides_when_enabled(monkeypatch):
         assert os.environ[env] == "4", env  # ceil(8 / 2)
 
 
-def test_configure_threading_reserves_cpus_for_the_parallel_encoder(monkeypatch):
-    """A CPU parallel encoder's share is held back before splitting across workers."""
+def test_parallel_encoder_threads_sit_on_top_of_the_workers(monkeypatch):
+    """The CPU parallel encoder never shrinks the workers' threads: they keep their usual
+    share of the budget, and the encoder takes what the host has left, or an exact count."""
+    import spyre_inference.threading_config as tc
     from spyre_inference.threading_config import configure_threading, encoder_cpu_share
 
     monkeypatch.delenv("SPYRE_UPDATE_THREAD_CONFIG", raising=False)
     _force_cpu_count(monkeypatch, 32.0)
+    monkeypatch.setattr(tc, "get_host_cpu_count", lambda use_logical_cpus=False: (64.0, "host"))
 
-    assert encoder_cpu_share(4, None) == 6  # 32 // (4 workers + encoder)
-    assert encoder_cpu_share(4, 12) == 12
-    configure_threading(worker_count=4, reserved_cpus=12)
-    assert os.environ["OMP_NUM_THREADS"] == "5"  # ceil((32 - 12) / 4)
+    configure_threading(worker_count=4)
+    assert os.environ["OMP_NUM_THREADS"] == "8"  # 32 / 4, as without the encoder
+    assert encoder_cpu_share(4, None) == 32  # 64 host - 4 workers x 8
+    assert encoder_cpu_share(4, 48) == 48
+
+
+def test_parallel_encoder_threads_have_a_floor_of_one(monkeypatch):
+    import spyre_inference.threading_config as tc
+    from spyre_inference.threading_config import encoder_cpu_share
+
+    _force_cpu_count(monkeypatch, 32.0)
+    monkeypatch.setattr(tc, "get_host_cpu_count", lambda use_logical_cpus=False: (32.0, "host"))
+    assert encoder_cpu_share(4, None) == 1
 
 
 def test_configure_threading_single_worker_uses_full_count(monkeypatch):

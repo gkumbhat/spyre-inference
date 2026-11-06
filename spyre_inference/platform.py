@@ -898,11 +898,13 @@ class TorchSpyrePlatform(CpuPlatform):
         from spyre_inference.config.parallel_encoder import ParallelEncoderConfig
         from spyre_inference.threading_config import configure_threading, encoder_cpu_share
 
+        configure_threading(parallel_config.world_size)
         pe_config = ParallelEncoderConfig.from_vllm_config(vllm_config)
-        reserved = 0
         if pe_config is not None and pe_config.enabled and not pe_config.compiled:
-            reserved = encoder_cpu_share(parallel_config.world_size, pe_config.encoder_num_threads)
-        configure_threading(parallel_config.world_size, reserved_cpus=reserved)
+            logger.info(
+                "parallel-encoder: CPU encoder gets %d threads, on top of the workers'",
+                encoder_cpu_share(parallel_config.world_size, pe_config.encoder_num_threads),
+            )
 
         # ---- worker ----
         from spyre_inference import pin_model_runner

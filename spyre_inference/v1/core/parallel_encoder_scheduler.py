@@ -238,6 +238,7 @@ class ParallelEncoderScheduler(TorchSpyreScheduler):
                 self._region_alloc.free(mm_hash)
 
         t2 = time.perf_counter() if prof.enabled else 0.0
+        self._prefetch_waiting()
         self._flush_dispatch()
         if prof.enabled:
             t3 = time.perf_counter()
@@ -320,28 +321,43 @@ class ParallelEncoderScheduler(TorchSpyreScheduler):
 
         decode_end = num_computed_tokens + num_new_tokens + shift_computed_tokens
         lo, hi = get_mm_features_in_window(mm_features, start=num_computed_tokens, end=decode_end)
+        # Look ahead to every image not yet passed, not just those in this step's
+        # window: Spyre caps a step at 512 tokens, so an image after a long text
+        # prompt would otherwise reach the encoder only once that text has
+        # prefilled, and its encode could not overlap its own request's prefill.
+        hi_all = len(mm_features)
 
-        # Dispatch every not-cached image in the window (like vLLM's inline
-        # loop), so a multi-image request encodes its images concurrently
-        # rather than one blocking round-trip at a time. Decode can advance no
-        # further than the first image whose embedding is not yet ready
-        # (in-flight or newly dispatched) — tracked as block_pos.
+        # Dispatch every not-cached image (like vLLM's inline loop), so a
+        # multi-image request encodes its images concurrently rather than one
+        # blocking round-trip at a time. Decode can advance no further than the
+        # first in-window image whose embedding is not yet ready (in-flight or
+        # newly dispatched) — tracked as block_pos. Images past the window are only
+        # dispatched: they never truncate decode and are not loaded until reached.
         block_pos: int | None = None
 
-        for i in range(lo, hi):
+        for i in range(lo, hi_all):
             mm_feature = mm_features[i]
             start_pos = mm_feature.mm_position.offset
             num_encoder_tokens = mm_feature.mm_position.length
             num_encoder_embeds = mm_feature.mm_position.get_num_embeds()
             item_identifier = mm_feature.identifier
+            in_window = i < hi
 
             if item_identifier in scheduled_this_call:
+                continue
+            if not in_window and (
+                item_identifier in self._encoding_inflight
+                or self._region_alloc.is_allocated(item_identifier)
+            ):
+                # Already dispatched by an earlier look-ahead; nothing to do until
+                # the window reaches it.
                 continue
 
             # No chunking of a single mm item's decoder tokens: if the window
             # would only partially cover this item, decode must stop before it.
             if (
-                self.scheduler_config.disable_chunked_mm_input
+                in_window
+                and self.scheduler_config.disable_chunked_mm_input
                 and num_computed_tokens < start_pos
                 and decode_end < (start_pos + num_encoder_tokens)
                 and block_pos is None
@@ -353,6 +369,10 @@ class ParallelEncoderScheduler(TorchSpyreScheduler):
             # request). This keeps refcounts correct for cross-request reuse.
             cached = self.encoder_cache_manager.check_and_update_cache(request, i)
             needs_reencode = False
+            if cached and not in_window:
+                # Encoded and reachable by another request; registered as a referrer
+                # above. Loaded when this request's window reaches it.
+                continue
             if cached:
                 if item_identifier in self._encoding_inflight:
                     # Allocated but not ready — decode must stop before it.
@@ -382,39 +402,27 @@ class ParallelEncoderScheduler(TorchSpyreScheduler):
 
             # Not cached — dispatch it to the encoder. (needs_reencode skips the
             # cache-manager reservation/eviction, which already happened.)
+            # The step's encoder compute budget meters encoder work on the decoder
+            # cards this step; a look-ahead image runs off them, so only cache space
+            # limits it.
+            compute_budget = encoder_compute_budget if in_window else num_encoder_embeds
             if not needs_reencode and not self.encoder_cache_manager.can_allocate(
-                request, i, encoder_compute_budget, num_embeds_to_schedule
+                request, i, compute_budget, num_embeds_to_schedule
             ):
-                # Encoder budget / cache space exhausted this step. This image
-                # (and any after it) can't be dispatched now; decode stops here.
-                if block_pos is None:
+                # Encoder budget / cache space exhausted. This image (and any after
+                # it) can't be dispatched now; decode stops here if it is in reach.
+                if in_window and block_pos is None:
                     block_pos = start_pos
                 break
 
-            # can_allocate() may have evicted freeable entries; reclaim their
-            # region blocks now so the free-list stays in sync this pass.
-            self._reconcile_region_frees()
-
-            block_ids = self._region_alloc.alloc(item_identifier, num_encoder_embeds)
-            if not needs_reencode:
-                self.encoder_cache_manager.allocate(request, i)
-            self._encoding_inflight.add(item_identifier)
-            if self._prof.enabled:
-                self._dispatched_at[item_identifier] = time.perf_counter()
-            self._dispatch_this_step.append(
-                EncodeItem(
-                    mm_hash=item_identifier,
-                    modality=mm_feature.modality,
-                    block_ids=block_ids,
-                    data=mm_feature.data,  # ty: ignore[invalid-argument-type]
-                )
-            )
+            self._dispatch_item(request, i, allocate=not needs_reencode)
             scheduled_this_call.add(item_identifier)
             num_embeds_to_schedule += num_encoder_embeds
-            encoder_compute_budget -= num_encoder_embeds
+            if in_window:
+                encoder_compute_budget -= num_encoder_embeds
 
             # Just dispatched -> not ready this step; decode stops before it.
-            if block_pos is None:
+            if in_window and block_pos is None:
                 block_pos = start_pos
 
         if block_pos is not None:
@@ -422,6 +430,52 @@ class ParallelEncoderScheduler(TorchSpyreScheduler):
                 block_pos, num_computed_tokens, shift_computed_tokens
             )
         return [], num_new_tokens, encoder_compute_budget, [], []
+
+    def _dispatch_item(self, request: Request, i: int, *, allocate: bool) -> None:
+        """Reserve region blocks for ``request``'s image ``i`` and queue it for the
+        encoder. The caller has already checked cache space with ``can_allocate``."""
+        mm_feature = request.mm_features[i]
+        mm_hash = mm_feature.identifier
+        # can_allocate() may have evicted freeable entries; reclaim their region
+        # blocks now so the free-list stays in sync this pass.
+        self._reconcile_region_frees()
+        block_ids = self._region_alloc.alloc(mm_hash, mm_feature.mm_position.get_num_embeds())
+        if allocate:
+            self.encoder_cache_manager.allocate(request, i)
+        self._encoding_inflight.add(mm_hash)
+        if self._prof.enabled:
+            self._dispatched_at[mm_hash] = time.perf_counter()
+        self._dispatch_this_step.append(
+            EncodeItem(
+                mm_hash=mm_hash,
+                modality=mm_feature.modality,
+                block_ids=block_ids,
+                data=mm_feature.data,  # ty: ignore[invalid-argument-type]
+            )
+        )
+
+    def _prefetch_waiting(self) -> None:
+        """Dispatch the images of requests still waiting for admission.
+
+        Spyre admits one partial prefill at a time by default, so a waiting request
+        would otherwise reach the encoder only once every request ahead of it has
+        prefilled. Its image encodes meanwhile and is loaded when its window reaches
+        it. Arrival order; stops at the in-flight cap or when cache space runs out.
+        """
+        for request in self.waiting:
+            for i, feature in enumerate(request.mm_features or ()):
+                if len(self._encoding_inflight) >= self._max_inflight_encode_images:
+                    return
+                mm_hash = feature.identifier
+                if mm_hash in self._encoding_inflight or self._region_alloc.is_allocated(mm_hash):
+                    # Dispatched or encoded already, possibly for another request:
+                    # register this one as a referrer so eviction leaves it alone.
+                    self.encoder_cache_manager.check_and_update_cache(request, i)
+                    continue
+                embeds = feature.mm_position.get_num_embeds()
+                if not self.encoder_cache_manager.can_allocate(request, i, embeds, 0):
+                    return
+                self._dispatch_item(request, i, allocate=True)
 
     def _reconcile_region_frees(self) -> None:
         """Free region blocks for mm_hashes the cache manager has already

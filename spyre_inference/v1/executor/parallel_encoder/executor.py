@@ -139,9 +139,11 @@ class ParallelEncoderExecutor(MultiprocExecutor):
         """Every process now maps the region: the TP workers attach before reporting
         ready and the encoder before its READY. Drop the name so a killed engine
         leaves no file behind; the mappings keep the memory alive."""
-        path = self._region._mmap_path
+        region = self._region
+        assert region is not None
+        path = region._mmap_path
         os.unlink(path)
-        self._region._is_creator = False
+        region._is_creator = False
         logger.debug("parallel-encoder: unlinked %s; all processes attached", path)
 
     def _build_encoder_config(self) -> VllmConfig:

@@ -43,7 +43,12 @@ def get_cpu_count(use_logical_cpus: bool = False) -> tuple[float | None, str]:
     """Resolution order: SPYRE_NUM_CPUS, cgroup v2 quota, psutil cores, os.cpu_count()."""
     if (num_cpu := envs.SPYRE_NUM_CPUS) > 0:
         return float(num_cpu), f"SPYRE_NUM_CPUS is set to {num_cpu}"
+    return get_host_cpu_count(use_logical_cpus)
 
+
+def get_host_cpu_count(use_logical_cpus: bool = False) -> tuple[float | None, str]:
+    """The host's own limit, ignoring SPYRE_NUM_CPUS: cgroup v2 quota, psutil cores,
+    os.cpu_count()."""
     cpu_count: float | None = None
     detection_message = ""
 
@@ -80,19 +85,24 @@ def get_cpu_count(use_logical_cpus: bool = False) -> tuple[float | None, str]:
 
 
 def encoder_cpu_share(worker_count: int, requested: int | None) -> int:
-    """Threads for a CPU parallel encoder: ``requested``, else an even share with the
-    ``worker_count`` decoder workers."""
+    """Threads for a CPU parallel encoder, on top of the decoder workers' own budget.
+
+    ``requested`` if set. Otherwise the host CPUs left once the ``worker_count`` workers
+    have their usual per-worker share, so the encoder uses spare capacity and never
+    shrinks the workers' threads.
+    """
     if requested:
         return requested
-    cpu_count, _ = get_cpu_count()
-    return max(1, int(cpu_count // (worker_count + 1))) if cpu_count else 1
+    budget, _ = get_cpu_count()
+    host, _ = get_host_cpu_count()
+    if budget is None or host is None:
+        return 1
+    workers_total = math.ceil(budget / worker_count) * worker_count
+    return max(1, int(host - workers_total))
 
 
-def configure_threading(worker_count: int, reserved_cpus: int = 0) -> None:
+def configure_threading(worker_count: int) -> None:
     """Clamp the CPU threading env vars to the per-worker CPU budget.
-
-    ``reserved_cpus`` are held back for another process (a CPU parallel encoder) before
-    the rest is split across the workers.
 
     Enabled by default; set SPYRE_UPDATE_THREAD_CONFIG=0 to only warn instead of
     overriding. vLLM already forces OMP_NUM_THREADS=1 for its own multi-worker
@@ -107,9 +117,6 @@ def configure_threading(worker_count: int, reserved_cpus: int = 0) -> None:
     )
 
     cpu_count, detection_message = get_cpu_count()
-    if cpu_count is not None and reserved_cpus:
-        cpu_count = max(float(worker_count), cpu_count - reserved_cpus)
-        detection_message += f", {reserved_cpus} reserved for the parallel encoder"
     # math.ceil may sum to slightly more than cpu_count across workers.
     cpus_per_worker = math.ceil(cpu_count / worker_count) if cpu_count is not None else None
 

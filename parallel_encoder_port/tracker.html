@@ -232,7 +232,7 @@ footer { font-family: var(--font-mono); font-size: 11.5px; color: var(--muted); 
 </div>
 
 <script>
-const META = { updated: "2026-11-06 00:10", branch: "feat/parallel-encoder", remote: "gkumbhat", head: "see git log", base: "78512255 (origin/main)", source: "/home/senuser/vllm (fork)", vllm: "0.33" };
+const META = { updated: "2026-11-06 01:00", branch: "feat/parallel-encoder", remote: "gkumbhat", head: "see git log", base: "78512255 (origin/main)", source: "/home/senuser/vllm (fork)", vllm: "0.33" };
 
 const PHASES = [
   { id: "P1", name: "Port + CPU encoder", goal: "All files ported, CPU encoder, Pixtral / Ministral-3 at TP1. Image request works end to end; text-only is token-exact." },
@@ -267,7 +267,7 @@ const TASKS = [
   { id: "3.1", phase: "P3", status: "todo", text: "Accept spyre:N (compiled only); child keeps the plugin and runs SpyreVisionEncoderMixin; testable at TP1-3 with 4 cards", comp: ["tower", "config"] },
   { id: "3.2", phase: "P3", status: "todo", text: "Tower compile and warmup inside the encoder process", comp: ["encmain"] },
   { id: "3.3", phase: "P3", status: "todo", text: "Write embeddings card-to-host into the region", comp: ["writer"] },
-  { id: "4.1", phase: "P4", status: "done", text: "Benchmark CPU encoder vs inline at high concurrency: with 32 encoder threads, throughput matches inline, tail ITL much better, TTFT worse", comp: ["executor"] },
+  { id: "4.1", phase: "P4", status: "active", text: "Benchmark CPU encoder vs inline at high concurrency: throughput matches, tail ITL much better, TTFT worse; rerun with on-arrival dispatch", comp: ["executor"] },
   { id: "4.2", phase: "P4", status: "todo", text: "Benchmark the Spyre-card encoder", comp: ["tower"] },
   { id: "4.3", phase: "P4", status: "todo", text: "Gemma-4 bring-up on the parallel encoder", comp: ["tower"] },
   { id: "4.4", phase: "P4", status: "todo", text: "User docs: when each mode wins, and how to configure it", comp: ["config"] },
@@ -439,6 +439,10 @@ const NOTES = [
   { date: "2026-11-05", kind: "progress", text: "Live encoder metrics behind PARALLEL_ENCODER_PROFILE=1 (interval PARALLEL_ENCODER_PROFILE_INTERVAL). PROFILE[sched] in the engine log now adds images in flight and per-image wait (dispatch to completion, mean and max). PROFILE[enc] from the encoder process: batches, items per batch, encode and write time, busy/idle share, and now max queued. These answer 'is the encoder keeping up' directly instead of inferring it from prefill cadence. The running 32-thread rerun started before this fix, so it has none of these lines." },
   { date: "2026-11-05", kind: "result", text: "Benchmark, parallel arm with a 32-thread CPU encoder and the batching fix: 200/200 ok, no region left in /dev/shm. Relative to inline: output throughput and mean E2E latency the same; p99 E2E about 3% better; p99 ITL about 54% better and median ITL about 9% better; mean TPOT about 13% better; mean TTFT about 41% worse and p99 TTFT about 17% worse. Boot to server ready about 40% faster on a warm cache. The encoder now keeps up, so throughput matches inline, while decode is smoother because the decoder cards do no vision work; each request's eager CPU encode still adds to its first-token time." },
   { date: "2026-11-05", kind: "decision", text: "Absolute performance numbers are kept out of the branch, commits and this report at the user's request; results here are relative to the inline arm. Raw benchmark output stays outside git." },
+  { date: "2026-11-06", kind: "finding", text: "TTFT gap traced to dispatch timing, not to the port diverging from the reference: the dispatch logic matches the fork line for line. It only sends an image once the image falls inside the current step's window, and Spyre caps a step at 512 tokens and admits one prefill at a time. random-mm puts the image after the 8k text, so in a replay of the benchmark shape the four requests' images reached the encoder one by one, each only after its own text had prefilled. Their CPU encode therefore sat in series on each request's first token. Upstream's large step budget sees the image in the first step, so this did not show there." },
+  { date: "2026-11-06", kind: "fix", text: "On-arrival dispatch: the scheduler now dispatches every image of a request as soon as cache space and the in-flight cap allow, including requests still waiting for admission (_prefetch_waiting) and images past the current window. Images past the window never truncate decode, are not loaded until reached, and do not use the step's inline encoder compute budget, which meters work on the decoder cards. Replay: all four images now reach the encoder in the first step, as one batch, while the first request's text prefills. Guarded by tests/parallel_encoder/test_parallel_encoder_dispatch_timing.py." },
+  { date: "2026-11-06", kind: "fix", text: "Threads: the CPU encoder no longer takes its threads out of the TP workers' budget. TP workers keep exactly the split they get without the parallel encoder; the encoder takes encoder_num_threads if set, else the host's spare CPUs (cgroup quota, then psutil, ignoring SPYRE_NUM_CPUS) after the workers' total. On this pod the workers keep their usual threads and the encoder gets the remaining half of the quota, with no SPYRE_NUM_CPUS override." },
+  { date: "2026-11-06", kind: "progress", text: "Next benchmark arm: bench/parallel_prefetch, on-arrival dispatch plus the default thread split, with encoder metrics logged." },
 ];
 
 const STATUS_LABEL = { done: "done", active: "in progress", todo: "not started", blocked: "blocked", open: "open", confirmed: "confirmed", differs: "differs" };
